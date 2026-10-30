@@ -11,7 +11,6 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 from typing import Any, cast
-from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pyarrow as pa
@@ -27,6 +26,7 @@ from .gold_publication.canonical import (
 )
 from .gold_publication.contract import Dependency, IdSet, InputArtifact
 from .gold_publication.errors import ContractViolation
+from .kst import KST
 from .model_snapshot import (
     IdSetArtifactRef,
     ModelKind,
@@ -170,7 +170,6 @@ _ROLE_PATTERN = re.compile(r"[a-z][a-z0-9_]*\Z")
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 _CONTENT_VERSION_PATTERN = re.compile(r"sha256:(?P<checksum>[0-9a-f]{64})\Z")
 _MAX_SAFE_INTEGER = 2**53 - 1
-_KST = ZoneInfo("Asia/Seoul")
 
 
 class InferenceSnapshotContractError(ContractViolation):
@@ -486,7 +485,7 @@ def canonicalize_inference_output_table(
     observed_keys: set[tuple[str, int]] = set()
     horizons_by_station: dict[str, set[int]] = {}
     expected_ids = set(expected_sta_ids.ids)
-    kst_base = base_dttm.astimezone(_KST)
+    kst_base = base_dttm.astimezone(KST)
     for index, raw in enumerate(selected.to_pylist()):
         station_id = _require_nonblank_nfc(
             raw["station_id"],

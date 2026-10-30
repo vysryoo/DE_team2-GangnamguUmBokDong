@@ -6,7 +6,6 @@ import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from io import BytesIO
-from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pyarrow as pa
@@ -50,6 +49,7 @@ from core.model_snapshot import (
     ModelSnapshotManifest,
     build_model_snapshot_manifest,
 )
+from core.kst import KST
 
 LOGICAL_DTTM = datetime(2026, 8, 20, 1, 0, tzinfo=UTC)
 RELEASE_SHA256 = "a" * 64
@@ -64,7 +64,6 @@ EFFECTIVE_CONTRACT_VERSION = "sha256:" + "6" * 64
 RENTAL_MODEL_VERSION = "sha256:" + "1" * 64
 RETURN_MODEL_VERSION = "sha256:" + "2" * 64
 RELEASE_VERSION = "sha256:" + "3" * 64
-KST = ZoneInfo("Asia/Seoul")
 
 
 def _serving_release(**overrides: object) -> ServingReleaseRef:
