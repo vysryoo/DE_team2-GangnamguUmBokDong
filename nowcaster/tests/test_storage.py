@@ -11,6 +11,8 @@ import storage
 from core.gold_publication.canonical import sha256_hex
 from core.source_snapshot_io import SourceSnapshotReadError
 from core.kst import KST
+from core.layout import nowcast_key
+from core.s3 import object_exists
 from core.sources import LIVING_POPULATION_GRID
 from core.testing import TEST_BUCKET, put_source_snapshot
 
@@ -139,20 +141,13 @@ class TestNowcastFile:
         stored = pq.read_table(io.BytesIO(_s3().get_object(Bucket=TEST_BUCKET, Key=key)["Body"].read()))
         assert stored.column("SPOP").to_pylist() == [42.0]
 
-    def test_nowcast_exists_true_and_false(self):
-        table = pa.table({"CELL_ID": ["가가00000000"]})
-        storage.write_nowcast(date(2026, 8, 13), table)
-
-        assert storage.nowcast_exists(date(2026, 8, 13)) is True
-        assert storage.nowcast_exists(date(2026, 8, 14)) is False
-
     def test_delete_nowcast_removes_file(self):
         table = pa.table({"CELL_ID": ["가가00000000"]})
         storage.write_nowcast(date(2026, 8, 13), table)
 
         storage.delete_nowcast(date(2026, 8, 13))
 
-        assert storage.nowcast_exists(date(2026, 8, 13)) is False
+        assert object_exists(nowcast_key(date(2026, 8, 13))) is False
 
     def test_delete_nowcast_is_idempotent_when_missing(self):
         storage.delete_nowcast(date(2026, 8, 13))  # 에러 없이 통과해야 함

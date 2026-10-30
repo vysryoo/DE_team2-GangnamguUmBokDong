@@ -61,50 +61,6 @@ class TestBuildNowcastTable:
         row = result.iloc[0]
         assert row["M00"] == pytest.approx(10.0 * 0.4 + 20.0 * 0.3 + 30.0 * 0.2 + 40.0 * 0.1)
 
-class TestHistoricalAverage:
-    def test_averages_value_columns_grouped_by_key_across_all_frames(self):
-        frame_a = _frame([{"H_DNG_CD": "H1", "CELL_ID": "C1", "TT": "10", "SPOP": 100.0}])
-        frame_b = _frame([{"H_DNG_CD": "H1", "CELL_ID": "C1", "TT": "10", "SPOP": 300.0}])
-
-        result = estimate_day.historical_average([frame_a, frame_b])
-
-        row = result.loc[("H1", "C1", "10")]
-        assert row["SPOP"] == 200.0
-
-    def test_ignores_none_frames(self):
-        frame_a = _frame([{"H_DNG_CD": "H1", "CELL_ID": "C1", "TT": "10", "SPOP": 100.0}])
-
-        result = estimate_day.historical_average([frame_a, None])
-
-        assert result.loc[("H1", "C1", "10")]["SPOP"] == 100.0
-
-    def test_returns_none_when_no_frames_available(self):
-        assert estimate_day.historical_average([None, None]) is None
-
-
-class TestHistoricalAverageOverDates:
-    def test_matches_historical_average_result(self):
-        frames_by_date = {
-            1: _frame([{"H_DNG_CD": "H1", "CELL_ID": "C1", "TT": "10", "SPOP": 100.0}]),
-            2: None,
-            3: _frame([{"H_DNG_CD": "H1", "CELL_ID": "C1", "TT": "10", "SPOP": 300.0}]),
-        }
-        calls = []
-
-        def read_frame(d):
-            calls.append(d)
-            return frames_by_date[d]
-
-        result = estimate_day.historical_average_over_dates([1, 2, 3], read_frame)
-
-        assert result.loc[("H1", "C1", "10")]["SPOP"] == 200.0
-        # 날짜당 정확히 한 번만 읽는다 — 리스트로 미리 다 모아두지 않는다.
-        assert calls == [1, 2, 3]
-
-    def test_returns_none_when_no_dates_have_data(self):
-        assert estimate_day.historical_average_over_dates([1, 2], lambda d: None) is None
-
-
 class TestHistoricalAverageCached:
     def _fake_cache_store(self):
         """load_cache/save_cache 계약을 지키는 인메모리 캐시 저장소를 만든다."""
