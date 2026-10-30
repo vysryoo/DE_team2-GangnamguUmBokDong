@@ -1,8 +1,6 @@
-"""DAG가 실행할 collector source_id 목록과 loader 테이블 이름을 모은다.
+"""DAG가 실행할 collector source_id 목록을 모은다.
 
-실제 값은 collector/sources/*.yaml의 source_id, loader/config.py의 TABLE_SPECS
-키와 정확히 일치해야 한다. API 세부 설정(URL, 인증키 등)은 여기 넣지 않는다 —
-그건 각 모듈의 책임이다.
+값은 `collector/sources/*.yaml`의 `source_id`와 정확히 일치해야 한다.
 """
 
 REALTIME_5MIN_SOURCES = ("bike_rental_history", "bike_station_realtime", "population_realtime")
@@ -14,8 +12,8 @@ DAILY_EVENT_SOURCE = "cultural_event"
 PERFORMANCE_EVENT_SOURCE = "performance_event"
 STATION_MASTER_SOURCE = "bike_station_master"
 
-# Hot Bronze는 source별 Silver Archive 가치와 관계없이 모든 수집 revision의 장기
-# 복구 근거다. 전 source를 Cold Bronze로 옮긴 뒤에만 공통 30일 Lifecycle에 맡긴다.
+# Hot Bronze는 Archive 가치와 관계없이 모든 수집 revision의 장기 복구 근거라 전 source를
+# Cold Bronze로 옮긴다.
 COLD_BRONZE_SOURCES = (
     *REALTIME_5MIN_SOURCES,
     WEATHER_10MIN_SOURCE,
@@ -47,23 +45,8 @@ COMPACTION_SOURCES = (
 
 # bike_rental_history를 몇 시간 전까지 다시 수집할지.
 #
-# tbCycleRentData는 `RENT_DT`(대여 시각) 기준으로 한 시간치를 주지만 목록에는
-# **반납이 완료된 기록만** 나타난다(정렬도 `RTN_DT` 오름차순). 그래서 대여 시간대가
-# 끝난 뒤에 반납된 기록은 그 시간대를 마지막으로 조회하는 윈도우 이후에야 등장한다.
-# 현행처럼 시간대 H를 `[H:05, H+1:00]` 윈도우만 조회하면 그 뒤 반납분을 영구히 놓치고,
-# `--backfill`은 실패한 조각만 채우므로 회수하지 못한다.
-#
-# 실측(2026-08-18, 5개 시간대 42,902건): 24.6%가 대여 시간대 종료 후에 반납됐다.
-# 시간대별 누락률은 13.4%(08시)~32.0%(21시)이고 긴 이용에 편향돼 있다.
-#
-# | L | 포착 조건 | 누락 회수 | 잔여 누락 | 요청/일 |
-# | - | --------- | --------- | --------- | ------- |
-# | 0 | RTN <= H+1:00 | —          | 24.6% | 1,836 |
-# | 1 | RTN <= H+2:00 | 86.7~90.2% | ~3.0% | 3,672 |
-# | 2 | RTN <= H+3:00 | 98.0~100%  | ~0.3% | 5,508 |
-#
-# 설계상 2시간을 재조회한다. 요청은 lookback 1 대비 1.5배지만 잔여 누락을
-# 약 3.0%에서 약 0.3%까지 줄인다. 이 상수에 맞춰 replay 태스크가 자동으로 늘어난다.
+# tbCycleRentData는 반납이 완료된 기록만 보여 주므로, 대여 시간대가 끝난 뒤 반납된
+# 기록은 이후 재조회에서만 잡힌다. 2시간 재조회 시 잔여 누락 약 0.3% (2026-08-18 실측).
 RENTAL_HISTORY_LOOKBACK_HOURS = 2
 
 # 일별 archive를 확정하기 전에 대여이력을 전체 재조회할 지연 일수.
