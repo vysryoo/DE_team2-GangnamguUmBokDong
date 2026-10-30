@@ -426,19 +426,14 @@ def test_activation_reconciles_put_response_loss(
     """조건부 PUT이 반영된 뒤 응답만 유실된 경우 exact readback으로 성공 처리한다."""
     ref = _put_poi_snapshot(BASE_TIME, _poi_table())
     activated_at = BASE_TIME + timedelta(hours=1)
-    real_store = S3ImmutableObjectStore()
 
-    class AppliedThenFailedStore:
+    class AppliedThenFailedStore(S3ImmutableObjectStore):
         """객체를 실제로 쓴 뒤 transport 실패를 흉내 내는 store다."""
 
         def put_once(self, *args: object, **kwargs: object) -> object:
             """실제 conditional PUT을 완료한 뒤 응답 유실 오류를 낸다."""
-            real_store.put_once(*args, **kwargs)
+            super().put_once(*args, **kwargs)
             raise ObjectStoreAccessError("응답 유실")
-
-        def read_bytes(self, *args: object, **kwargs: object) -> bytes:
-            """실제 저장소에서 exact readback을 수행한다."""
-            return real_store.read_bytes(*args, **kwargs)
 
     monkeypatch.setattr(
         poi_master_module,

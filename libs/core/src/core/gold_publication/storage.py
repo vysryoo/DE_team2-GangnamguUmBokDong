@@ -13,6 +13,7 @@ from ..s3 import _client as default_s3_client
 from .canonical import parse_canonical_json, sha256_hex, validate_sha256_hex
 from .errors import (
     CanonicalParseError,
+    ImmutableObjectError,
     InvalidObjectUriError,
     ObjectChecksumMismatchError,
     ObjectCollisionError,
@@ -194,6 +195,50 @@ class S3ImmutableObjectStore:
         raise ObjectStoreAccessError(
             f"immutable object 조건부 쓰기를 완료하지 못했습니다: {uri}"
         )
+
+    def put_verified(
+        self,
+        uri: str,
+        payload: bytes,
+        *,
+        require_canonical_json: bool = False,
+    ) -> bytes:
+        """object를 한 번만 쓰고 같은 URI를 checksum으로 다시 읽어 확인한다.
+
+        downstream manifest가 아직 완성되지 않은 object를 가리키지 않도록, 반환 전에
+        exact bytes를 읽어 확인한다. 조건부 PUT이 반영된 뒤 응답만 유실되는 경우가
+        있어, 쓰기 오류가 나도 readback이 같은 bytes면 성공으로 본다.
+
+        args:
+            uri: 쓸 정확한 ``s3://bucket/key`` URI
+            payload: 저장할 원본 bytes
+            require_canonical_json: true면 쓰기·읽기 모두 canonical JSON인지 검증
+        returns:
+            readback으로 확인한 bytes
+        raises:
+            ImmutableObjectError: readback이 실패했을 때. 쓰기 오류가 있었으면 그 오류를 던진다
+        """
+        payload_sha256 = sha256_hex(payload)
+        put_error: ImmutableObjectError | None = None
+        try:
+            self.put_once(
+                uri,
+                payload,
+                expected_sha256=payload_sha256,
+                require_canonical_json=require_canonical_json,
+            )
+        except ImmutableObjectError as exc:
+            put_error = exc
+        try:
+            return self.read_bytes(
+                uri,
+                payload_sha256,
+                require_canonical_json=require_canonical_json,
+            )
+        except ImmutableObjectError as exc:
+            if put_error is not None:
+                raise put_error from exc
+            raise
 
     def _read_exact(self, uri: str, location: _S3Location) -> bytes:
         """prefix fallback 없이 정확한 bucket/key의 전체 bytes만 읽는다."""

@@ -282,6 +282,37 @@ def test_put_once_rejects_different_existing_bytes_without_overwrite(
     assert stored == existing
 
 
+def test_put_verified_returns_readback_bytes(s3_client: Any) -> None:
+    """새 object를 쓰고 readback으로 확인한 bytes를 반환한다."""
+    store = S3ImmutableObjectStore(client=s3_client)
+
+    readback = store.put_verified("s3://test-bucket/artifacts/verified.bin", b"v")
+
+    assert readback == b"v"
+
+
+def test_put_verified_accepts_lost_put_response(s3_client: Any) -> None:
+    """PUT이 반영된 뒤 응답만 유실돼도 readback이 같으면 성공한다."""
+
+    class _AppliedThenFailedStore(S3ImmutableObjectStore):
+        def put_once(self, *args: Any, **kwargs: Any) -> ImmutablePutOutcome:
+            super().put_once(*args, **kwargs)
+            raise ObjectStoreAccessError("응답 유실")
+
+    store = _AppliedThenFailedStore(client=s3_client)
+
+    assert store.put_verified("s3://test-bucket/artifacts/lost.bin", b"x") == b"x"
+
+
+def test_put_verified_raises_put_error_when_readback_fails(s3_client: Any) -> None:
+    """다른 bytes와 충돌하면 readback 오류가 아니라 쓰기 오류를 던진다."""
+    _put_fixture(s3_client, "artifacts/conflict.bin", b"existing")
+    store = S3ImmutableObjectStore(client=s3_client)
+
+    with pytest.raises(ObjectCollisionError):
+        store.put_verified("s3://test-bucket/artifacts/conflict.bin", b"incoming")
+
+
 def test_put_once_validates_expected_checksum_before_client_call() -> None:
     """payload checksum 불일치는 조건부 PUT을 호출하기 전에 거부한다."""
     client = Mock()
