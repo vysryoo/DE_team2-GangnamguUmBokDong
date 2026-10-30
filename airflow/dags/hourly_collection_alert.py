@@ -21,9 +21,12 @@ from config.schedules import (
     TIMEZONE,
 )
 from config.sources import HOURLY_MONITORED_SOURCES
-from notifications.collection_report import build_hourly_alert_message, evaluate_source_stats
+from notifications.collection_report import (
+    build_hourly_alert_message,
+    evaluate_source_stats,
+)
 from notifications.slack import send_message
-from orchestration.collection_stats_task import build_window_stats_task
+from orchestration.collector_task import build_window_stats_task
 from orchestration.templates import kst_hours_ago_date, kst_hours_ago_hour
 
 _HOUR_AGO_DATE = kst_hours_ago_date(1)

@@ -21,9 +21,12 @@ from config.schedules import (
     TIMEZONE,
 )
 from config.sources import COLD_BRONZE_SOURCES
-from notifications.collection_report import build_daily_report_message, evaluate_source_stats
+from notifications.collection_report import (
+    build_daily_report_message,
+    evaluate_source_stats,
+)
 from notifications.slack import send_message
-from orchestration.collection_stats_task import build_window_stats_task
+from orchestration.collector_task import build_window_stats_task
 from orchestration.templates import kst_date_days_ago
 
 _YESTERDAY = kst_date_days_ago(1)

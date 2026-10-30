@@ -4,7 +4,9 @@
 """
 
 import pendulum
+from airflow import DAG
 from airflow.timetables.trigger import CronTriggerTimetable
+
 from config.schedules import (
     CATCHUP,
     DAILY_CRON,
@@ -17,10 +19,8 @@ from config.sources import (
     PERFORMANCE_EVENT_SOURCE,
 )
 from orchestration.collector_task import build_collector_task
-from orchestration.gold_publisher_task import build_gold_publisher_task
-from orchestration.nowcasting_task import build_nowcasting_task
-
-from airflow import DAG
+from orchestration.refine_task import build_nowcasting_task
+from orchestration.serving_task import build_event_publication_task
 
 with DAG(
     dag_id="daily_population_and_events",
@@ -35,9 +35,9 @@ with DAG(
     collect_population >> run_nowcasting
 
     collect_events = build_collector_task(dag, DAILY_EVENT_SOURCE)
-    publish_events = build_gold_publisher_task(dag, "event:cultural_event")
+    publish_events = build_event_publication_task(dag, DAILY_EVENT_SOURCE)
     collect_events >> publish_events
 
     collect_performance = build_collector_task(dag, PERFORMANCE_EVENT_SOURCE)
-    publish_performance = build_gold_publisher_task(dag, "event:performance_event")
+    publish_performance = build_event_publication_task(dag, PERFORMANCE_EVENT_SOURCE)
     collect_performance >> publish_performance

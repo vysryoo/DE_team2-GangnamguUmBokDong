@@ -1,7 +1,6 @@
-"""collector CLI를 실행하는 태스크 빌더.
+"""collector CLI 태스크 빌더.
 
-호출 계약(docs/airflow/implementation-plan.md 참고): `--source`/`--window-start`만
-전달하고, 페이지 번호·API URL·fetch round 등 collector 내부 세부사항은 Airflow가
+Airflow는 ``--source``와 시각만 넘기고 페이지 번호, API URL 등 collector 내부 세부사항은
 알지 않는다.
 """
 
@@ -11,6 +10,7 @@ import json
 import subprocess
 from datetime import timedelta
 
+from airflow.providers.standard.operators.bash import BashOperator
 from airflow.providers.standard.operators.python import ShortCircuitOperator
 from airflow.task.trigger_rule import TriggerRule
 
@@ -21,31 +21,95 @@ from config.schedules import (
     DEFAULT_RETRY_DELAY,
     EXECUTION_TIMEOUT_OVERRIDES,
 )
-from orchestration.poi_master_task import poi_master_ref_env
+from orchestration.refine_task import POI_MASTER_ARGS, poi_master_ref_env
 from orchestration.task_builder import (
     REPO_ROOT,
     build_module_task,
     module_subprocess_env,
+    uv_python_command,
 )
-from orchestration.templates import (
-    KST_WINDOW_START,
-    kst_day_hour_replay_days_ago,
-    kst_window_start_shifted,
-)
+from orchestration.templates import KST_WINDOW_START, kst_day_hour_replay_days_ago
 
 COLLECTOR_DIR = str(REPO_ROOT / "collector")
 _FRESHNESS_CHECK_TIMEOUT_SECONDS = 30
+_STATS_EXECUTION_TIMEOUT = timedelta(seconds=60)
+
+
+def build_collector_task(
+    dag,
+    source_id: str,
+    *,
+    task_id: str | None = None,
+    window_start: str = KST_WINDOW_START,
+    force: bool = False,
+    poi_master_task_id: str | None = None,
+    retries: int = DEFAULT_RETRIES,
+    retry_delay: timedelta = DEFAULT_RETRY_DELAY,
+    execution_timeout: timedelta | None = None,
+    trigger_rule: str = TriggerRule.ALL_SUCCESS,
+) -> BashOperator:
+    """``main.py --source --window-start``로 한 윈도우를 수집하는 태스크를 만든다.
+
+    Args:
+        dag: 태스크를 붙일 DAG
+        source_id: 수집할 source ID
+        task_id: 태스크 ID. 기본값은 ``collect_{source_id}``
+        window_start: ``--window-start`` 템플릿. 기본값은 현재 tick의 KST 윈도우
+        force: ``--force``로 완결된 윈도우도 다시 수집할지 여부
+        poi_master_task_id: 지정하면 이 resolver 태스크가 고정한 POI Master 인자를 전달
+        retries: 재시도 횟수
+        retry_delay: 재시도 간격
+        execution_timeout: 실행 제한 시간. 기본값은 source별 override 또는 공통 기본값
+        trigger_rule: 상위 태스크 상태에 따른 실행 조건
+    Returns:
+        구성된 BashOperator
+    """
+    args = ["main.py", "--source", source_id, "--window-start", window_start]
+    if force:
+        args.append("--force")
+    env = None
+    if poi_master_task_id is not None:
+        args.extend(POI_MASTER_ARGS)
+        env = poi_master_ref_env(poi_master_task_id)
+    return build_module_task(
+        dag,
+        task_id or f"collect_{source_id}",
+        COLLECTOR_DIR,
+        uv_python_command(*args),
+        execution_timeout=execution_timeout
+        or EXECUTION_TIMEOUT_OVERRIDES.get(source_id, DEFAULT_EXECUTION_TIMEOUT),
+        retries=retries,
+        retry_delay=retry_delay,
+        trigger_rule=trigger_rule,
+        env=env,
+    )
+
+
+def build_daily_history_replay_task(dag, hour: int, days_back: int) -> BashOperator:
+    """``days_back``일 전 대여이력 한 시간대를 ``--force``로 다시 수집하는 태스크를 만든다.
+
+    시간대 하나의 실패가 나머지 시간대를 막지 않도록 ``ALL_DONE``으로 실행함.
+
+    Args:
+        dag: 태스크를 붙일 DAG
+        hour: 대상 시(0~23)
+        days_back: 며칠 전 날짜인지. 양수
+    Returns:
+        구성된 BashOperator
+    """
+    return build_collector_task(
+        dag,
+        "bike_rental_history",
+        task_id=f"replay_bike_rental_history_{hour:02d}h",
+        window_start=kst_day_hour_replay_days_ago(days_back, hour),
+        force=True,
+        trigger_rule=TriggerRule.ALL_DONE,
+    )
 
 
 def _check_source_due(source_id: str, min_interval_seconds: int) -> bool:
-    """collector CLI에 수집 주기 또는 source 설정 변경으로 재수집이 필요한지 묻는다.
-
-    실제 실행 시각(`datetime.now()`) 기준으로 판단한다 — DAG의 논리 시각
-    (`logical_date`)은 이전 run이 늦게 끝나면 실제 시각보다 뒤처질 수 있어서,
-    "지금 진짜로 얼마나 지났는지"를 묻는 이 판단에는 맞지 않는다. 최신 authority가
-    현재 배포 YAML과 다른 config version이면 시간 간격이 짧아도 즉시 due가 된다.
-    """
-    env = module_subprocess_env(COLLECTOR_DIR)
+    # logical_date는 이전 run이 늦게 끝나면 실제 시각보다 뒤처지므로, 경과 시간은
+    # collector가 실제 현재 시각 기준으로 판단함
     result = subprocess.run(
         [
             "uv", "run", "--frozen", "python", "main.py",
@@ -53,7 +117,7 @@ def _check_source_due(source_id: str, min_interval_seconds: int) -> bool:
             "--check-due-after-seconds", str(min_interval_seconds),
         ],
         cwd=COLLECTOR_DIR,
-        env=env,
+        env=module_subprocess_env(COLLECTOR_DIR),
         capture_output=True,
         text=True,
         timeout=_FRESHNESS_CHECK_TIMEOUT_SECONDS,
@@ -63,16 +127,20 @@ def _check_source_due(source_id: str, min_interval_seconds: int) -> bool:
     return bool(payload["due"])
 
 
-def build_weather_freshness_gate_task(dag, source_id: str, *, min_interval: timedelta):
-    """현재 설정의 성공 수집이 `min_interval` 안에 있으면 수집을 스킵하는 게이트.
+def build_weather_freshness_gate_task(
+    dag, source_id: str, *, min_interval: timedelta
+) -> ShortCircuitOperator:
+    """마지막 성공 수집이 ``min_interval`` 안이면 이 source의 수집만 건너뛰는 게이트를 만든다.
 
-    `ShortCircuitOperator`가 `False`를 반환하면 직접 하위 태스크(이 소스의
-    `collect_{source_id}`)만 스킵된다 — `ignore_downstream_trigger_rules=False`를
-    명시해야 한다. 기본값(`True`)이면 이 태스크 뒤에 연결된 모든 태스크(`weather_
-    ready_gate`는 물론 `prepare_serving_plan` 이후 전체 체인)가 트리거룰과 무관하게
-    강제로 스킵되어, 날씨 하나만 아직 안 지났어도 그 tick의 서빙 전체가 멈춘다.
-    `False`로 두면 직접 하위(collect 태스크)만 스킵되고, `weather_ready_gate`
-    (`ALL_DONE`)부터는 실제 상태를 보고 정상 평가된다.
+    ``ignore_downstream_trigger_rules=False``로 직접 하위인 collect 태스크만 스킵함.
+    기본값(True)이면 ``weather_ready_gate`` 이후 serving 체인 전체가 스킵됨.
+
+    Args:
+        dag: 태스크를 붙일 DAG
+        source_id: 확인할 source ID
+        min_interval: 이 시간 안에 성공 수집이 있으면 스킵
+    Returns:
+        구성된 ShortCircuitOperator
     """
     return ShortCircuitOperator(
         task_id=f"freshness_gate_{source_id}",
@@ -86,108 +154,36 @@ def build_weather_freshness_gate_task(dag, source_id: str, *, min_interval: time
     )
 
 
-def build_collector_task(
+def build_window_stats_task(
     dag,
     source_id: str,
     *,
-    retries: int = DEFAULT_RETRIES,
-    retry_delay: timedelta = DEFAULT_RETRY_DELAY,
-    execution_timeout: timedelta | None = None,
-):
-    """소스별 retry와 timeout을 적용해 Collector 태스크를 만든다."""
-    timeout = execution_timeout or EXECUTION_TIMEOUT_OVERRIDES.get(
-        source_id, DEFAULT_EXECUTION_TIMEOUT
-    )
-    cmd = f"uv run --frozen python main.py --source {source_id} --window-start {KST_WINDOW_START}"
-    return build_module_task(
-        dag,
-        f"collect_{source_id}",
-        COLLECTOR_DIR,
-        cmd,
-        execution_timeout=timeout,
-        retries=retries,
-        retry_delay=retry_delay,
-    )
+    day_template: str,
+    hour_template: str | None = None,
+) -> BashOperator:
+    """KST 날짜(선택적으로 시)의 수집 통계를 JSON XCom으로 남기는 태스크를 만든다.
 
-
-def build_population_collector_task(
-    dag,
-    *,
-    poi_master_task_id: str,
-    retries: int = DEFAULT_RETRIES,
-):
-    """Resolver가 고정한 POI Master로 실시간 인구를 수집하는 태스크를 만든다."""
-    source_id = "population_realtime"
-    timeout = EXECUTION_TIMEOUT_OVERRIDES.get(source_id, DEFAULT_EXECUTION_TIMEOUT)
-    cmd = (
-        f"uv run --frozen python main.py --source {source_id} "
-        f"--window-start {KST_WINDOW_START} "
-        '--poi-master-mode "$POI_MASTER_MODE" '
-        '--poi-master-manifest-uri "$POI_MASTER_MANIFEST_URI" '
-        '--poi-master-manifest-sha256 "$POI_MASTER_MANIFEST_SHA256"'
-    )
-    return build_module_task(
-        dag,
-        f"collect_{source_id}",
-        COLLECTOR_DIR,
-        cmd,
-        execution_timeout=timeout,
-        retries=retries,
-        env=poi_master_ref_env(poi_master_task_id),
-    )
-
-
-def build_collector_replay_task(dag, source_id: str, hours_back: int):
-    """`hours_back`시간 전 윈도우를 `--force`로 다시 수집하는 태스크.
-
-    반납이 완료돼야 목록에 나타나는 API(tbCycleRentData)에서, 대여 시간대가 끝난 뒤
-    반납된 기록을 회수하는 용도다. 자세한 배경과 실측 수치는
-    `config.sources.RENTAL_HISTORY_LOOKBACK_HOURS` 주석에 있다.
-
-    `--backfill`이 아니라 `--force`인 이유: backfill은 실패한 조각만 채우는데
-    (`collector/pipeline.py`의 분기 4가 `skip=have_parts`로 부른다) 여기서 놓치는 것은
-    실패가 아니라 "그때는 아직 존재하지 않았던 데이터"다. 조각이 전부 성공했으므로
-    재시도 마커도 남지 않고, 그냥 재실행하면 완결된 윈도우라 SKIPPED가 된다.
-
-    `trigger_rule=ALL_DONE`인 이유: 과거를 보강하는 일이라 현재 tick의 수집이
-    실패했어도 시도할 가치가 있고, 반대로 이 태스크가 실패해도 현재 tick을 막아선
-    안 된다(그래서 DAG에서 run_inference의 상위로 두지 않는다).
+    Args:
+        dag: 태스크를 붙일 DAG
+        source_id: 통계를 볼 source ID
+        day_template: ``--window-day`` 템플릿
+        hour_template: ``--window-hour`` 템플릿. 없으면 하루 전체
+    Returns:
+        구성된 BashOperator
     """
-    timeout = EXECUTION_TIMEOUT_OVERRIDES.get(source_id, DEFAULT_EXECUTION_TIMEOUT)
-    window_start = kst_window_start_shifted(hours_back)
-    cmd = (
-        f"uv run --frozen python main.py --source {source_id} "
-        f"--window-start {window_start} --force"
-    )
+    args = [
+        "main.py", "--report-window-stats",
+        "--source", source_id,
+        "--window-day", f'"{day_template}"',
+    ]
+    if hour_template is not None:
+        args.extend(["--window-hour", f'"{hour_template}"'])
     return build_module_task(
         dag,
-        f"collect_{source_id}_replay_{hours_back}h",
+        f"collection_stats_{source_id}",
         COLLECTOR_DIR,
-        cmd,
-        execution_timeout=timeout,
-        trigger_rule=TriggerRule.ALL_DONE,
-    )
-
-
-def build_daily_history_replay_task(dag, hour: int, days_back: int):
-    """과거 날짜의 대여이력 한 시간대를 실패 전파 없이 전체 재수집한다.
-
-    시간별 태스크는 API 동시 요청을 제한하려고 순차 연결하지만, 한 시간대의 최종
-    실패가 나머지 23개 시간대까지 막아서는 안 되므로 ``ALL_DONE``으로 실행한다.
-    """
-    source_id = "bike_rental_history"
-    window_start = kst_day_hour_replay_days_ago(days_back, hour)
-    cmd = (
-        f"uv run --frozen python main.py --source {source_id} "
-        f"--window-start {window_start} --force"
-    )
-    return build_module_task(
-        dag,
-        f"replay_{source_id}_{hour:02d}h",
-        COLLECTOR_DIR,
-        cmd,
-        execution_timeout=EXECUTION_TIMEOUT_OVERRIDES.get(
-            source_id, DEFAULT_EXECUTION_TIMEOUT
-        ),
-        trigger_rule=TriggerRule.ALL_DONE,
+        uv_python_command(*args),
+        output_processor=json.loads,
+        execution_timeout=_STATS_EXECUTION_TIMEOUT,
+        retries=1,
     )

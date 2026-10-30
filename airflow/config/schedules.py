@@ -107,7 +107,7 @@ INFERENCE_EXECUTION_TIMEOUT = timedelta(seconds=300)
 # S3·RDS 네트워크 왕복이 되니 콜드 스타트(재사용할 이전 산출물이 없는 최초 실행)
 # 기준 165초가 걸렸다(2026-08-21, CPU는 21초뿐이라 대부분 네트워크 I/O 대기).
 # 기존 120초는 이 실측 전의 placeholder였다 — 여유를 두고 300초로 올린다.
-DB_LOADER_EXECUTION_TIMEOUT = timedelta(seconds=300)
+SERVING_EXECUTION_TIMEOUT = timedelta(seconds=300)
 # 실측 데이터 없음(placeholder) — S3 tick 5~6개 + 예측 결과 1개만 읽는 순수 계산이라
 # 추론보다는 가볍게 잡았다. 로컬에서 1회 실행 시간을 재본 뒤 조정.
 URGENCY_EXECUTION_TIMEOUT = timedelta(seconds=180)

@@ -28,6 +28,19 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 _MODULE_UV_ENV_ROOT = "/opt/venvs/modules"
 
 
+def uv_python_command(*args: str, project: str | None = None) -> str:
+    """모듈 uv 프로젝트에서 python을 실행하는 셸 명령을 만든다.
+
+    Args:
+        *args: ``python`` 뒤에 붙일 스크립트와 인자. 셸에 그대로 이어 붙임
+        project: 작업 디렉터리와 다른 uv 프로젝트를 쓸 때의 ``--project`` 값
+    Returns:
+        ``uv run --frozen python ...`` 형태의 명령 문자열
+    """
+    uv = f"uv --project {project} run" if project else "uv run"
+    return " ".join([uv, "--frozen", "python", *args])
+
+
 def _module_project_environment(module_dir: str, uv_environment_name: str | None) -> str:
     environment_name = uv_environment_name or Path(module_dir).name
     if re.fullmatch(r"[a-z][a-z0-9-]*", environment_name) is None:
