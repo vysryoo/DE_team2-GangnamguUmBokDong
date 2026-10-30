@@ -11,7 +11,7 @@
 | `set_null` | None | 예 | — |
 | `fill_zero` | 0 | 예 | `TYPE_ERROR` 제외 |
 | `fill_default` | spec에 선언된 기본값 | 예 | `TYPE_ERROR` 제외 |
-| `clip_to_range` | 정상 범위의 경계로 자른 값 | 예 | `TYPE_ERROR`·`range`/`min`/`max` 미선언 제외 |
+| `clip_to_range` | 정상 범위의 경계로 자른 값 | 예 | `OUTLIER`·`range` 선언 컬럼만 |
 | `drop_row` | — (행 폐기) | — | — |
 | `fail_batch` | — (배치 실패) | — | — |
 
@@ -68,7 +68,7 @@ def fill_default(value: Any, issue: Issue, row: dict, ctx: RunContext) -> tuple[
 def clip_to_range(value: Any, issue: Issue, row: dict, ctx: RunContext) -> tuple[Any, Action]:
     """값을 정상 범위의 경계로 잘라낸다. 적용 조건이 안 맞으면 None으로 대신한다."""
     bounds = issue.spec.range
-    if issue.kind is not IssueKind.OUTLIER or bounds is None or bounds.min is None or bounds.max is None:
+    if issue.kind is not IssueKind.OUTLIER or bounds is None:
         return None, Action.KEEP
     return min(max(value, bounds.min), bounds.max), Action.KEEP
 

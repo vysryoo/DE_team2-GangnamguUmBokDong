@@ -1,13 +1,7 @@
-"""YAML 설정 파일에 명시된 정책 이름을 실제 파이썬 검증 함수로 연결해 주는 레지스트리이다.
+"""YAML의 정책 이름을 정책 함수로 연결하는 레지스트리.
 
-데이터 수집 시 문자열로 작성된 정책 이름을 파이썬 함수 객체로 매핑합니다.
-컬럼 정책(`@policy`)과 파라미터가 필요한 행 정책(`@row_policy`)을 분리하여 관리하며,
-외부 모듈이 오타를 검증하거나 요구 파라미터를 조회할 수 있도록 돕는 역할을 합니다.
-
-주의:
-- 중복 방지: 같은 이름의 정책을 중복 등록하면 예외가 발생하여 조용한 덮어쓰기를 방지합니다.
-- 부수 효과: 함수 등록은 데코레이터의 import 부수효과로 동작하므로, 사전에 함수들이 import 되어야 합니다.
-- 영구 기록: 정책 이름은 manifest에 영구 기록되므로 정책 이름을 바꿀 때는 신중해야 합니다.
+등록은 데코레이터의 import 부수효과로 이뤄지므로 `validation.policies`가 먼저 import돼야
+한다. 정책 이름은 manifest의 `policy_actions`에 영구 기록되므로 함부로 바꾸지 않는다.
 """
 
 from __future__ import annotations
@@ -35,8 +29,7 @@ class DuplicatePolicyError(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class RowPolicyEntry:
-    """파라미터가 필요한 정책을 등록할 때에는 모델을 넣어두고, 
-    파라미터가 필요 없는 정책을 등록할 때는 param_model에 None을 넣는다."""
+    """행 정책 함수와 params 모델. params가 없는 정책은 params_model이 None이다."""
 
     fn: RowPolicyFn
     params_model: type[BaseModel] | None
@@ -90,7 +83,7 @@ def get_row_policy(name: str) -> RowPolicyFn:
 
 
 def get_row_policy_params_model(name: str) -> type[BaseModel] | None:
-    """행 정책이 파라미터를 필요로 하는지, 필요하다면 어떤 Pydantic 모델을 써야하는가를 반환해준다."""
+    """행 정책의 params Pydantic 모델을 반환한다. params가 없는 정책이면 None."""
     return _row_entry(name).params_model
 
 
