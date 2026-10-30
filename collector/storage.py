@@ -45,14 +45,23 @@ class ImmutableSilverArtifact:
     row_count: int
 
 
-def _bronze_prefix(
-    source_id: str, window_start: datetime, revision: int | None = None
-) -> str:
-    """Bronze 조각들이 모이는 legacy 또는 immutable Hot prefix를 만든다."""
-    window = (
+def _bronze_window(source_id: str, window_start: datetime) -> str:
+    """Bronze prefix 중 source·window 부분을 만든다."""
+    return (
         f"{source_id}/dt={window_start:%Y-%m-%d}/hh={window_start:%H}/"
         f"{window_start:%H%M}/"
     )
+
+
+def bronze_prefix(
+    source_id: str, window_start: datetime, revision: int | None = None
+) -> str:
+    """Bronze 조각들이 모이는 prefix를 만든다.
+
+    revision이 None이면 Hot revision 도입 전 legacy prefix다. 기존 manifest와 Cold
+    Bronze 복원 경로가 아직 이 형태를 읽는다.
+    """
+    window = _bronze_window(source_id, window_start)
     if revision is None:
         return f"bronze/{window}"
     if revision < 0:
@@ -60,19 +69,9 @@ def _bronze_prefix(
     return f"bronze/hot/{window}revision={revision:010d}/"
 
 
-def bronze_prefix(
-    source_id: str, window_start: datetime, revision: int | None = None
-) -> str:
-    """Manifest에 기록할 canonical Bronze prefix를 반환한다."""
-    return _bronze_prefix(source_id, window_start, revision)
-
-
 def next_bronze_revision(source_id: str, window_start: datetime) -> int:
     """Manifest 저장 전 중단된 orphan까지 피해 다음 immutable revision을 고른다."""
-    window_prefix = (
-        f"bronze/hot/{source_id}/dt={window_start:%Y-%m-%d}/"
-        f"hh={window_start:%H}/{window_start:%H%M}/"
-    )
+    window_prefix = f"bronze/hot/{_bronze_window(source_id, window_start)}"
     revisions = []
     for key in list_keys(window_prefix):
         matched = re.match(rf"{re.escape(window_prefix)}revision=(\d{{10}})/", key)
@@ -89,7 +88,7 @@ def _bronze_part_key(
 ) -> str:
     """bronze 조각 하나의 전체 키를 만든다."""
     return (
-        f"{_bronze_prefix(source_id, window_start, revision)}"
+        f"{bronze_prefix(source_id, window_start, revision)}"
         f"part={chunk_key}.json.gz"
     )
 
@@ -145,16 +144,6 @@ def read_bronze(
             )
         )
     return [restored[part] for part in parts if part in restored]
-
-
-def clear_bronze(
-    source_id: str, window_start: datetime, revision: int | None = None
-) -> None:
-    """해당 윈도우의 bronze 조각을 모두 삭제한다.
-    수집 파이프라인이 에러로 뻗었을 때, 쓰레기 데이터가 남지 않도록 임시 조각들을 지워주는 역할."""
-    prefix = _bronze_prefix(source_id, window_start, revision)
-    keys = list_keys(prefix)
-    delete_objects(keys)
 
 
 def _layer_key(layer: str, source_id: str, window_start: datetime, ext: str) -> str:

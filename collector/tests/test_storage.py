@@ -14,7 +14,6 @@ from core.gold_publication.errors import (
     ObjectCollisionError,
 )
 from storage import (
-    clear_bronze,
     latest_source_snapshot_logical_dttm,
     list_source_snapshot_windows,
     list_window_manifest_payloads,
@@ -108,36 +107,6 @@ class TestBronzeRoundTrip:
         )
 
         assert next_bronze_revision("test_source", WINDOW_START) == 4
-
-
-class TestClearBronze:
-    def test_removes_all_parts_for_that_window(self):
-        write_bronze_part("test_source", WINDOW_START, "page-001", b"a")
-        write_bronze_part("test_source", WINDOW_START, "page-002", b"b")
-        write_bronze_part("test_source", WINDOW_START, "page-003", b"c")
-
-        clear_bronze("test_source", WINDOW_START)
-
-        listed = _s3().list_objects_v2(
-            Bucket=TEST_BUCKET, Prefix="bronze/test_source/dt=2026-08-12/hh=14/1410/"
-        )
-        assert listed.get("KeyCount", 0) == 0
-
-    def test_rerun_with_fewer_parts_leaves_no_ghosts(self):
-        write_bronze_part("test_source", WINDOW_START, "page-001", b"a")
-        write_bronze_part("test_source", WINDOW_START, "page-002", b"b")
-        write_bronze_part("test_source", WINDOW_START, "page-003", b"c")
-
-        clear_bronze("test_source", WINDOW_START)
-        write_bronze_part("test_source", WINDOW_START, "page-001", b"a2")
-
-        listed = _s3().list_objects_v2(
-            Bucket=TEST_BUCKET, Prefix="bronze/test_source/dt=2026-08-12/hh=14/1410/"
-        )
-        assert listed["KeyCount"] == 1
-
-    def test_clear_on_empty_prefix_does_not_raise(self):
-        clear_bronze("nonexistent_source", WINDOW_START)
 
 
 class TestWriteImmutableSilver:
