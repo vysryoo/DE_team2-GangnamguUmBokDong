@@ -1,10 +1,8 @@
-"""7개 모듈(collector/poi-master/normalizer/nowcasting/ml-inference/loader/rebalance)이 쓰는
-공용 subprocess-CLI BashOperator 팩토리.
+"""모듈 CLI를 독립 uv 환경에서 실행하는 BashOperator 팩토리.
 
-Airflow는 각 모듈을 독립된 CLI로만 호출한다 — 모듈 내부 코드를 import하지 않는다.
-모든 모듈은 저마다 별도의 uv 프로젝트/venv를 유지한다. Airflow 자체의
-``VIRTUAL_ENV``는 제거하되 모듈 환경은 Docker 전용 named volume 아래에 명시해,
-bind mount된 호스트 ``.venv``를 macOS와 Linux 컨테이너가 서로 덮어쓰지 않게 한다.
+Airflow는 각 모듈을 CLI로만 호출하고 모듈 코드를 import하지 않는다. 모듈 venv는
+Docker named volume 아래에 두어, bind mount된 호스트 ``.venv``를 macOS와 Linux
+컨테이너가 서로 덮어쓰지 않게 한다.
 """
 
 from __future__ import annotations
@@ -25,74 +23,36 @@ from config.schedules import (
     DEFAULT_RETRY_DELAY,
 )
 
-# 이 파일: airflow/orchestration/task_builder.py -> parents[2] == 저장소 루트.
-# docker-compose.yml이 저장소 전체를 /workspace에 마운트하므로 컨테이너 안에서도
-# 동일하게 성립한다.
+# docker-compose가 저장소 전체를 /workspace에 마운트하므로 컨테이너 안에서도 성립함
 REPO_ROOT = Path(__file__).resolve().parents[2]
 _MODULE_UV_ENV_ROOT = "/opt/venvs/modules"
-_RESOURCE_PROBE_PATH = "/workspace/ops/resource_probe.py"
-_RESOURCE_PROFILE_ROOT = "/workspace/airflow/resource-profiles"
-_RESOURCE_COMMAND_DELIMITER = "__AIRFLOW_RESOURCE_PROBE_COMMAND__"
-
-
-def _profiled_bash_command(command: str) -> str:
-    """모듈 명령을 task instance별 resource probe 실행으로 감싼다."""
-    if _RESOURCE_COMMAND_DELIMITER in command:
-        raise ValueError("bash_command에 resource probe 예약 구분자를 사용할 수 없습니다.")
-    manifest = (
-        f"{_RESOURCE_PROFILE_ROOT}/{{{{ dag.dag_id }}}}/{{{{ run_id }}}}/"
-        "{{ task.task_id }}/map-{{ ti.map_index }}/try-{{ ti.try_number }}.json"
-    )
-    return (
-        f"/usr/local/bin/python3 {_RESOURCE_PROBE_PATH} "
-        f'--manifest "{manifest}" '
-        '--label "{{ dag.dag_id }}.{{ task.task_id }}" '
-        '--sample-seconds "${AIRFLOW_RESOURCE_PROBE_SAMPLE_SECONDS:-1}" '
-        '--filesystem-path /workspace '
-        '--metadata "dag_id={{ dag.dag_id }}" '
-        '--metadata "run_id={{ run_id }}" '
-        '--metadata "task_id={{ task.task_id }}" '
-        '--metadata "try_number={{ ti.try_number }}" '
-        '--metadata "map_index={{ ti.map_index }}" '
-        '--metadata "executor=${AIRFLOW__CORE__EXECUTOR:-LocalExecutor}" '
-        '--metadata "parallelism=${AIRFLOW__CORE__PARALLELISM:-3}" '
-        '--metadata "max_active_tasks_per_dag='
-        '${AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG:-3}" '
-        f"-- /bin/bash -c \"$(cat <<'{_RESOURCE_COMMAND_DELIMITER}'\n"
-        f"{command}\n"
-        f"{_RESOURCE_COMMAND_DELIMITER}\n"
-        ')"'
-    )
 
 
 def _module_project_environment(module_dir: str, uv_environment_name: str | None) -> str:
-    """모듈의 독립 uv venv 경로를 검증해서 반환한다(BashOperator와 subprocess 호출이 공유)."""
     environment_name = uv_environment_name or Path(module_dir).name
-    if (
-        type(environment_name) is not str
-        or re.fullmatch(r"[a-z][a-z0-9-]*", environment_name) is None
-    ):
-        raise ValueError(
-            "uv_environment_name은 lowercase 영숫자와 하이픈만 허용합니다."
-        )
+    if re.fullmatch(r"[a-z][a-z0-9-]*", environment_name) is None:
+        raise ValueError("uv_environment_name은 lowercase 영숫자와 하이픈만 허용합니다.")
     return f"{_MODULE_UV_ENV_ROOT}/{environment_name}"
 
 
 def module_subprocess_env(
     module_dir: str, *, uv_environment_name: str | None = None
 ) -> dict[str, str]:
-    """모듈 venv를 가리키는 환경변수를 계산한다.
+    """PythonOperator 안에서 모듈 CLI를 ``subprocess``로 부를 때 쓸 환경변수를 만든다.
 
-    `build_module_task()`(BashOperator)를 못 쓰는 자리 — 예: PythonOperator/
-    ShortCircuitOperator의 callable 안에서 `subprocess.run()`으로 모듈 CLI를 직접
-    부를 때 — 를 위한 것이다. Airflow 자체의 ``VIRTUAL_ENV``를 물려받지 않도록
-    지운다(호스트/컨테이너가 `.venv`를 서로 덮어쓰지 않게 하는 이유는 이 파일
-    docstring 참고).
+    Args:
+        module_dir: 모듈 디렉터리 경로
+        uv_environment_name: 모듈 venv 이름. 기본값은 ``module_dir``의 마지막 경로명
+    Returns:
+        Airflow의 ``VIRTUAL_ENV``를 지우고 모듈 venv를 가리키는 환경변수
+    Raises:
+        ValueError: venv 이름이 lowercase 영숫자와 하이픈 형식이 아닌 경우
     """
-    project_environment = _module_project_environment(module_dir, uv_environment_name)
     env = dict(os.environ)
     env.pop("VIRTUAL_ENV", None)
-    env["UV_PROJECT_ENVIRONMENT"] = project_environment
+    env["UV_PROJECT_ENVIRONMENT"] = _module_project_environment(
+        module_dir, uv_environment_name
+    )
     return env
 
 
@@ -112,18 +72,29 @@ def build_module_task(
 ) -> BashOperator:
     """독립 uv 환경을 사용하는 모듈 CLI 태스크를 만든다.
 
-    args:
-        uv_environment_name: 기본값은 ``module_dir``의 마지막 경로명이다. uv의
-            ``--project``가 작업 디렉터리와 다른 프로젝트를 가리키는 경우에만
-            명시한다.
+    Args:
+        dag: 태스크를 붙일 DAG
+        task_id: 태스크 ID
+        module_dir: 명령을 실행할 모듈 디렉터리
+        bash_command: 실행할 셸 명령
+        retries: 재시도 횟수
+        retry_delay: 재시도 간격
+        execution_timeout: 실행 제한 시간
+        trigger_rule: 상위 태스크 상태에 따른 실행 조건
+        env: 추가 환경변수. Airflow 환경변수에 덧붙임
+        output_processor: 마지막 stdout 줄을 XCom 값으로 바꾸는 함수
+        uv_environment_name: 모듈 venv 이름. ``--project``가 작업 디렉터리와 다른
+            프로젝트를 가리킬 때만 지정
+    Returns:
+        구성된 BashOperator
+    Raises:
+        ValueError: venv 이름이 lowercase 영숫자와 하이픈 형식이 아닌 경우
     """
     project_environment = _module_project_environment(module_dir, uv_environment_name)
-    profiled_command = _profiled_bash_command(bash_command)
     arguments: dict[str, Any] = {
         "task_id": task_id,
         "bash_command": (
-            "env -u VIRTUAL_ENV "
-            f"UV_PROJECT_ENVIRONMENT={project_environment} {profiled_command}"
+            f"env -u VIRTUAL_ENV UV_PROJECT_ENVIRONMENT={project_environment} {bash_command}"
         ),
         "cwd": module_dir,
         "retries": retries,
