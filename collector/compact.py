@@ -93,7 +93,7 @@ def resolve_dates(args: argparse.Namespace, config, today: date) -> list[date]:
             raise SystemExit(f"--from({first})이 --to({last})보다 뒤다")
         return [first + timedelta(days=n) for n in range((last - first).days + 1)]
 
-    return compaction.target_dates(config, today)
+    return compaction.target_dates(today)
 
 
 def exit_code_for(results: list[compaction.DateResult]) -> int:
@@ -110,7 +110,7 @@ def main(argv: list[str] | None = None) -> int:
 
     today = today_kst()
     days = resolve_dates(args, config, today)
-    results = compaction.compact_range(config, days, today=today, force=args.force)
+    results = [compaction.compact_date(config, day, force=args.force) for day in days]
 
     tally: dict[str, int] = {}
     for result in results:

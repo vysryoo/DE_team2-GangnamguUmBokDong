@@ -8,7 +8,7 @@ import pytest
 
 import compact
 from compaction import RECOVERY_DAYS, DateResult
-from config.schema import Backfill, ColumnSpec, Policies, Quality, Schedule, SourceConfig
+from config.schema import ColumnSpec, Policies, Quality, Schedule, SourceConfig
 from config.schema import Storage as StorageConfig
 
 TODAY = date(2026, 8, 13)
@@ -87,14 +87,7 @@ class TestResolveDates:
     def test_default_uses_config_lookback(self):
         args = compact.parse_args(["--source", "t_source"])
 
-        assert len(compact.resolve_dates(args, _config(backfill=None), TODAY)) == RECOVERY_DAYS
-
-    def test_default_widens_for_long_backfill_window(self):
-        args = compact.parse_args(["--source", "t_source"])
-
-        dates = compact.resolve_dates(args, _config(backfill=Backfill(enabled=True, max_age="7d")), TODAY)
-
-        assert len(dates) == 8
+        assert len(compact.resolve_dates(args, _config(), TODAY)) == RECOVERY_DAYS
 
     def test_reversed_range_exits(self):
         args = compact.parse_args(

@@ -192,17 +192,6 @@ def write_immutable_silver(
     )
 
 
-def write_silver(source_id: str, window_start: datetime, table: pq.Table) -> str:
-    """Legacy/compaction Silver key에 테이블을 쓰고 key를 반환한다.
-
-    Authoritative Collector pipeline은 이 mutable 호환 경로를 사용하지 않고
-    ``write_immutable_silver``의 content-addressed object만 source manifest에 싣는다.
-    """
-    key = _layer_key("silver", source_id, window_start, "parquet")
-    write_parquet(table, key)
-    return key
-
-
 def read_immutable_silver_artifact(
     key: str,
     *,
@@ -240,24 +229,13 @@ def write_quarantine(
 def list_silver_objects(source_id: str, day: date) -> list[S3Object]:
     """해당 날짜의 silver parquet을 메타(size·last_modified)와 함께 나열한다.
 
-    compaction이 "이 날짜가 지난번 압축 이후 바뀌었는가"를 본문 없이 판정하는 근거다.
-    parquet이 아닌 객체는 거른다 — nowcaster가 같은 prefix 아래에 자기 산출물을
-    두는 경우가 있어(`silver/{src}/dt=.../hh=00/nowcast.parquet`) 확장자만으로는
-    부족할 수 있으나, 그 소스는 compaction 대상이 아니다.
+    compaction의 변경 감지와 silver GC의 삭제 후보가 이 목록을 근거로 한다.
     """
     return [
         o
         for o in list_objects(layout.silver_day_prefix(source_id, day))
         if o.key.endswith(".parquet")
     ]
-
-
-def delete_silver_objects(keys: list[str]) -> None:
-    """검증된 exact Silver parquet key만 일괄 삭제한다."""
-    for key in keys:
-        if not key.startswith("silver/") or not key.endswith(".parquet"):
-            raise ValueError(f"Silver GC 삭제 key가 안전 범위를 벗어났다: {key}")
-    delete_objects(keys)
 
 
 def write_archive(source_id: str, day: date, table: pq.Table) -> str:

@@ -32,15 +32,9 @@ def main(argv: list[str] | None = None) -> int:
         result = cold_bronze.recover_pending(
             args.source, today=today, delay_days=args.delay_days
         )
-        status = "completed_with_stale" if result.stale_markers else "completed"
         print(
             json.dumps(
-                {
-                    "status": status,
-                    "dates": result.dates,
-                    "objects": result.objects,
-                    "stale_markers": result.stale_markers,
-                }
+                {"status": "completed", "dates": result.dates, "objects": result.objects}
             )
         )
         return 0
