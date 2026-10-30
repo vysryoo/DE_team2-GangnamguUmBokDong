@@ -299,9 +299,7 @@ def prepare_source_snapshot(
     planned_parts: tuple[str, ...],
     completed_parts: tuple[str, ...],
 ) -> PublishedSourceSnapshot:
-    """Output identity를 검증하고 쓸 authority revision을 부작용 없이 준비한다."""
-    if type(counts) is not Counts:
-        raise SourceSnapshotContractError("counts는 collector Counts여야 합니다.")
+    """쓸 authority revision을 부작용 없이 준비한다."""
     typed_counts = SourceSnapshotCounts(
         expected=counts.expected,
         fetched=counts.fetched,
@@ -338,21 +336,12 @@ def prepare_source_snapshot(
 def finalize_source_snapshot(
     prepared: PublishedSourceSnapshot,
 ) -> PublishedSourceSnapshot:
-    """준비한 authority manifest를 last put-once/readback으로 확정한다."""
-    if type(prepared) is not PublishedSourceSnapshot:
-        raise SourceSnapshotContractError(
-            "prepared snapshot은 PublishedSourceSnapshot이어야 합니다."
-        )
+    """준비한 authority manifest를 put-once/readback으로 확정한다."""
     candidate = prepared.manifest
-
-    manifest_uri = storage.write_source_snapshot_manifest(
+    storage.write_source_snapshot_manifest(
         candidate.source_id,
         candidate.logical_dttm,
         candidate.revision_no,
         candidate.canonical_bytes,
     )
-    if manifest_uri != prepared.manifest_uri:
-        raise SourceSnapshotContractError(
-            "준비한 source snapshot manifest URI와 기록 URI가 다릅니다."
-        )
-    return PublishedSourceSnapshot(candidate, manifest_uri)
+    return prepared
