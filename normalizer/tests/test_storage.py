@@ -104,7 +104,7 @@ class TestReadRealtimeSilver:
         table = pa.table({"AREA_CD": ["POI001"]})
         put_source_snapshot("population_realtime", window_start, table)
 
-        result = storage.read_realtime_silver(window_start)
+        result = storage.read_realtime_snapshot(window_start).table
 
         assert result.column("AREA_CD").to_pylist() == ["POI001"]
 
@@ -114,14 +114,14 @@ class TestReadRealtimeSilver:
         table = pa.table({"AREA_CD": ["POI001"]})
         put_partial_source_snapshot("population_realtime", window_start, table)
 
-        result = storage.read_realtime_silver(window_start)
+        result = storage.read_realtime_snapshot(window_start).table
 
         assert result.column("AREA_CD").to_pylist() == ["POI001"]
 
     def test_raises_when_window_file_missing(self):
         window_start = datetime(2026, 8, 12, 14, 5, tzinfo=KST)
         with pytest.raises(storage.PartitionNotFoundError):
-            storage.read_realtime_silver(window_start)
+            storage.read_realtime_snapshot(window_start)
 
     def test_uses_recent_complete_after_current_complete_and_partial_are_missing(self):
         """현재 입력이 없으면 보정 전에 freshness 안의 과거 성공을 선택한다."""

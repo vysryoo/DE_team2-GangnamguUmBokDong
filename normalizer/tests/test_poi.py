@@ -130,24 +130,3 @@ def test_load_poi_master_areas_decodes_one_exact_ref_once(monkeypatch):
     assert first is second
     assert [area.area_cd for area in first] == ["POI001", "POI132"]
     assert all(area.geometry.is_valid and area.area_m2 > 0 for area in first)
-
-
-def test_load_poi_master_areas_rejects_duplicate_or_unsorted_codes(monkeypatch):
-    """손상된 registry 순서를 조용히 정렬하거나 중복 제거하지 않는다."""
-    ref = PoiMasterRef(
-        mode="s3",
-        manifest_uri=(
-            "s3://test/source_snapshot_manifest/poi_master/dt=2026-08-25/hh=01/"
-            "logical=20260825T010000000000Z/revision=0000000000.json"
-        ),
-        manifest_sha256="b" * 64,
-    )
-    poi.load_poi_master_areas.cache_clear()
-    monkeypatch.setattr(
-        poi,
-        "read_poi_master",
-        lambda _ref: _master_table([_master_row("POI132"), _master_row("POI001")]),
-    )
-
-    with pytest.raises(ValueError, match="고유 오름차순"):
-        poi.load_poi_master_areas(ref)

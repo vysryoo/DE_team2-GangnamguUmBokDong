@@ -193,10 +193,8 @@ def run(window_start: datetime) -> int:
     정적인 CELL_ID 목록만 쓰므로 당일 nowcaster와의 스케줄 경합은 이전 성공본으로
     안전하게 피하고 미래 snapshot은 선택하지 않는다.
     """
-    baseline_date = window_start.date()
-
     master_table = storage.read_station_master_silver(window_start)
-    baseline_date, grid_table = storage.read_latest_nowcast_grid(baseline_date)
+    baseline_date, grid_table = storage.read_latest_nowcast_grid(window_start.date())
     realtime_table = storage.read_latest_bike_realtime_silver(window_start)
     output, metrics = enrich_station_master(master_table, grid_table, realtime_table)
     output_key = storage.write_enriched_station_master(window_start, output)

@@ -17,7 +17,6 @@ from merge import (
     GridCell,
     PoiSnapshot,
     find_overlap_areas,
-    find_overlaps,
     merge_cell,
     merge_cell_total_only,
     round_output_row,
@@ -192,7 +191,7 @@ class TestMultiPoiSequentialUpdate:
         assert all(result.ages[c] == 0.0 for c in FEMALE_AGE_COLUMNS)
 
 
-class TestFindOverlaps:
+class TestOverlapAreaCalculation:
     def test_finds_intersecting_pairs_with_correct_area(self):
         cell = GridCell(
             cell_id="C1", h_dng_cd="H1", spop=100.0, ages=_zero_ages(),
@@ -207,18 +206,16 @@ class TestFindOverlaps:
             pop_estimate=100.0, geometry=box(10000, 10000, 10100, 10100), area_m2=10000.0,
         )
 
-        result = find_overlaps([cell], [overlapping_poi, far_poi])
+        result = find_overlap_areas([cell], [overlapping_poi, far_poi])
 
         assert set(result.keys()) == {"C1"}
-        pairs = result["C1"]
-        assert len(pairs) == 1
-        matched_poi, area = pairs[0]
-        assert matched_poi.area_cd == "POI001"
+        [(area_cd, area)] = result["C1"]
+        assert area_cd == "POI001"
         assert area == pytest.approx(150.0 * 150.0)  # 겹치는 사각형: (100,100)-(250,250)
 
     def test_no_pois_returns_empty_dict(self):
         cell = GridCell(cell_id="C1", h_dng_cd="H1", spop=1.0, ages=_zero_ages(), geometry=box(0, 0, 1, 1))
-        assert find_overlaps([cell], []) == {}
+        assert find_overlap_areas([cell], []) == {}
 
 
 class TestMergeCellTotalOnly:
