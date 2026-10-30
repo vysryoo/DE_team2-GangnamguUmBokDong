@@ -722,7 +722,7 @@ class S3ServingReleasePointerStore:
         self._client = (
             client if client is not None else cast(S3PointerClient, s3_io._client())
         )
-        self._bucket = bucket if bucket is not None else s3_io._bucket()
+        self._bucket = bucket if bucket is not None else s3_io.bucket_name()
 
     def read(self, key: str) -> PointerRead:
         """단일 GET 응답에서 pointer bytes와 ETag를 함께 읽는다."""
@@ -1582,7 +1582,7 @@ def publish_serving_release(
     _validate_station_source_binding(preflight, station_source, immutable)
     release_payload = manifest.canonical_bytes
     resolved_manifest_uri = release_manifest_uri or (
-        f"s3://{s3_io._bucket()}/{serving_release_manifest_key(manifest.sha256)}"
+        f"s3://{s3_io.bucket_name()}/{serving_release_manifest_key(manifest.sha256)}"
     )
     validate_content_addressed_s3_uri(
         resolved_manifest_uri,
@@ -2046,7 +2046,7 @@ def _put_once_and_readback(
 
 def _s3_uri(key: str, *, bucket: str | None) -> str:
     """Bucket-relative key를 현재 또는 명시된 bucket의 canonical S3 URI로 만든다."""
-    resolved_bucket = bucket if bucket is not None else s3_io._bucket()
+    resolved_bucket = bucket if bucket is not None else s3_io.bucket_name()
     _require_nonblank_nfc(resolved_bucket, "S3 bucket")
     if "/" in resolved_bucket or ":" in resolved_bucket:
         raise ServingReleaseContractError("S3 bucket 이름이 유효하지 않습니다.")
