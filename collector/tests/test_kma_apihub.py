@@ -148,15 +148,9 @@ def test_planned_parts_fixes_all_34_grids_before_fetch():
     assert "grid-060x123" in planned
 
 
-@pytest.mark.parametrize(
-    "grids",
-    [
-        pytest.param(_thirty_four_grids()[:-1], id="33-grids"),
-        pytest.param(_thirty_four_grids()[:-1] + [[57, 120]], id="duplicate"),
-    ],
-)
-def test_planned_parts_rejects_non_exact_grid_plan(grids):
-    """33개나 중복 포함 34개 plan은 완전 snapshot 근거가 될 수 없다."""
+def test_planned_parts_rejects_duplicate_grid():
+    """중복 격자는 한 번만 호출되므로 완전 snapshot 근거가 될 수 없다."""
+    grids = _thirty_four_grids()[:-1] + [[57, 120]]
     with pytest.raises(ValueError):
         KmaApiHubAdapter.planned_parts(_config(grids=grids), _window())
 

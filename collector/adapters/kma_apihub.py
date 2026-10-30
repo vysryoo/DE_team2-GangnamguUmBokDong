@@ -1,46 +1,24 @@
 """기상청 API 허브 어댑터.
 
-기상청 초단기 실황·예보(10분)와 단기예보(3시간)를 수집한다. 이 API는 전체 행 수를
-미리 알려주지 않아 `expected_total`이 항상 None이고, 완결도는 행이 아니라
-(성공 격자 / 계획 격자)로 계산되어 manifest의 `missing.basis`가 `parts`가 된다.
-`base_date`·`base_time`은 window로 계산한다.
+초단기실황·예보(10분)와 단기예보(3시간)를 수집한다. 전체 행 수를 알려주지 않아
+`expected_total`이 항상 None이고, 완결도는 (성공 격자 / 계획 격자)로 계산된다.
 
-`time_rule`로 발표 주기에 맞춰 window를 API가 허용하는 시각으로 보정한다:
+`time_rule`은 window를 API가 허용하는 발표 시각(`base_time`)으로 내린다.
+`freshness_rule`은 fetch에는 쓰지 않고 `main.py`의 freshness 판정에만 쓰는 폴링
+그리드다. 초단기실황·예보는 발표 그리드(시간당 1슬롯)와 실제 갱신 주기(10분·30분)가
+달라, 발표 그리드로 freshness를 판정하면 시간당 1번만 수집된다.
 
-| time_rule | 소스 | 규칙 | 예시 |
+| rule | 용도 | 규칙 | 예시 |
 | --- | --- | --- | --- |
-| `hourly` | 초단기실황 | 매시 정각 | 14:40 → 14:00 |
-| `half_hourly` | 초단기예보 | 매시 30분 | 14:40 → 14:30 |
-| `vilage_fcst` | 단기예보 | 02, 05, 08...시 정각 | 05:05 → 02:00 |
+| `hourly` | 초단기실황 fetch | 매시 정각(40분 발표) | 14:40 → 14:00, 14:39 → 13:00 |
+| `half_hourly` | 초단기예보 fetch | 매시 30분 | 14:40 → 14:30, 14:20 → 13:30 |
+| `vilage_fcst` | 단기예보 fetch | 02, 05, 08...시 정각(10분 발표) | 05:05 → 02:00 |
+| `ten_minutely` | freshness | 10분 단위 내림 | 14:37 → 14:30 |
+| `thirty_minutely` | freshness | 30분 단위 내림 | 14:37 → 14:30 |
 
-아래 둘은 fetch(API 파라미터 계산)에는 절대 쓰지 않는, `main.py`의 freshness
-판단(`--check-due-after-seconds`) 전용 그리드다(`adapter_params.freshness_rule`).
-`hourly`/`half_hourly`는 API가 허용하는 시각(시간당 1슬롯)일 뿐, 초단기실황/예보가
-실제로 갱신되는 주기(10분/30분)와는 다르다 — freshness 판단에 그대로 쓰면 시간당
-1번만 due가 되어 원래 주기보다 훨씬 드물게 수집한다(실제 운영에서 확인,
-2026-08-26). 발표 지연 보정이 필요 없는 순수 폴링 그리드라 hourly/half_hourly보다
-로직이 단순하다(내림만 한다):
-
-| time_rule | 소스 | 규칙 | 예시 |
-| --- | --- | --- | --- |
-| `ten_minutely` | 초단기실황(freshness) | 10분 단위 내림 | 14:37 → 14:30 |
-| `thirty_minutely` | 초단기예보(freshness) | 30분 단위 내림 | 14:37 → 14:30 |
-
-격자 하나의 행 수가 `numOfRows`(1000)를 넘으면(단기예보가 대표적: 3일치×14개
-카테고리=1052건) 응답 본문의 `totalCount`를 읽어 `pageNo`를 늘려가며 남은 페이지를
-전부 받는다. 여러 페이지를 받았어도 바깥에는 격자당 하나의 `FetchResult`만 내보낸다
-— 페이지는 이 어댑터 내부에서만 존재하는 구현 세부사항이고, 재시도·skip은 여전히
-격자 단위(`grid-060x127`)로만 이뤄진다. 페이지 중 하나라도 실패하면 그 격자 전체를
-실패로 처리해 다음 라운드가 처음부터(1페이지부터) 다시 받는다 — 부분 페이지만
-따로 재시도하면 "이 격자는 몇 페이지짜리였는지"를 라운드 사이에 기억할 방법이
-없기 때문이다.
-
-주의:
-- 인증키(`KMA_APIHUB_KEY`)는 로그·bronze에 남지 않게 마스킹한다.
-- 캐스팅은 검증 엔진의 `types`가 담당한다. pivot은 구조만 바꾸고 값은 문자열 그대로 둔다.
-- 실패 범주 판정은 base의 규칙을 따른다.
-- 페이지가 1개뿐이면(대부분의 경우) 원본 응답 바이트를 그대로 넘긴다. 2개 이상을
-  합칠 때만 페이지들의 item 배열을 이어붙인 JSON을 새로 만든다.
+격자 하나의 행 수가 `numOfRows`를 넘으면(단기예보 1052건) `totalCount`로 남은 페이지를
+받아 격자당 하나의 `FetchResult`로 합친다. 재시도·skip은 격자 단위이므로 페이지 중
+하나라도 실패하면 그 격자 전체를 실패로 처리한다.
 """
 
 from __future__ import annotations
@@ -71,12 +49,7 @@ if TYPE_CHECKING:
     from adapters.base import Window
 
 _BASE_URL = "https://apihub.kma.go.kr/api/typ02/openApi/VilageFcstInfoService_2.0"
-_NUM_OF_ROWS = 1000  # 격자 하나당 한 시각의 관측·예보 항목 수를 넉넉히 덮는 상한
-_EXPECTED_GRID_COUNT = 34
-# adapter_params에 concurrency를 선언하지 않은 소스는 순차로 돈다(seoul_openapi와
-# 같은 opt-in 관례). 단기예보(getVilageFcst)만 격자당 페이지 2장이 필요해 무거워서
-# concurrency를 켠다 — 실측(2026-08-23): 순차 50.89초 -> 4개씩 병렬로 크게 단축.
-_DEFAULT_CONCURRENCY = 1
+_NUM_OF_ROWS = 1000
 
 logger = logging.getLogger(__name__)
 
@@ -103,57 +76,40 @@ def _classify_result_code(code: str | None) -> FetchErrorKind | None:
 
 
 def adjust_base_time(dt: datetime, rule: str | None) -> datetime:
-    """기상청 API가 허용하는 가장 최근의 base_time으로 내림한다.
-
-    fetch 경로(API 호출 파라미터 계산)뿐 아니라 `main.py`의 freshness
-    판단(`--check-due-after-seconds`)에서도 쓴다 — 발표 그리드(예: 단기예보
-    02/05/08...시)에 스냅한 두 시각을 비교해야 "마지막 성공이 실제로 어느
-    슬롯이었는지"를 wall-clock 실행 시각과 무관하게 알 수 있다(그렇지 않으면
-    수집이 한 번 늦어질 때마다 그 지연이 다음 판단 기준에 그대로 누적돼
-    발표 슬롯과 점점 어긋난다 — 실제 운영에서 확인, 2026-08-26)."""
+    """`rule` 그리드에서 `dt` 이전 가장 최근 슬롯으로 내린다(모듈 docstring 표 참고)."""
     if not rule:
         return dt
 
     if rule == "hourly":
-        # 매시 정각 (초단기실황. 매시 40분 발표. 예: 14:40 -> 14:00, 14:39 -> 13:00)
         eval_dt = dt if dt.minute >= 40 else dt - timedelta(hours=1)
         return eval_dt.replace(minute=0, second=0, microsecond=0)
 
     if rule == "half_hourly":
-        # 매시 30분 (초단기예보. 예: 14:20 -> 13:30, 14:40 -> 14:30)
         if dt.minute < 30:
             return (dt - timedelta(hours=1)).replace(minute=30, second=0, microsecond=0)
         return dt.replace(minute=30, second=0, microsecond=0)
 
     if rule == "vilage_fcst":
-        # 단기예보: 02:00, 05:00, 08:00, 11:00, 14:00, 17:00, 20:00, 23:00
-        # API 발표는 기준시간 + 10분부터 이루어지므로, 현재 10분 미만이면 한 턴 앞당겨야 함
         eval_dt = dt if dt.minute >= 10 else dt - timedelta(hours=1)
         if eval_dt.hour < 2:
             return (eval_dt - timedelta(days=1)).replace(
                 hour=23, minute=0, second=0, microsecond=0
             )
-
-        k = (eval_dt.hour - 2) // 3
-        base_hour = 2 + 3 * k
+        base_hour = 2 + 3 * ((eval_dt.hour - 2) // 3)
         return eval_dt.replace(hour=base_hour, minute=0, second=0, microsecond=0)
 
     if rule == "ten_minutely":
-        # API 발표 그리드가 아니라 순수 폴링 그리드다 — `main.py`의 freshness
-        # 판단 전용(`adapter_params.freshness_rule`)이며 fetch 경로(base_time
-        # 파라미터 계산)에는 절대 쓰지 않는다. 발표 지연 보정이 필요 없으므로
-        # (우리가 그 주기로 폴링하겠다고 정한 값일 뿐, 기상청이 그 분에 맞춰
-        # 발표한다는 보장이 아니다) 그냥 10분 단위로 내림한다.
         return dt.replace(minute=(dt.minute // 10) * 10, second=0, microsecond=0)
 
     if rule == "thirty_minutely":
-        # ten_minutely와 같은 이유로 존재하는 순수 폴링 그리드(freshness 전용).
-        # `half_hourly`(API의 매시 30분 발표 그리드, 시간당 1슬롯)와 이름이
-        # 비슷해 헷갈리기 쉬운데, 이건 시간당 2슬롯(:00, :30)이다 — 절대
-        # 섞어 쓰지 않는다.
         return dt.replace(minute=(dt.minute // 30) * 30, second=0, microsecond=0)
 
     raise ValueError(f"알 수 없는 time_rule: {rule}")
+
+
+def _grid_key(nx: int, ny: int) -> str:
+    """격자 좌표로 조각 키를 만든다."""
+    return f"grid-{nx:03d}x{ny:03d}"
 
 
 def _extract(body: dict, root_key: str) -> list[dict]:
@@ -183,8 +139,7 @@ def _merge_pages(bodies: list[dict], root_key: str) -> bytes:
 
 @dataclass(frozen=True, slots=True)
 class _GridOutcome:
-    """격자 하나(페이지 여러 장 포함)를 전부 받은 뒤의 결과. 스레드풀 워커가
-    돌려주는 값이라 순수 데이터로 둔다."""
+    """격자 하나(페이지 여러 장 포함)를 전부 받은 뒤의 결과."""
 
     payload: bytes | None
     error: FetchErrorKind | None
@@ -199,11 +154,7 @@ def _fetch_grid(
     nx: int,
     ny: int,
 ) -> _GridOutcome:
-    """격자 하나를 필요한 만큼 페이지를 넘겨가며 받아 하나의 결과로 합친다.
-
-    페이지 중 하나라도 실패하면 그 격자 전체를 실패로 처리한다 — 부분 페이지만 따로
-    재시도하면 "이 격자는 몇 페이지짜리였는지"를 라운드 사이에 기억할 방법이 없다.
-    """
+    """격자 하나를 필요한 만큼 페이지를 넘겨가며 받아 하나의 결과로 합친다."""
     base_url = (
         f"{_BASE_URL}/{endpoint}?authKey={_api_key()}&dataType=JSON"
         f"&numOfRows={_NUM_OF_ROWS}"
@@ -246,11 +197,8 @@ def _fetch_grid(
 
         category = classify_http_status(response.status_code)
         if category is not None:
-            # FATAL(인증키 오류)이든 TRANSIENT/PERMANENT든 판정만 돌려준다 —
-            # "전체 중단할지"는 호출자(fetch)가 결정한다.
             return _GridOutcome(payload=None, error=category)
 
-        # HTTP 200 OK일 경우 본문의 resultCode 확인
         try:
             body = json.loads(response.content)
             if not isinstance(body, dict):
@@ -283,33 +231,15 @@ class KmaApiHubAdapter:
     """기상청 API 허브 공용 격자 반복 어댑터."""
 
     @staticmethod
-    def planned_parts(
-        config: SourceConfig,
-        window: Window,
-    ) -> frozenset[str]:
-        """Deadline 전에 config의 exact 34-grid 요청 계획을 고정한다.
+    def planned_parts(config: SourceConfig, window: Window) -> frozenset[str]:
+        """fetch 전에 격자 요청 계획을 고정한다.
 
-        KMA는 응답에서 전체 조각 수를 주지 않는다. 따라서 iterator가 deadline으로
-        첫 미방문 grid 전에 끊겨도 누락을 기록하려면 fetch를 시작하기 전에 전체 key를
-        만들어야 한다. 중복 grid는 34개처럼 보여도 한 번만 호출되므로 hard fail한다.
+        iterator가 budget으로 첫 미방문 격자 전에 끊겨도 누락을 기록하려면 전체 키를
+        미리 알아야 한다. 중복 격자는 한 번만 호출되므로 거부한다.
         """
-        del window
-        grids = config.adapter_params.get("grids")
-        if type(grids) is not list or len(grids) != _EXPECTED_GRID_COUNT:
-            raise ValueError("KMA source의 grids는 정확히 34개여야 합니다")
-
-        keys: list[str] = []
-        for grid in grids:
-            if (
-                type(grid) not in {list, tuple}
-                or len(grid) != 2
-                or type(grid[0]) is not int
-                or type(grid[1]) is not int
-            ):
-                raise ValueError("KMA grid는 정확히 두 builtin integer여야 합니다")
-            keys.append(f"grid-{grid[0]:03d}x{grid[1]:03d}")
-        if len(set(keys)) != _EXPECTED_GRID_COUNT:
-            raise ValueError("KMA source의 34개 grid는 중복될 수 없습니다")
+        keys = [_grid_key(nx, ny) for nx, ny in config.adapter_params["grids"]]
+        if len(set(keys)) != len(keys):
+            raise ValueError("KMA source의 grids는 중복될 수 없습니다")
         return frozenset(keys)
 
     @staticmethod
@@ -324,43 +254,29 @@ class KmaApiHubAdapter:
         params = config.adapter_params
         endpoint = params["endpoint"]
         root_key = params["root_key"]
-        time_rule = params.get("time_rule")
-
-        # time_rule 규칙에 따라 API 유효 시각으로 보정
-        adjusted_time = adjust_base_time(window.window_start, time_rule)
-        base_date = adjusted_time.strftime("%Y%m%d")
-        base_time = adjusted_time.strftime("%H%M")
-
+        base_time = adjust_base_time(window.window_start, params.get("time_rule"))
         grid_items = [
-            (f"grid-{nx:03d}x{ny:03d}", nx, ny)
+            (_grid_key(nx, ny), nx, ny)
             for nx, ny in params["grids"]
-            if f"grid-{nx:03d}x{ny:03d}" not in skip
+            if _grid_key(nx, ny) not in skip
         ]
 
         def fetch_one_grid(item: tuple[str, int, int]) -> _GridOutcome:
             _key, nx, ny = item
-            return _fetch_grid(client, endpoint, root_key, base_date, base_time, nx, ny)
-
-        # concurrency 미선언 소스는 순차로 돈다(seoul_openapi와 같은 opt-in 관례).
-        concurrency = max(1, int(params.get("concurrency", _DEFAULT_CONCURRENCY)))
-        if concurrency == 1:
-            for item in grid_items:
-                key, _nx, _ny = item
-                outcome = fetch_one_grid(item)
-                yield FetchResult(
-                    key=key, payload=outcome.payload, error=outcome.error, expected_total=None
-                )
-                if outcome.error is FetchErrorKind.FATAL:
-                    # 모든 격자가 같은 인증키를 쓰므로 나머지도 같은 이유로 실패한다.
-                    return
-            return
+            return _fetch_grid(
+                client,
+                endpoint,
+                root_key,
+                base_time.strftime("%Y%m%d"),
+                base_time.strftime("%H%M"),
+                nx,
+                ny,
+            )
 
         for (key, _nx, _ny), outcome in run_concurrent(
-            grid_items, concurrency, fetch_one_grid, "kma-grid"
+            grid_items, int(params.get("concurrency", 1)), fetch_one_grid, "kma-grid"
         ):
-            yield FetchResult(
-                key=key, payload=outcome.payload, error=outcome.error, expected_total=None
-            )
+            yield FetchResult(key=key, payload=outcome.payload, error=outcome.error)
 
     @staticmethod
     def normalize(chunks: list[bytes], config: SourceConfig) -> list[dict]:
@@ -370,7 +286,6 @@ class KmaApiHubAdapter:
         key_field, value_field = pivot["key"], pivot["value"]
 
         groups: dict[tuple, dict] = {}
-        order: list[tuple] = []
         for chunk in chunks:
             body = json.loads(chunk)
             for item in _extract(body, root_key):
@@ -381,9 +296,7 @@ class KmaApiHubAdapter:
                         if k not in (key_field, value_field)
                     )
                 )
-                if group_key not in groups:
-                    groups[group_key] = dict(group_key)
-                    order.append(group_key)
-                groups[group_key][item[key_field]] = item[value_field]
-
-        return [groups[k] for k in order]
+                groups.setdefault(group_key, dict(group_key))[item[key_field]] = item[
+                    value_field
+                ]
+        return list(groups.values())

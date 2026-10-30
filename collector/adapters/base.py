@@ -74,33 +74,25 @@ class FetchErrorKind(Enum):
 
 @dataclass(frozen=True, slots=True)
 class FetchResult:
-    """조각 하나의 결과. 성공이든 실패든 이 타입으로 나온다.
-    
+    """조각 하나의 결과. 실패도 예외 대신 `error`에 범주를 담아 반환한다.
+
     key: 조각 식별 키
     payload: 성공 시 원본 응답
-    error: 실패 시 범주 (TRANSIENT, PERMANENT, FATAL)
-    expected_total: 전체 행 수 (알 수 있는 소스의 첫 조각에만)
-    persist: payload를 bronze 조각으로 저장할지 여부. False는 페이지 탐색 종료처럼
-        expected_total만 전달하는 메타데이터 결과에만 사용한다.
-
-    에러 시 예외를 던지지 않고 종류를 적어서 반환한다.
-    파이프라인이 멈추지 않고 계속 진행하여 재시도 전략을 짤 수 있도록 하기 위함.
+    error: 실패 시 범주
+    expected_total: 전체 행 수. 알 수 있는 소스가 처음 알아낸 조각에만 싣는다
+    persist: False면 payload를 Bronze에 저장하지 않고 expected_total만 전달한다
     """
 
     key: str
-    payload: bytes | None
-    error: FetchErrorKind | None   
-    expected_total: int | None
+    payload: bytes | None = None
+    error: FetchErrorKind | None = None
+    expected_total: int | None = None
     persist: bool = True
 
 
 class Adapter(Protocol):
-    """API 제공처 하나에 대응하는 fetch · normalize 계약.
-    서울시 API든. 기상청 API든, 새로운 외부 데이터 소스를 추가할 때
-    fetch와 normalize 규격만 맞춰서 구현하면, 엔진이 알아서 파이프라인을 돌려준다.
-    """
+    """API 제공처 하나에 대응하는 fetch · normalize 계약."""
 
-    # fetch: 네트워크를 열어 원본 데이터를 가져오는 역할만 담당.
     @staticmethod
     def fetch(
         config: SourceConfig,
@@ -111,7 +103,6 @@ class Adapter(Protocol):
         expected_total: int | None = None,
     ) -> Iterator[FetchResult]: ...
 
-    # normalize: bytes 조각들을 파이썬 딕셔너리 리스트로 파싱하는 역할만 담당
     @staticmethod
     def normalize(chunks: list[bytes], config: SourceConfig) -> list[dict]: ...
 
@@ -149,20 +140,10 @@ def get_adapter(name: str) -> type:
     try:
         return _ADAPTERS[name]
     except KeyError:
-        listed = ", ".join(adapter_names()) or "(없음)"
+        listed = ", ".join(sorted(_ADAPTERS)) or "(없음)"
         raise UnknownAdapterError(
             f"어댑터 '{name}'이 등록되어 있지 않습니다. 등록된 이름: {listed}"
         ) from None
-
-
-def is_adapter_registered(name: str) -> bool:
-    """어댑터 이름이 등록돼 있는지 본다. 인스턴스를 만들지 않는다."""
-    return name in _ADAPTERS
-
-
-def adapter_names() -> tuple[str, ...]:
-    """등록된 어댑터 이름을 정렬된 튜플로 반환한다."""
-    return tuple(sorted(_ADAPTERS))
 
 
 _Item = TypeVar("_Item")
@@ -183,14 +164,21 @@ def run_concurrent(
     fetch_one: Callable[[_Item], _Outcome],
     thread_name_prefix: str,
 ) -> Iterator[tuple[_Item, _Outcome]]:
-    """items 순서를 유지하며 fetch_one(item)을 동시 실행해 (item, outcome) 순서대로 yield한다.
+    """items 순서를 유지하며 fetch_one(item)을 실행해 (item, outcome)을 yield한다.
 
-    서울시·기상청 등 여러 어댑터가 공유하는 병렬 조회 헬퍼다(원래 seoul_openapi.py에만
-    있었다). 완료 순서대로 내보내면(as_completed) 조각 키 순서가 흔들리므로, 앞 항목을
-    기다리는 동안에도 뒤 요청은 이미 나가 있게 해 전체 소요를 완료순과 같게 만든다.
-    미리 요청하는 개수를 concurrency의 2배로 묶는 이유는 메모리다 — 전부 던져두면
-    완료됐지만 아직 내보내지 않은 응답이 쌓인다.
+    `concurrency`가 1 이하면 순차로 돈다. 그보다 크면 앞 항목을 기다리는 동안 뒤 요청을
+    미리 보내되, 완료됐지만 아직 내보내지 않은 응답이 쌓이지 않게 concurrency의 2배까지만
+    미리 요청한다. 어느 쪽이든 FATAL을 만나면 나머지 항목을 요청하지 않는다(모든 조각이
+    같은 인증키를 쓴다).
     """
+    if concurrency <= 1:
+        for item in items:
+            outcome = fetch_one(item)
+            yield item, outcome
+            if outcome.error is FetchErrorKind.FATAL:
+                return
+        return
+
     pool = ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix=thread_name_prefix)
     try:
         queued = iter(items)
@@ -213,20 +201,15 @@ def run_concurrent(
             submit_next()
             yield item, outcome
             if outcome.error is FetchErrorKind.FATAL:
-                # 모든 조각이 같은 인증키를 쓰므로 나머지도 같은 이유로 실패한다.
                 return
     finally:
-        # `with ThreadPoolExecutor(...)`를 쓰면 __exit__이 shutdown(wait=True)라
-        # 큐에 남은 항목이 끝날 때까지 블록한다. fetch_with_rounds가 마감 시한을
-        # 넘겨 순회를 중단하고 이 제너레이터를 버릴 때 그 대기가 마감 시한 방어를
-        # 무력화한다. 실행 중인 요청은 끊을 수 없지만 대기 큐는 즉시 비운다.
+        # `with` 문의 shutdown(wait=True)는 fetch_with_rounds가 마감 시한으로 순회를
+        # 버릴 때 대기 큐가 끝날 때까지 블록한다. 대기 큐는 즉시 비운다.
         pool.shutdown(wait=False, cancel_futures=True)
 
 
 def classify_http_status(status_code: int) -> FetchErrorKind | None:
-    """HTTP 상태 코드를 실패 범주로 매핑한다. `None`은 성공(2xx)이다.
-    HTTP 상태만으로 성공/실패를 가르는 제공처가 공유하는 규칙이다.
-    """
+    """HTTP 상태 코드를 실패 범주로 매핑한다. `None`은 성공(2xx)이다."""
     if 200 <= status_code < 300:
         return None
     if status_code in (401, 403):
@@ -264,55 +247,44 @@ def fetch_with_rounds(
     on_chunk=None,
     planned_parts: frozenset[str] | None = None,
 ):
-    """실패분을 모아 재순회하는 공통 라운드 루프이다.
+    """TRANSIENT 조각만 모아 대기 후 다시 요청하는 라운드 루프를 돈다.
 
-    어댑터의 fetch 함수를 호출하여 데이터를 수집하며, 
-    TRANSIENT가 발생한 조각들을 모아 지정된 대기 시간 후 최대 지정된 라운드 횟수까지 재시도합니다.
-    어댑터는 이 라운드 로직을 알지 못하며 오직 파이프라인 엔진에서만 이 함수를 호출합니다.
+    fetch budget이 끝나면 새 요청을 시작하지 않는다. FATAL이 나오면 남은 라운드를 돌지
+    않는다.
 
-    args:
-        fetch_fn: 어댑터의 fetch 제너레이터 함수
-        config: 소스별 설정 객체
-        window: 수집 대상 시간 윈도우
-        client: 통신에 사용할 httpx 클라이언트
-        skip: 이미 확보되어 이번 수집에서 건너뛸 조각 키들의 집합
-        expected_total: 예상되는 전체 데이터 건수 (이전 라운드나 백필에서 넘겨줌)
-        sleep_fn: 대기 함수 (테스트 시 모킹용)
-        now_fn: 현재 시간 측정 함수 (테스트 시 모킹용)
-        on_chunk: 조각 수집 성공 시 즉시 실행할 콜백 함수 (보통 S3 스트리밍 저장용)
-        planned_parts: 어댑터가 요청 전에 알 수 있는 전체 조각 키. 조기 budget
-            종료로 iterator가 도달하지 못한 키도 누락으로 기록하는 데 사용한다.
-    returns:
-        성공분(chunks), 누락분(missing), 전체 행 수(expected_total)를 담은 FetchRoundResult 객체
+    Args:
+        fetch_fn: 어댑터의 fetch 제너레이터 함수.
+        config: 소스 설정.
+        window: 수집 대상 window.
+        client: 어댑터에 넘길 httpx 클라이언트.
+        skip: 이미 확보해 건너뛸 조각 키.
+        expected_total: 이미 알고 있는 전체 행 수.
+        sleep_fn: 라운드 간 대기 함수.
+        now_fn: budget 계산용 단조 시계.
+        on_chunk: 성공 조각마다 즉시 호출할 콜백(pipeline의 Bronze 저장).
+        planned_parts: 요청 전에 아는 전체 조각 키. budget 종료로 iterator가 도달하지
+            못한 키도 누락으로 기록한다.
+    Returns:
+        성공 조각, 누락 조각, 전체 행 수를 담은 FetchRoundResult.
+    Raises:
+        ValueError: 저장 대상 성공 조각의 payload가 None일 때.
     """
     collected: dict[str, bytes] = {}
     permanent: dict[str, FetchErrorKind] = {}
     transient: dict[str, FetchErrorKind] = {}
-
-    # (1) 마감 시한 방어
-    # fetch_budget: window 하나의 fetch 전체에 걸리는 시간 제한
     deadline = now_fn() + config.effective_fetch_budget().total_seconds()
 
     for round_index in range(MAX_ROUNDS):
-        # 라운드 1·2는 재시도할 TRANSIENT가 없으면 돌지 않는다.
         if round_index > 0 and not transient:
             break
-        # 이미 시작된 라운드는 끝까지 진행한다.
         if now_fn() >= deadline:
             break
 
-        # (2) 재시도 타겟팅
-        # skip: 저번 배치에서 이미 성공했던 것들
-        # collected.keys(): 방금 전 라운드에서 방금 성공한 것들
-        # permanent.keys(): 아예 포기하기로 확정된 것들
-
         round_skip = frozenset(skip) | collected.keys() | permanent.keys()
         transient = {}
-        aborted = False  # FATAL로 이번 fetch 전체를 접었는지
-
+        aborted = False
         iterator = fetch_fn(config, window, client=client, skip=round_skip, expected_total=expected_total)
-        
-        # 새 호출을 시작하기 직전에만 budget을 체크한다.
+
         while True:
             if now_fn() >= deadline:
                 aborted = True
@@ -322,10 +294,8 @@ def fetch_with_rounds(
             except StopIteration:
                 break
 
-            # probe 소스는 재시도 중 snapshot이 늘었음을 종료 probe로 발견할 수 있다.
-            # 이미 확정한 하한보다 큰 total은 갱신하되, 더 작은 값으로 줄여 기존
-            # Bronze payload를 정상으로 오인하지 않는다(어댑터도 shrink를 TRANSIENT로
-            # 막는다).
+            # probe 소스가 재시도 중 늘어난 total을 발견하면 갱신하되, 더 작은 값으로
+            # 줄여 기존 Bronze payload를 정상으로 오인하지 않는다.
             if result.expected_total is not None:
                 expected_total = max(expected_total or 0, result.expected_total)
 
@@ -333,37 +303,24 @@ def fetch_with_rounds(
                 if result.payload is None:
                     raise ValueError("저장할 성공 조각의 payload는 None일 수 없습니다")
                 collected[result.key] = result.payload
-
-                # (3) 스트리밍 저장
-                # on_chunk 콜백 함수(pipeline이 즉시 bronze에 쓴다)
                 if on_chunk is not None:
                     on_chunk(result.key, result.payload)
             elif result.error is None:
-                # probe 종료 신호처럼 expected_total만 전달하는 메타데이터 결과다.
-                # bronze part·완결도 조각 수에 포함하면 빈 종료 페이지가 실제 데이터
-                # 페이지처럼 보이고 다음 라운드의 skip에도 섞이므로 저장하지 않는다.
                 continue
             elif result.error is FetchErrorKind.FATAL:
-                # 모든 조각이 같은 인증키를 쓰므로 하나가 FATAL이면 나머지도 잘못되었을 것이므로,
-                # 라운드를 더 돌 이유가 없어 즉시 전체를 접는다.
                 permanent[result.key] = result.error
                 aborted = True
                 break
             elif result.error is FetchErrorKind.PERMANENT:
-                permanent[result.key] = result.error  # 이 조각만 누락 확정, 재시도 안 함
-            else:  # TRANSIENT
-                transient[result.key] = result.error  # 다음 라운드가 다시 시도한다
+                permanent[result.key] = result.error
+            else:
+                transient[result.key] = result.error
 
         if aborted:
             break
-
-        # 마지막 라운드 뒤에는 대기하지 않는다.
-        # transient가 비었을 때도 대기하지 않는다.
         if round_index < len(ROUND_WAITS_SECONDS) and transient:
             sleep_fn(ROUND_WAITS_SECONDS[round_index])
 
-    # 여기까지 남은 transient는 라운드를 다 써버려서 더 재시도하지 못하는 것들이다.
-    # permanent와 합쳐 이번 실행에서 못 받은 조각으로 pipeline에 돌려준다.
     missing = {**permanent, **transient}
     if planned_parts is not None:
         covered = frozenset(skip) | collected.keys() | missing.keys()
