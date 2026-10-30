@@ -15,16 +15,17 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 from xml.etree import ElementTree
-from zoneinfo import ZoneInfo
 
 import httpx
 import pyarrow.parquet as pq
 import pytest
 from core.forecast import POPULATION_FORECAST_SLOT_COUNT
+from core.kst import KST
 
-pytestmark = pytest.mark.usefixtures("_bucket")
+pytestmark = pytest.mark.usefixtures("s3_bucket")
 
 from core.s3 import get_object_bytes
+from core.sources import COLLECTOR_SOURCE_IDS
 
 import config.loader as config_loader
 import pipeline
@@ -35,7 +36,6 @@ from adapters import (  # noqa: F401 — @adapter 등록을 위한 import
 )
 from manifest import RunStatus
 
-KST = ZoneInfo("Asia/Seoul")
 SOURCES_DIR = Path(__file__).resolve().parent.parent / "sources"
 SOURCE_IDS = sorted(p.stem for p in SOURCES_DIR.glob("*.yaml"))
 OFFICIAL_POI_LIST = (
@@ -733,3 +733,8 @@ class TestKmaSourceEndToEnd:
         grids = config.adapter_params["grids"]
 
         assert len(grids) == len({tuple(g) for g in grids})
+
+
+def test_source_yaml_ids_match_core_sources() -> None:
+    """`core.sources`의 수집 source 목록이 YAML 파일과 정확히 같은지 확인한다."""
+    assert SOURCE_IDS == sorted(COLLECTOR_SOURCE_IDS)

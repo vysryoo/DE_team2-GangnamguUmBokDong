@@ -5,8 +5,9 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import date, datetime
-from zoneinfo import ZoneInfo
+from datetime import date
+
+from core.kst import today_kst
 
 import hot_bronze_gc
 
@@ -17,7 +18,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--today", type=date.fromisoformat)
     parser.add_argument("--retention-days", type=int, default=30)
     args = parser.parse_args(argv)
-    today = args.today or datetime.now(ZoneInfo("Asia/Seoul")).date()
+    today = args.today or today_kst()
     result = hot_bronze_gc.recover_due(
         args.source, today=today, retention_days=args.retention_days
     )

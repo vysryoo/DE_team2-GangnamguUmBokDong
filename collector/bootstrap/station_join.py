@@ -44,9 +44,9 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 import httpx
+from core.kst import KST
 
 from bootstrap.globbing import glob_normalized
 
@@ -59,7 +59,6 @@ _PAGE_SIZE = 1000
 # 총건수를 잘못 주더라도 여기서 끊긴다.
 _MAX_PAGES = 20
 
-_KST = ZoneInfo("Asia/Seoul")
 
 # 대여소명 앞에 붙는 번호. `"102. 망원역 1번출구 앞"` -> `102`.
 _NAME_PREFIX = re.compile(r"^\s*(\d+)\s*\.")
@@ -241,7 +240,7 @@ def build(csv_dir: Path | None, *, client: httpx.Client | None = None) -> Statio
         by_number.setdefault(number, StationInfo(station_id=station_id))
 
     stats = {
-        "built_at": datetime.now(tz=_KST).isoformat(),
+        "built_at": datetime.now(tz=KST).isoformat(),
         "api_stations": len(api_rows),
         "history_stations": len(history),
         # 대여소번호 하나가 기간에 따라 서로 다른 station_id로 나타난 건수. manifest에

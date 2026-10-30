@@ -5,15 +5,14 @@ from __future__ import annotations
 import json
 import re
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
 
 from adapters.base import FetchErrorKind, Window, fetch_with_rounds
 from adapters.seoul_openapi import NaturalKeyCardinalityError, SeoulOpenApiAdapter
+from core.kst import KST
 
-KST = ZoneInfo("Asia/Seoul")
 
 
 class _StubConfig:

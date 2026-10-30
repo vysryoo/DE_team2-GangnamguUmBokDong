@@ -15,9 +15,9 @@ from core.s3 import (
     read_json,
     write_json,
 )
-from tests.conftest import KST
+from core.kst import KST
 
-pytestmark = pytest.mark.usefixtures("_bucket")
+pytestmark = pytest.mark.usefixtures("s3_bucket")
 
 DAY = date(2026, 8, 12)
 WINDOW = datetime(2026, 8, 12, 14, 55, tzinfo=KST)

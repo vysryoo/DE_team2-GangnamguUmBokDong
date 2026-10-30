@@ -6,7 +6,6 @@ import json
 import logging
 import re
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
@@ -16,8 +15,8 @@ from adapters.kma_apihub import (
     adjust_base_time,
     _classify_result_code,
 )
+from core.kst import KST
 
-KST = ZoneInfo("Asia/Seoul")
 
 
 class _StubConfig:

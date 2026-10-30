@@ -5,8 +5,9 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import date, datetime
-from zoneinfo import ZoneInfo
+from datetime import date
+
+from core.kst import today_kst
 
 import cold_bronze
 
@@ -27,7 +28,7 @@ def main(argv: list[str] | None = None) -> int:
     """Cold Bronze를 생성하고 기계 판독 가능한 결과 한 줄을 출력한다."""
     args = parse_args(argv)
     if args.recover_pending:
-        today = args.today or datetime.now(ZoneInfo("Asia/Seoul")).date()
+        today = args.today or today_kst()
         result = cold_bronze.recover_pending(
             args.source, today=today, delay_days=args.delay_days
         )

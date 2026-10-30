@@ -22,9 +22,9 @@ from config.schema import Compaction as CompactionConfig
 from config.schema import Storage as StorageConfig
 from manifest import Artifacts, Counts, Manifest, RunStatus, Stage
 from storage import read_archive_manifest, write_silver
-from tests.conftest import KST
+from core.kst import KST
 
-pytestmark = pytest.mark.usefixtures("_bucket")
+pytestmark = pytest.mark.usefixtures("s3_bucket")
 
 DAY = date(2026, 8, 12)
 TODAY = date(2026, 8, 13)

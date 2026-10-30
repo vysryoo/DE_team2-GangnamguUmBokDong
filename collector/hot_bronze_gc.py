@@ -6,10 +6,10 @@ import hashlib
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from zoneinfo import ZoneInfo
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+from core.kst import KST
 from core.s3 import (
     delete_objects,
     get_object_bytes,
@@ -19,7 +19,6 @@ from core.s3 import (
     write_json,
 )
 
-_KST = ZoneInfo("Asia/Seoul")
 _MANIFEST_KEY = re.compile(
     r"\Abronze/cold_manifest/(?P<source>[a-z][a-z0-9_]*)/"
     r"dt=(?P<day>\d{4}-\d{2}-\d{2})\.json\Z"
@@ -107,7 +106,7 @@ def collect_date(
     if unknown:
         raise RuntimeError(f"Cold에 포함되지 않은 Hot object가 있다: {unknown[:5]}")
 
-    cutoff = (now or datetime.now(_KST)) - timedelta(days=retention_days)
+    cutoff = (now or datetime.now(KST)) - timedelta(days=retention_days)
     candidates = sorted(obj.key for obj in hot_objects if obj.last_modified <= cutoff)
     retained = len(hot_objects) - len(candidates)
     base = {
@@ -138,7 +137,7 @@ def collect_date(
             "status": status,
             "deleted_keys": candidates,
             "retained": retained,
-            "completed_at": datetime.now(_KST).isoformat(),
+            "completed_at": datetime.now(KST).isoformat(),
         },
     )
     return HotGcResult(dates=1, deleted=len(candidates), retained=retained)

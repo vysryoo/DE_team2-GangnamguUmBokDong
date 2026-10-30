@@ -10,7 +10,7 @@ from compaction import compact_date
 from core.s3 import get_object_bytes, read_json
 from tests.test_compaction_run import DAY, TODAY, _config, _publish_succeeded, _window
 
-pytestmark = pytest.mark.usefixtures("_bucket")
+pytestmark = pytest.mark.usefixtures("s3_bucket")
 
 
 def _prepare_cold() -> None:

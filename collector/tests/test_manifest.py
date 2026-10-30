@@ -1,7 +1,6 @@
 """manifest.py의 상태 어휘와 Manifest·RetryMarker 모델을 검증한다."""
 
 from datetime import date, datetime
-from zoneinfo import ZoneInfo
 
 import manifest as manifest_module
 import pytest
@@ -23,10 +22,10 @@ from manifest import (
     save_retry_marker,
 )
 from pydantic import BaseModel, ValidationError
+from core.kst import KST
 
-pytestmark = pytest.mark.usefixtures("_bucket")
+pytestmark = pytest.mark.usefixtures("s3_bucket")
 
-KST = ZoneInfo("Asia/Seoul")
 WINDOW_START = datetime(2026, 8, 12, 14, 10, tzinfo=KST)
 WINDOW_END = datetime(2026, 8, 12, 14, 15, tzinfo=KST)
 

@@ -39,19 +39,19 @@ import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from math import ceil
-from zoneinfo import ZoneInfo
 
 import manifest as manifest_module
 import pyarrow as pa
 import storage
 from config.schema import SourceConfig
-from core.s3 import S3Object, read_parquet
+from core import layout
+from core.kst import KST
+from core.s3 import S3Object, object_uri, read_parquet
 from core.source_snapshot import SourceSnapshotManifest, SourceSnapshotStatus
 from manifest import RunStatus, Stage
 
 logger = logging.getLogger(__name__)
 
-_KST = ZoneInfo("Asia/Seoul")
 
 # 배치가 안 돈 날을 되채우는 하한. airflow가 CATCHUP=False로 돌아서 놓친 스케줄은
 # 다시 실행되지 않으므로, 검사 범위가 그걸 복구하는 유일한 수단이다. D-6 대여이력
@@ -116,7 +116,7 @@ def _parse_silver_key(key: str) -> _ParsedSilverKey:
         raise ValueError(f"silver 키의 hh partition과 파일 시각이 다르다: {key}")
     try:
         window_start = datetime.strptime(f"{day} {hhmm}", "%Y-%m-%d %H%M").replace(
-            tzinfo=_KST
+            tzinfo=KST
         )
     except ValueError as exc:
         raise ValueError(f"silver 키의 윈도우 시각이 유효하지 않다: {key}") from exc
@@ -339,14 +339,13 @@ def _snapshot_silver_key(
     if snapshot.silver_uri is None or snapshot.silver_byte_sha256 is None:
         raise ValueError("SUCCEEDED source snapshot에 Silver identity가 없다.")
 
-    kst_window = snapshot.logical_dttm.astimezone(_KST)
+    kst_window = snapshot.logical_dttm.astimezone(KST)
     if kst_window.second or kst_window.microsecond:
         raise ValueError("Silver minute key로 표현할 수 없는 source logical_dttm이다.")
-    key = (
-        f"silver/{source_id}/dt={kst_window:%Y-%m-%d}/hh={kst_window:%H}/"
-        f"{kst_window:%H%M}/sha256={snapshot.silver_byte_sha256}.parquet"
+    key = layout.silver_content_key(
+        source_id, kst_window, snapshot.silver_byte_sha256
     )
-    if snapshot.silver_uri != storage.object_uri(key):
+    if snapshot.silver_uri != object_uri(key):
         raise ValueError("source snapshot의 Silver URI가 canonical key와 다르다.")
     return key
 
@@ -627,7 +626,7 @@ def compact_date(
             "selected_silver_keys": [
                 item.object.key for item in authority.selected
             ],
-            "compacted_at": datetime.now(tz=_KST).isoformat(),
+            "compacted_at": datetime.now(tz=KST).isoformat(),
         },
     )
     logger.info(
