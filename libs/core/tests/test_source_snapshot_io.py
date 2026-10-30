@@ -3,7 +3,6 @@
 import io
 import json
 from datetime import UTC, datetime, timedelta
-from zoneinfo import ZoneInfo
 
 import boto3
 import pyarrow as pa
@@ -12,11 +11,7 @@ import pytest
 from botocore.exceptions import EndpointConnectionError
 
 from core.gold_publication.canonical import sha256_hex
-from core.source_snapshot import (
-    SourceSnapshotCounts,
-    SourceSnapshotStatus,
-    build_source_snapshot_manifest,
-)
+from core.kst import KST
 from core.source_snapshot_io import (
     PartialConsumptionPolicy,
     SourceDataStatus,
@@ -29,9 +24,7 @@ from core.source_snapshot_io import (
     read_latest_source_snapshot,
     read_partial_source_snapshot,
 )
-
-KST = ZoneInfo("Asia/Seoul")
-TEST_BUCKET = "test-bucket"
+from core.testing import TEST_BUCKET, PutSourceSnapshot, put_source_snapshot
 
 
 def _put_snapshot(
@@ -41,47 +34,15 @@ def _put_snapshot(
     revision: int = 0,
     source_id: str = "population_realtime",
     manifest_rows: int | None = None,
-) -> tuple[str, str, str]:
+) -> PutSourceSnapshot:
     """테스트용 content-addressed Parquet과 authority manifest를 쓴다."""
-    buffer = io.BytesIO()
-    pq.write_table(pa.Table.from_pylist(rows), buffer)
-    body = buffer.getvalue()
-    checksum = sha256_hex(body)
-    silver_key = (
-        f"silver/{source_id}/dt={logical:%Y-%m-%d}/hh={logical:%H}/"
-        f"{logical:%H%M}/sha256={checksum}.parquet"
-    )
-    reported_rows = len(rows) if manifest_rows is None else manifest_rows
-    manifest = build_source_snapshot_manifest(
-        source_id=source_id,
-        logical_dttm=logical,
+    return put_source_snapshot(
+        source_id,
+        logical,
+        pa.Table.from_pylist(rows),
         revision_no=revision,
-        status=SourceSnapshotStatus.SUCCEEDED,
-        config_version="fixture-v1",
-        silver_uri=f"s3://{TEST_BUCKET}/{silver_key}",
-        silver_byte_sha256=checksum,
-        counts=SourceSnapshotCounts(
-            reported_rows,
-            reported_rows,
-            reported_rows,
-            0,
-            0,
-        ),
-        planned_parts=("page=1",),
-        completed_parts=("page=1",),
+        manifest_rows=manifest_rows,
     )
-    utc = logical.astimezone(ZoneInfo("UTC"))
-    manifest_key = (
-        f"source_snapshot_manifest/{source_id}/dt={utc:%Y-%m-%d}/hh={utc:%H}/"
-        f"logical={utc:%Y%m%dT%H%M%S}{utc.microsecond:06d}Z/"
-        f"revision={revision:010d}.json"
-    )
-    client = boto3.client("s3", region_name="us-east-1")
-    client.put_object(Bucket=TEST_BUCKET, Key=silver_key, Body=body)
-    client.put_object(
-        Bucket=TEST_BUCKET, Key=manifest_key, Body=manifest.canonical_bytes
-    )
-    return f"s3://{TEST_BUCKET}/{manifest_key}", manifest.sha256, silver_key
 
 
 def test_exact_window_selects_latest_contiguous_correction() -> None:
