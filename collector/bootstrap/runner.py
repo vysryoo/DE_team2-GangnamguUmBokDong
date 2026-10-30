@@ -21,9 +21,9 @@ import logging
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from zoneinfo import ZoneInfo
 
 import pyarrow as pa
+from core.kst import KST
 
 import storage
 from bootstrap.config import BootstrapConfig
@@ -34,7 +34,6 @@ from validation.types import RunContext
 
 logger = logging.getLogger(__name__)
 
-_KST = ZoneInfo("Asia/Seoul")
 
 
 @dataclass(frozen=True)
@@ -62,7 +61,7 @@ def group_by_window(rows: list[dict], cfg: BootstrapConfig) -> dict[str, list[di
     groups: dict[str, list[dict]] = defaultdict(list)
     for row in rows:
         moment = datetime.strptime(row[cfg.window.from_column], cfg.window.format)
-        window = moment.replace(minute=0, second=0, microsecond=0, tzinfo=_KST)
+        window = moment.replace(minute=0, second=0, microsecond=0, tzinfo=KST)
         groups[window.isoformat()].append(row)
     return dict(groups)
 
@@ -120,7 +119,7 @@ def _materialize_empty(
             "column_issues": column_issues,
             "silver_present": silver_present,
             "materialized_empty": True,
-            "loaded_at": datetime.now(tz=_KST).isoformat(),
+            "loaded_at": datetime.now(tz=KST).isoformat(),
             **({"station_map": station_map_stats} if station_map_stats else {}),
         },
     )
@@ -267,7 +266,7 @@ def load_date(
         "out_of_range": out_of_range,
         "column_issues": column_issues,
         "silver_present": silver_present,
-        "loaded_at": datetime.now(tz=_KST).isoformat(),
+        "loaded_at": datetime.now(tz=KST).isoformat(),
         # 조인하지 않은 소스에는 키 자체를 두지 않는다.
         **({"station_map": station_map_stats} if station_map_stats else {}),
     })

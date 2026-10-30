@@ -12,6 +12,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 # pyrefly: ignore [missing-import]
+from core import layout
 from core.s3 import (
     get_object_bytes,
     get_object_metadata,
@@ -29,40 +30,21 @@ from core.source_snapshot_io import (
     read_latest_source_snapshot,
     read_partial_source_snapshot,
 )
+from core.sources import (
+    BIKE_STATION_MASTER,
+    BIKE_STATION_REALTIME,
+    LIVING_POPULATION_GRID,
+    LIVING_POPULATION_NORMALIZED,
+    POPULATION_REALTIME,
+    STATION_MASTER_ENRICHED,
+)
 
-GRID_SOURCE_ID = "living_population_grid"
-REALTIME_SOURCE_ID = "population_realtime"
-NORMALIZED_SOURCE_ID = "living_population_normalized"
 PARTIAL_POLICY = PartialConsumptionPolicy.REPAIR
-STATION_MASTER_SOURCE_ID = "bike_station_master"
-BIKE_REALTIME_SOURCE_ID = "bike_station_realtime"
-ENRICHED_STATION_MASTER_SOURCE_ID = "station_master_enriched"
-_NOWCAST_FILENAME = "nowcast.parquet"
 _NORMALIZED_SOURCE_WINDOW_METADATA = "normalized_source_window_start"
 
 
 class PartitionNotFoundError(RuntimeError):
     """요청한 Silver 파티션이 S3에 존재하지 않을 때 발생하는 예외."""
-
-
-def _silver_key(source_id: str, window_start: datetime, ext: str = "parquet") -> str:
-    """수집 윈도우 시각에 대응하는 Silver Parquet S3 키를 생성한다."""
-    return (
-        f"silver/{source_id}/dt={window_start:%Y-%m-%d}/hh={window_start:%H}/"
-        f"{window_start:%H%M}.{ext}"
-    )
-
-
-def _silver_date_prefix(source_id: str, baseline_date: date) -> str:
-    """해당 일자의 Silver S3 접두사(prefix)를 생성한다."""
-    return f"silver/{source_id}/dt={baseline_date:%Y-%m-%d}/"
-
-
-def _nowcast_key(target_date: date) -> str:
-    """해당 일자의 nowcaster 추정치 parquet S3 키를 반환한다(`nowcaster/storage.py`와 같은 규칙)."""
-    return (
-        f"{_silver_date_prefix(GRID_SOURCE_ID, target_date)}hh=00/{_NOWCAST_FILENAME}"
-    )
 
 
 def read_nowcast_grid(target_date: date) -> pa.Table:
@@ -81,10 +63,10 @@ def read_nowcast_grid(target_date: date) -> pa.Table:
     raises:
         PartitionNotFoundError: 해당 일자의 추정치 파일이 없을 때
     """
-    key = _nowcast_key(target_date)
+    key = layout.nowcast_key(target_date)
     body = get_object_bytes(key)
     if body is None:
-        raise PartitionNotFoundError(f"{GRID_SOURCE_ID}의 nowcast 추정치 없음: {key}")
+        raise PartitionNotFoundError(f"{LIVING_POPULATION_GRID}의 nowcast 추정치 없음: {key}")
     return pq.read_table(io.BytesIO(body))
 
 
@@ -103,27 +85,23 @@ def read_latest_nowcast_grid(target_date: date) -> tuple[date, pa.Table]:
     raises:
         PartitionNotFoundError: 상한 이전 nowcast가 하나도 없을 때
     """
-    prefix = f"silver/{GRID_SOURCE_ID}/"
-    suffix = f"hh=00/{_NOWCAST_FILENAME}"
     candidates: list[tuple[date, str]] = []
-    for key in list_keys(prefix):
-        if not key.endswith(suffix):
-            continue
+    for key in list_keys(layout.silver_prefix(LIVING_POPULATION_GRID)):
         try:
             partition = key.split("/dt=", 1)[1].split("/", 1)[0]
             snapshot_date = date.fromisoformat(partition)
         except (IndexError, ValueError):
             continue
-        if snapshot_date <= target_date:
+        if key == layout.nowcast_key(snapshot_date) and snapshot_date <= target_date:
             candidates.append((snapshot_date, key))
     if not candidates:
         raise PartitionNotFoundError(
-            f"{GRID_SOURCE_ID}의 {target_date.isoformat()} 이전 nowcast 추정치 없음"
+            f"{LIVING_POPULATION_GRID}의 {target_date.isoformat()} 이전 nowcast 추정치 없음"
         )
     snapshot_date, key = max(candidates)
     body = get_object_bytes(key)
     if body is None:
-        raise PartitionNotFoundError(f"{GRID_SOURCE_ID}의 nowcast 추정치 없음: {key}")
+        raise PartitionNotFoundError(f"{LIVING_POPULATION_GRID}의 nowcast 추정치 없음: {key}")
     return snapshot_date, pq.read_table(io.BytesIO(body))
 
 
@@ -131,7 +109,7 @@ def read_realtime_snapshot(window_start: datetime) -> AvailableSourceSnapshot:
     """완전·부분·최근 성공 순서로 실시간 POI 인구를 선택한다."""
     try:
         return read_available_source_snapshot(
-            REALTIME_SOURCE_ID,
+            POPULATION_REALTIME,
             window_start,
             lookback=timedelta(hours=1),
             partial_policy=PARTIAL_POLICY,
@@ -155,14 +133,14 @@ def read_realtime_silver(window_start: datetime) -> pa.Table:
 
 def read_station_master_silver(window_start: datetime) -> pa.Table:
     """Collector가 같은 window에 쓴 대여소 master Silver를 읽는다."""
-    return _read_exact_collector_snapshot(STATION_MASTER_SOURCE_ID, window_start)
+    return _read_exact_collector_snapshot(BIKE_STATION_MASTER, window_start)
 
 
 def read_latest_bike_realtime_silver(window_start: datetime) -> pa.Table | None:
     """window 시각 이전 24시간의 최신 authoritative 대여소 Silver를 읽는다."""
     try:
         snapshot = read_latest_source_snapshot(
-            BIKE_REALTIME_SOURCE_ID,
+            BIKE_STATION_REALTIME,
             window_start,
             lookback=timedelta(hours=24),
         )
@@ -220,7 +198,7 @@ def write_normalized_silver(
         ValueError: 기존 객체의 세대 metadata가 손상됐을 때
     """
     generation = source_window_start or target
-    key = _silver_key(NORMALIZED_SOURCE_ID, target)
+    key = layout.silver_window_key(LIVING_POPULATION_NORMALIZED, target)
     metadata = get_object_metadata(key)
     if metadata is not None:
         raw_generation = metadata.get(_NORMALIZED_SOURCE_WINDOW_METADATA)
@@ -244,28 +222,17 @@ def write_normalized_silver(
 
 def write_enriched_station_master(window_start: datetime, table: pa.Table) -> str:
     """CELL_ID가 보강된 대여소 master를 파티션 Silver로 저장한다."""
-    key = _silver_key(ENRICHED_STATION_MASTER_SOURCE_ID, window_start)
+    key = layout.silver_window_key(STATION_MASTER_ENRICHED, window_start)
     write_parquet(table, key)
     return key
-
-
-def _manifest_key(
-    window_start: datetime,
-    source_id: str = NORMALIZED_SOURCE_ID,
-) -> str:
-    """수집 윈도우 시각과 source_id에 대응하는 Manifest JSON S3 키를 생성한다."""
-    return (
-        f"_manifest/{source_id}/dt={window_start:%Y-%m-%d}/hh={window_start:%H}/"
-        f"{window_start:%H%M}.json"
-    )
 
 
 def write_manifest(
     window_start: datetime,
     data: dict,
-    source_id: str = NORMALIZED_SOURCE_ID,
+    source_id: str = LIVING_POPULATION_NORMALIZED,
 ) -> str:
     """해당 source의 정규화 실행 메타데이터를 Manifest JSON 파일로 저장한다."""
-    key = _manifest_key(window_start, source_id)
+    key = layout.window_manifest_key(source_id, window_start)
     write_json(key, data)
     return key

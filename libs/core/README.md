@@ -10,7 +10,11 @@
 |---|---|---|
 | `db.py` | PostgreSQL(psycopg3) 연결 관리 및 기본 쿼리 실행 | `get_connection()`, `execute()`, `fetch_all()`, `fetch_one()` |
 | `upsert.py` | PostgreSQL 대량 Upsert (`INSERT ON CONFLICT DO UPDATE`) 쿼리 실행 | `upsert(conn, table, rows, conflict_cols, update_cols)` |
-| `s3.py` | S3 / MinIO 제네릭 I/O (Parquet, JSON, Bytes) 및 배치/스레드 병렬 처리 | `get_object_bytes`, `read_parquet`, `write_parquet`, `read_json`, `write_json`, `list_keys`, `delete_objects` |
+| `s3.py` | S3 / MinIO 제네릭 I/O (Parquet, JSON, Bytes) 및 배치/스레드 병렬 처리 | `get_object_bytes`, `read_parquet`, `write_parquet`, `read_json`, `write_json`, `list_keys`, `delete_objects`, `bucket_name`, `object_uri` |
+| `layout.py` | 여러 모듈이 공유하는 데이터 레이크 객체 키 규칙 (silver·nowcast·window manifest·source snapshot manifest·archive) | `silver_content_key()`, `window_manifest_key()`, `source_snapshot_manifest_key()`, `parse_source_snapshot_manifest_key()`, `archive_key()` |
+| `kst.py` | 파이프라인 공통 시간대(KST)와 CLI 시각 인자 파싱 | `KST`, `parse_kst_datetime()`, `today_kst()` |
+| `sources.py` | S3 경로와 manifest에 쓰이는 source id 상수 | `BIKE_STATION_REALTIME` 등, `COLLECTOR_SOURCE_IDS` |
+| `testing.py` | 각 프로젝트 테스트가 공유하는 moto S3 fixture와 source snapshot 헬퍼 (pytest plugin) | `s3_env`, `s3_bucket`, `put_source_snapshot()`, `put_partial_source_snapshot()` |
 | `regions.py` | 대여소를 11개 지역센터 중 최근접으로 배정(apps/api, rebalance 공유) | `DISPATCH_CENTERS`, `nearest_region()` |
 | `forecast.py` | 예측 원본치를 누적해 예측 재고·action_type을 계산(apps/api, rebalance 공유) | `enrich_forecast_points()` |
 | `scoring_config.py` | urgency_score/enrich_forecast_points 계산에 쓰이는 튜닝 상수 | `SUPPLY_LOW_STOCK_RATIO`, `SEVERITY_SCALE` 등 |

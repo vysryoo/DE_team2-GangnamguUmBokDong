@@ -11,9 +11,9 @@ import storage
 from core.gold_publication.errors import ObjectCollisionError
 from core.source_snapshot import SourceSnapshotContractError, SourceSnapshotStatus
 from manifest import Counts
-from tests.conftest import KST
+from core.kst import KST
 
-pytestmark = pytest.mark.usefixtures("_bucket")
+pytestmark = pytest.mark.usefixtures("s3_bucket")
 
 WINDOW_START = datetime(2026, 8, 12, 14, 10, tzinfo=KST)
 PARTS = ("page-00001-00001",)

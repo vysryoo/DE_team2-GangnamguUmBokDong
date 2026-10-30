@@ -1,6 +1,7 @@
 """S3/MinIO 입출력과 경로 규칙 생성.
 
-S3와 연결되는 창구다. 경로 문자열을 만드는 곳도 여기 하나뿐이다.
+S3와 연결되는 창구다. collector만 쓰는 키(bronze, quarantine, archive manifest)는
+여기서 만들고, 다른 모듈과 공유하는 키는 `core.layout`이 만든다.
 dict·bytes 단위로만 주고받고, 그 값이 무엇을 뜻하는지는 해석하지 않는다.
 """
 
@@ -9,17 +10,16 @@ from __future__ import annotations
 import gzip
 import io
 import json
-import os
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
-from zoneinfo import ZoneInfo
 
 import pyarrow.parquet as pq
+from core import layout
 from core.gold_publication.canonical import sha256_hex
 from core.gold_publication.storage import S3ImmutableObjectStore
-from core.layout import archive_key
+from core.kst import KST
 from core.s3 import (
     S3Object,
     delete_object,
@@ -28,6 +28,7 @@ from core.s3 import (
     list_keys,
     list_objects,
     object_exists,
+    object_uri,
     put_object_bytes,
     read_json,
     write_json,
@@ -43,16 +44,6 @@ class ImmutableSilverArtifact:
     uri: str
     byte_sha256: str
     row_count: int
-
-
-_KST = ZoneInfo("Asia/Seoul")
-_SOURCE_SNAPSHOT_MANIFEST_KEY = re.compile(
-    r"\Asource_snapshot_manifest/(?P<source_id>[a-z][a-z0-9_]*)/"
-    r"dt=(?P<partition_day>\d{4}-\d{2}-\d{2})/"
-    r"hh=(?P<partition_hour>\d{2})/"
-    r"logical=(?P<logical>\d{8}T\d{12}Z)/"
-    r"revision=\d{10}\.json\Z"
-)
 
 
 def _bronze_prefix(
@@ -190,17 +181,9 @@ def write_immutable_silver(
     pq.write_table(table, buffer)
     payload = buffer.getvalue()
     checksum = sha256_hex(payload)
-    kst_window = window_start.astimezone(_KST)
-    key = (
-        f"silver/{source_id}/dt={kst_window:%Y-%m-%d}/hh={kst_window:%H}/"
-        f"{kst_window:%H%M}/sha256={checksum}.parquet"
-    )
+    key = layout.silver_content_key(source_id, window_start, checksum)
     uri = object_uri(key)
-    object_store = S3ImmutableObjectStore()
-    object_store.put_once(uri, payload, expected_sha256=checksum)
-    readback = object_store.read_bytes(uri, checksum)
-    if readback != payload:
-        raise RuntimeError("immutable Silver readback bytes가 원본과 다릅니다.")
+    S3ImmutableObjectStore().put_verified(uri, payload)
     return ImmutableSilverArtifact(
         key=key,
         uri=uri,
@@ -254,11 +237,6 @@ def write_quarantine(
     return key
 
 
-def _silver_date_prefix(source_id: str, day: date) -> str:
-    """해당 날짜의 silver 조각들이 모이는 prefix를 만든다."""
-    return f"silver/{source_id}/dt={day:%Y-%m-%d}/"
-
-
 def list_silver_objects(source_id: str, day: date) -> list[S3Object]:
     """해당 날짜의 silver parquet을 메타(size·last_modified)와 함께 나열한다.
 
@@ -269,7 +247,7 @@ def list_silver_objects(source_id: str, day: date) -> list[S3Object]:
     """
     return [
         o
-        for o in list_objects(_silver_date_prefix(source_id, day))
+        for o in list_objects(layout.silver_day_prefix(source_id, day))
         if o.key.endswith(".parquet")
     ]
 
@@ -288,7 +266,7 @@ def write_archive(source_id: str, day: date, table: pq.Table) -> str:
     경로 규칙은 `core.layout`이 갖는다 — nowcaster도 같은 계층을 읽고 쓰므로
     한쪽만 바뀌면 조용히 어긋난다.
     """
-    key = archive_key(source_id, day)
+    key = layout.archive_key(source_id, day)
     write_parquet(table, key)
     return key
 
@@ -298,7 +276,7 @@ def archive_exists(source_id: str, day: date) -> bool:
 
     bootstrap이 재개 판단에 쓴다 — 상태 파일을 따로 두지 않고 결과물의 존재로 판정한다.
     """
-    return object_exists(archive_key(source_id, day))
+    return object_exists(layout.archive_key(source_id, day))
 
 
 def _archive_manifest_key(source_id: str, day: date) -> str:
@@ -314,62 +292,6 @@ def write_archive_manifest(source_id: str, day: date, data: dict) -> None:
 def read_archive_manifest(source_id: str, day: date) -> dict | None:
     """해당 날짜의 압축 결과 요약을 읽는다. 없으면 None(= 아직 압축한 적 없음)."""
     return read_json(_archive_manifest_key(source_id, day))
-
-
-def _manifest_key(source_id: str, window_start: datetime) -> str:
-    """해당 윈도우의 manifest 객체 키를 만든다."""
-    return (
-        f"_manifest/{source_id}/dt={window_start:%Y-%m-%d}/hh={window_start:%H}/"
-        f"{window_start:%H%M}.json"
-    )
-
-
-def _source_snapshot_manifest_prefix(source_id: str, logical_dttm: datetime) -> str:
-    """논리 source window의 immutable authority manifest prefix를 만든다."""
-    utc_logical = logical_dttm.astimezone(UTC)
-    return (
-        f"source_snapshot_manifest/{source_id}/dt={utc_logical:%Y-%m-%d}/"
-        f"hh={utc_logical:%H}/logical={utc_logical:%Y%m%dT%H%M%S}"
-        f"{utc_logical.microsecond:06d}Z/"
-    )
-
-
-def _source_snapshot_manifest_key(
-    source_id: str,
-    logical_dttm: datetime,
-    revision_no: int,
-) -> str:
-    """Source snapshot correction ordinal의 immutable manifest key를 만든다."""
-    return (
-        f"{_source_snapshot_manifest_prefix(source_id, logical_dttm)}"
-        f"revision={revision_no:010d}.json"
-    )
-
-
-def _source_snapshot_logical_dttm_from_key(source_id: str, key: str) -> datetime:
-    """Source snapshot manifest key의 canonical UTC logical identity를 검증한다."""
-    matched = _SOURCE_SNAPSHOT_MANIFEST_KEY.fullmatch(key)
-    if matched is None or matched.group("source_id") != source_id:
-        raise ValueError(
-            f"source snapshot manifest key가 canonical하지 않습니다: {key}"
-        )
-    logical_text = matched.group("logical")
-    try:
-        logical = datetime.strptime(logical_text, "%Y%m%dT%H%M%S%fZ").replace(
-            tzinfo=UTC
-        )
-    except ValueError as exc:
-        raise ValueError(
-            f"source snapshot manifest logical time이 유효하지 않습니다: {key}"
-        ) from exc
-    if (
-        matched.group("partition_day") != f"{logical:%Y-%m-%d}"
-        or matched.group("partition_hour") != f"{logical:%H}"
-    ):
-        raise ValueError(
-            f"source snapshot manifest UTC partition과 logical time이 다릅니다: {key}"
-        )
-    return logical
 
 
 def list_source_snapshot_windows(source_id: str, day: date) -> list[datetime]:
@@ -388,7 +310,7 @@ def list_source_snapshot_windows(source_id: str, day: date) -> list[datetime]:
     raises:
         ValueError: 전용 namespace에 canonical하지 않은 manifest key가 있을 때
     """
-    start_kst = datetime(day.year, day.month, day.day, tzinfo=_KST)
+    start_kst = datetime(day.year, day.month, day.day, tzinfo=KST)
     end_kst = start_kst + timedelta(days=1)
     start_utc = start_kst.astimezone(UTC)
     end_utc = end_kst.astimezone(UTC)
@@ -399,11 +321,12 @@ def list_source_snapshot_windows(source_id: str, day: date) -> list[datetime]:
 
     logical_windows: set[datetime] = set()
     for utc_day in sorted(utc_days):
-        prefix = f"source_snapshot_manifest/{source_id}/dt={utc_day:%Y-%m-%d}/"
-        for key in list_keys(prefix):
-            logical = _source_snapshot_logical_dttm_from_key(source_id, key)
-            if start_utc <= logical < end_utc:
-                logical_windows.add(logical.astimezone(_KST))
+        for key in list_keys(layout.source_snapshot_day_prefix(source_id, utc_day)):
+            parsed = layout.parse_source_snapshot_manifest_key(key)
+            if parsed.source_id != source_id:
+                raise ValueError(f"다른 source의 manifest key가 섞였다: {key}")
+            if start_utc <= parsed.logical_dttm < end_utc:
+                logical_windows.add(parsed.logical_dttm.astimezone(KST))
     return sorted(logical_windows)
 
 
@@ -423,17 +346,12 @@ def latest_source_snapshot_logical_dttm(
     returns:
         가장 최근 logical 시각(KST aware) 또는 None
     """
-    as_of_kst = as_of.astimezone(_KST)
+    as_of_kst = as_of.astimezone(KST)
     candidates = [w for w in list_source_snapshot_windows(source_id, as_of_kst.date()) if w <= as_of_kst]
     if not candidates:
         yesterday = (as_of_kst - timedelta(days=1)).date()
         candidates = [w for w in list_source_snapshot_windows(source_id, yesterday) if w <= as_of_kst]
     return max(candidates) if candidates else None
-
-
-def object_uri(key: str) -> str:
-    """현재 collector bucket의 exact S3 object URI를 만든다."""
-    return f"s3://{os.environ.get('S3_BUCKET', 'gangnamgu')}/{key}"
 
 
 def source_snapshot_manifest_uri(
@@ -443,7 +361,7 @@ def source_snapshot_manifest_uri(
 ) -> str:
     """Source snapshot manifest revision의 exact S3 URI를 반환한다."""
     return object_uri(
-        _source_snapshot_manifest_key(source_id, logical_dttm, revision_no)
+        layout.source_snapshot_manifest_key(source_id, logical_dttm, revision_no)
     )
 
 
@@ -455,21 +373,7 @@ def write_source_snapshot_manifest(
 ) -> str:
     """Authority manifest를 revision URI에 put-once하고 exact bytes를 다시 읽는다."""
     uri = source_snapshot_manifest_uri(source_id, logical_dttm, revision_no)
-    checksum = sha256_hex(payload)
-    object_store = S3ImmutableObjectStore()
-    object_store.put_once(
-        uri,
-        payload,
-        expected_sha256=checksum,
-        require_canonical_json=True,
-    )
-    readback = object_store.read_bytes(
-        uri,
-        checksum,
-        require_canonical_json=True,
-    )
-    if readback != payload:
-        raise RuntimeError("source snapshot manifest readback bytes가 원본과 다릅니다.")
+    S3ImmutableObjectStore().put_verified(uri, payload, require_canonical_json=True)
     return uri
 
 
@@ -478,7 +382,7 @@ def list_source_snapshot_manifest_payloads(
     logical_dttm: datetime,
 ) -> list[tuple[str, bytes]]:
     """논리 source window의 authority manifest exact URI와 bytes를 모두 반환한다."""
-    prefix = _source_snapshot_manifest_prefix(source_id, logical_dttm)
+    prefix = layout.source_snapshot_logical_prefix(source_id, logical_dttm)
     object_store = S3ImmutableObjectStore()
     result: list[tuple[str, bytes]] = []
     for key in sorted(list_keys(prefix)):
@@ -505,13 +409,12 @@ def _retry_marker_key(source_id: str, window_start: datetime) -> str:
 
 def write_manifest(source_id: str, window_start: datetime, data: dict) -> None:
     """해당 윈도우의 manifest를 json으로 저장한다."""
-    key = _manifest_key(source_id, window_start)
-    write_json(key, data)
+    write_json(layout.window_manifest_key(source_id, window_start), data)
 
 
 def read_manifest(source_id: str, window_start: datetime) -> dict | None:
     """해당 윈도우의 manifest를 읽는다. 없으면 None을 반환한다."""
-    return read_json(_manifest_key(source_id, window_start))
+    return read_json(layout.window_manifest_key(source_id, window_start))
 
 
 def list_window_manifest_payloads(
@@ -519,13 +422,13 @@ def list_window_manifest_payloads(
 ) -> list[dict]:
     """해당 KST 날짜(및 선택적으로 시)에 속한 window manifest를 모두 읽어 반환한다.
 
-    `_manifest_key`가 window_start를 그대로(KST 오프셋 유지) `dt=`/`hh=`로 찍으므로,
-    이 prefix 하나가 정확히 KST 하루(또는 KST 한 시간)와 일치한다 — 데이터 수집
-    모니터링 알림(일별/시간별)이 이 함수로 해당 기간의 manifest를 모두 모은다.
+    window manifest의 `dt=`/`hh=`는 KST 파티션이라 이 prefix 하나가 정확히 KST
+    하루(또는 KST 한 시간)와 일치한다. 데이터 수집 모니터링 알림(일별/시간별)이 이
+    함수로 해당 기간의 manifest를 모두 모은다.
     """
-    prefix = f"_manifest/{source_id}/dt={day:%Y-%m-%d}/"
-    if hour is not None:
-        prefix += f"hh={hour}/"
+    prefix = layout.window_manifest_prefix(
+        source_id, day, None if hour is None else int(hour)
+    )
     payloads = []
     for key in list_keys(prefix):
         if not key.endswith(".json"):

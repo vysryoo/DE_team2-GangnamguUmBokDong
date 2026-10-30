@@ -6,15 +6,14 @@ import hashlib
 import json
 from datetime import date, datetime, timedelta
 from types import SimpleNamespace
-from zoneinfo import ZoneInfo
 
 import pyarrow as pa
 import pytest
 
 import main
 from manifest import RunStatus
+from core.kst import KST
 
-KST = ZoneInfo("Asia/Seoul")
 POI_MASTER_URI = (
     "s3://test-bucket/source_snapshot_manifest/poi_master/"
     "dt=2026-08-25/hh=00/logical=20260825T000000000000Z/"

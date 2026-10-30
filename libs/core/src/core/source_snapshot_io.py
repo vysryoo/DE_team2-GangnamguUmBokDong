@@ -4,18 +4,17 @@ from __future__ import annotations
 
 import io
 import json
-import os
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from urllib.parse import urlsplit
-from zoneinfo import ZoneInfo
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 from botocore.exceptions import BotoCoreError, ClientError
 
+from . import layout
 from .gold_publication.canonical import (
     format_utc_dttm,
     sha256_hex,
@@ -23,7 +22,7 @@ from .gold_publication.canonical import (
 )
 from .gold_publication.errors import HashFormatError, ImmutableObjectError
 from .gold_publication.storage import S3ImmutableObjectStore
-from .s3 import get_object_bytes, list_keys
+from .s3 import bucket_name, get_object_bytes, list_keys
 from .source_snapshot import (
     SourceSnapshotContractError,
     SourceSnapshotManifest,
@@ -32,14 +31,7 @@ from .source_snapshot import (
 )
 
 _SOURCE_ID = re.compile(r"[a-z][a-z0-9_]*\Z")
-_REVISION_KEY = re.compile(r"revision=([0-9]{10})\.json\Z")
-_MANIFEST_KEY = re.compile(
-    r"\Asource_snapshot_manifest/(?P<source_id>[a-z][a-z0-9_]*)/"
-    r"dt=(?P<partition_day>\d{4}-\d{2}-\d{2})/"
-    r"hh=(?P<partition_hour>\d{2})/"
-    r"logical=(?P<logical>\d{8}T\d{12}Z)/"
-    r"revision=(?P<revision>\d{10})\.json\Z"
-)
+_SILVER_CHECKSUM = re.compile(r"/sha256=([0-9a-f]{64})\.parquet\Z")
 
 
 class SourceSnapshotReadError(RuntimeError):
@@ -309,7 +301,7 @@ def read_exact_source_snapshot(
     """한 logical window의 최신 correction과 연결된 Parquet을 읽는다."""
     source = _validated_source_id(source_id)
     logical = _aware_utc(logical_dttm)
-    keys = tuple(sorted(list_keys(_logical_prefix(source, logical))))
+    keys = tuple(sorted(list_keys(layout.source_snapshot_logical_prefix(source, logical))))
     if not keys:
         raise SourceSnapshotNotFoundError(
             f"{source} exact source authority window가 없습니다: {format_utc_dttm(logical)}"
@@ -318,12 +310,12 @@ def read_exact_source_snapshot(
     revisions: list[int] = []
     manifests: list[SourceSnapshotManifest] = []
     for key in keys:
-        match = _REVISION_KEY.search(key)
-        if match is None:
+        try:
+            revision = layout.parse_source_snapshot_manifest_key(key).revision_no
+        except ValueError as exc:
             raise SourceSnapshotReadError(
                 f"source authority revision key가 잘못됐습니다: {key}"
-            )
-        revision = int(match.group(1))
+            ) from exc
         payload = get_object_bytes(key)
         if payload is None:
             raise SourceSnapshotReadError(
@@ -371,13 +363,12 @@ def read_latest_source_snapshot(
     current = cutoff.replace(minute=0, second=0, microsecond=0)
     final = lower.replace(minute=0, second=0, microsecond=0)
     while current >= final:
-        keys = list_keys(_hour_prefix(source, current))
+        keys = list_keys(layout.source_snapshot_hour_prefix(source, current))
         logicals = sorted(
             {
                 parsed
                 for key in keys
-                if (parsed := _logical_from_key(key, source)) is not None
-                and lower <= parsed <= cutoff
+                if lower <= (parsed := _logical_from_key(key, source)) <= cutoff
             },
             reverse=True,
         )
@@ -405,10 +396,7 @@ def read_partial_source_snapshot(
     """
     source = _validated_source_id(source_id)
     logical = _aware_utc(logical_dttm)
-    local = logical.astimezone(ZoneInfo("Asia/Seoul"))
-    manifest_key = (
-        f"_manifest/{source}/dt={local:%Y-%m-%d}/hh={local:%H}/{local:%H%M}.json"
-    )
+    manifest_key = layout.window_manifest_key(source, logical)
     payload = get_object_bytes(manifest_key)
     if payload is None:
         raise SourceSnapshotNotFoundError(
@@ -442,12 +430,10 @@ def read_partial_source_snapshot(
         raise SourceSnapshotReadError(
             f"partial diagnostic manifest가 completed PARTIAL 계약을 위반했습니다: {manifest_key}"
         )
-    match = re.fullmatch(
-        rf"silver/{re.escape(source)}/dt={local:%Y-%m-%d}/hh={local:%H}/"
-        rf"{local:%H%M}/sha256=([0-9a-f]{{64}})\.parquet",
-        silver_key,
-    )
-    if match is None:
+    match = _SILVER_CHECKSUM.search(silver_key)
+    if match is None or silver_key != layout.silver_content_key(
+        source, logical, match.group(1)
+    ):
         raise SourceSnapshotReadError(
             f"partial Silver key가 logical window 또는 content address와 다릅니다: {silver_key}"
         )
@@ -470,8 +456,7 @@ def _read_manifest_parquet(
             "SUCCEEDED manifest에 Silver artifact가 없습니다."
         )
     parsed = urlsplit(manifest.silver_uri)
-    bucket = os.environ.get("S3_BUCKET", "gangnamgu")
-    if parsed.scheme != "s3" or parsed.netloc != bucket:
+    if parsed.scheme != "s3" or parsed.netloc != bucket_name():
         raise SourceSnapshotReadError(
             f"source Silver bucket이 현재 런타임과 다릅니다: {manifest.silver_uri}"
         )
@@ -543,57 +528,33 @@ def _exact_manifest_key_from_uri(uri: str) -> str:
         parsed = urlsplit(uri)
     except ValueError as exc:
         raise ValueError("manifest_uri를 해석할 수 없습니다.") from exc
-    bucket = os.environ.get("S3_BUCKET", "gangnamgu")
-    if parsed.scheme != "s3" or parsed.netloc != bucket:
+    if parsed.scheme != "s3" or parsed.netloc != bucket_name():
         raise ValueError("manifest_uri bucket이 현재 런타임과 다릅니다.")
     key = parsed.path.removeprefix("/")
-    if parsed.path != f"/{key}" or _MANIFEST_KEY.fullmatch(key) is None:
+    if parsed.path != f"/{key}":
         raise ValueError("manifest_uri가 canonical source manifest 경로가 아닙니다.")
+    try:
+        layout.parse_source_snapshot_manifest_key(key)
+    except ValueError as exc:
+        raise ValueError("manifest_uri가 canonical source manifest 경로가 아닙니다.") from exc
     return key
-
-
-def _hour_prefix(source_id: str, value: datetime) -> str:
-    """UTC hour authority prefix를 반환한다."""
-    utc = value.astimezone(UTC)
-    return f"source_snapshot_manifest/{source_id}/dt={utc:%Y-%m-%d}/hh={utc:%H}/"
-
-
-def _logical_prefix(source_id: str, value: datetime) -> str:
-    """UTC logical window authority prefix를 반환한다."""
-    utc = value.astimezone(UTC)
-    return (
-        f"{_hour_prefix(source_id, utc)}"
-        f"logical={utc:%Y%m%dT%H%M%S}{utc.microsecond:06d}Z/"
-    )
 
 
 def _manifest_key(manifest: SourceSnapshotManifest) -> str:
     """Manifest identity의 canonical authority key를 반환한다."""
-    return (
-        f"{_logical_prefix(manifest.source_id, manifest.logical_dttm)}"
-        f"revision={manifest.revision_no:010d}.json"
+    return layout.source_snapshot_manifest_key(
+        manifest.source_id, manifest.logical_dttm, manifest.revision_no
     )
 
 
-def _logical_from_key(key: str, source_id: str) -> datetime | None:
+def _logical_from_key(key: str, source_id: str) -> datetime:
     """해당 source의 canonical authority key에서 logical UTC 시각을 읽는다."""
-    prefix = f"source_snapshot_manifest/{source_id}/"
-    if not key.startswith(prefix):
-        raise SourceSnapshotReadError(f"source authority key가 prefix 밖입니다: {key}")
     try:
-        logical_text = key.split("/logical=", 1)[1].split("/", 1)[0]
-        logical = datetime.strptime(logical_text, "%Y%m%dT%H%M%S%fZ").replace(
-            tzinfo=UTC
-        )
-    except (IndexError, ValueError) as exc:
-        raise SourceSnapshotReadError(
-            f"source authority key logical 형식이 잘못됐습니다: {key}"
-        ) from exc
-    if (
-        not key.startswith(_logical_prefix(source_id, logical))
-        or _REVISION_KEY.search(key) is None
-    ):
+        parsed = layout.parse_source_snapshot_manifest_key(key)
+    except ValueError as exc:
         raise SourceSnapshotReadError(
             f"source authority key 형식이 잘못됐습니다: {key}"
-        )
-    return logical
+        ) from exc
+    if parsed.source_id != source_id:
+        raise SourceSnapshotReadError(f"source authority key가 prefix 밖입니다: {key}")
+    return parsed.logical_dttm

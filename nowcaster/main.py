@@ -6,14 +6,12 @@ import argparse
 import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 import pandas as pd
 
 # pyrefly: ignore [missing-import]
 import pyarrow as pa
-
-_KST = ZoneInfo("Asia/Seoul")
+from core.kst import KST, parse_kst_datetime, today_kst
 
 import backfill
 import estimate_day
@@ -48,7 +46,7 @@ def run_estimate(
             or source_window_start.utcoffset() is None
         ):
             raise ValueError("source_window_start는 timezone-aware여야 한다")
-        if source_window_start.astimezone(_KST).date() != today:
+        if source_window_start.astimezone(KST).date() != today:
             raise ValueError("source_window_start의 KST 날짜가 target date와 다르다")
 
     # 1. 오늘 수집된 authoritative 실측 Silver를 Archive로 승격하고 임시 추정치 정리
@@ -240,7 +238,7 @@ def main(argv: list[str] | None = None) -> int:
         today = (
             date.fromisoformat(args.target_date)
             if args.target_date
-            else datetime.now(tz=_KST).date()
+            else today_kst()
         )
         return run_bootstrap_lookback(
             args.csv_dir,
@@ -250,15 +248,10 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     # estimate 커맨드: target-date가 주어지면 해당 날짜, 없으면 KST 기준 오늘을 기준으로 실행
-    today = date.fromisoformat(args.target_date) if args.target_date else datetime.now(tz=_KST).date()
+    today = date.fromisoformat(args.target_date) if args.target_date else today_kst()
     source_window_start = None
     if args.source_window_start:
-        source_window_start = datetime.fromisoformat(args.source_window_start)
-        if (
-            source_window_start.tzinfo is None
-            or source_window_start.utcoffset() is None
-        ):
-            raise ValueError("--source-window-start는 timezone offset이 필요하다")
+        source_window_start = parse_kst_datetime(args.source_window_start)
     else:
         print(
             "--source-window-start가 없어 actual Archive 승격을 생략합니다.",

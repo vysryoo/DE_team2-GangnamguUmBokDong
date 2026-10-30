@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import io
-import os
 import re
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 
 import pyarrow as pa
@@ -15,6 +14,7 @@ import pyarrow.parquet as pq
 import shapefile
 from core.gold_publication.errors import ImmutableObjectError
 from core.gold_publication.storage import S3ImmutableObjectStore
+from core.layout import source_snapshot_manifest_key
 from core.poi_master import (
     POI_MASTER_SCHEMA_VERSION,
     PoiMasterRef,
@@ -22,6 +22,7 @@ from core.poi_master import (
     read_poi_master,
     resolve_poi_master,
 )
+from core.s3 import object_uri
 from core.source_snapshot import (
     SourceSnapshotCounts,
     SourceSnapshotStatus,
@@ -32,11 +33,11 @@ from core.source_snapshot_io import (
     SourceSnapshotReadError,
     read_exact_source_snapshot_manifest,
 )
+from core.sources import POI_MASTER
 
 from registry import RegistryBuild, build_registry
 from source import SourceAssets
 
-_SOURCE_ID = "poi_master"
 _PARTS = ("areas_zip", "list_xlsx")
 _AREA_CODE = re.compile(r"\APOI[0-9]{3}\Z")
 _LEGACY_POI_SHP_PATH = (
@@ -73,16 +74,6 @@ class RefreshResult:
         }
 
 
-def _bucket() -> str:
-    """현재 런타임의 S3 bucket 이름을 반환한다."""
-    return os.environ.get("S3_BUCKET", "gangnamgu")
-
-
-def _s3_uri(key: str) -> str:
-    """현재 bucket의 key를 S3 URI로 변환한다."""
-    return f"s3://{_bucket()}/{key}"
-
-
 def _put_once(
     store: S3ImmutableObjectStore,
     key: str,
@@ -91,32 +82,11 @@ def _put_once(
     require_canonical_json: bool = False,
 ) -> None:
     """조건부 PUT으로 exact bytes를 한 번만 쓰고 다시 읽어 확인한다."""
-    uri = _s3_uri(key)
-    payload_sha256 = hashlib.sha256(payload).hexdigest()
-    put_error: ImmutableObjectError | None = None
+    uri = object_uri(key)
     try:
-        store.put_once(
-            uri,
-            payload,
-            expected_sha256=payload_sha256,
-            require_canonical_json=require_canonical_json,
-        )
+        store.put_verified(uri, payload, require_canonical_json=require_canonical_json)
     except ImmutableObjectError as exc:
-        # 조건부 PUT이 반영된 뒤 응답만 유실될 수 있다. incoming checksum으로 exact
-        # readback이 되면 안전한 재시도로 간주하고, 충돌이면 readback도 실패한다.
-        put_error = exc
-    try:
-        persisted = store.read_bytes(
-            uri,
-            payload_sha256,
-            require_canonical_json=require_canonical_json,
-        )
-    except ImmutableObjectError as exc:
-        raise PoiPublicationError(f"POI 불변 객체 게시에 실패했습니다: {uri}") from (
-            put_error or exc
-        )
-    if persisted != payload:
-        raise PoiPublicationError(f"POI 객체 write/readback 검증에 실패했습니다: {uri}")
+        raise PoiPublicationError(f"POI 불변 객체 게시에 실패했습니다: {uri}") from exc
 
 
 def _parquet_bytes(table: pa.Table) -> bytes:
@@ -132,23 +102,13 @@ def _parquet_bytes(table: pa.Table) -> bytes:
     return buffer.getvalue()
 
 
-def _manifest_key(logical_dttm: datetime, revision_no: int = 0) -> str:
-    """core source snapshot 규약의 canonical authority key를 만든다."""
-    utc = logical_dttm.astimezone(UTC)
-    logical = f"{utc:%Y%m%dT%H%M%S}{utc.microsecond:06d}Z"
-    return (
-        f"source_snapshot_manifest/{_SOURCE_ID}/dt={utc:%Y-%m-%d}/hh={utc:%H}/"
-        f"logical={logical}/revision={revision_no:010d}.json"
-    )
-
-
 def _raw_metadata_table(build: RegistryBuild) -> tuple[pa.Table, str, str]:
     """영구 보존할 원본 exact URI를 metadata에 더하고 raw key 두 개를 반환한다."""
     list_key = f"source_snapshot_raw/poi_master/list/sha256={build.list_sha256}.xlsx"
     areas_key = f"source_snapshot_raw/poi_master/areas/sha256={build.areas_sha256}.zip"
     metadata = dict(build.table.schema.metadata or {})
-    metadata[b"list_uri"] = _s3_uri(list_key).encode("utf-8")
-    metadata[b"areas_uri"] = _s3_uri(areas_key).encode("utf-8")
+    metadata[b"list_uri"] = object_uri(list_key).encode("utf-8")
+    metadata[b"areas_uri"] = object_uri(areas_key).encode("utf-8")
     return build.table.replace_schema_metadata(metadata), list_key, areas_key
 
 
@@ -209,7 +169,7 @@ def _read_refresh_snapshot(ref: PoiMasterRef) -> SourceSnapshotData:
             f"활성 POI Master snapshot을 읽을 수 없습니다: {ref.manifest_uri}"
         ) from exc
     if (
-        snapshot.manifest.source_id != _SOURCE_ID
+        snapshot.manifest.source_id != POI_MASTER
         or snapshot.manifest.status is not SourceSnapshotStatus.SUCCEEDED
         or snapshot.table is None
     ):
@@ -341,7 +301,7 @@ def refresh_poi_master(
     parquet_sha256 = hashlib.sha256(parquet_payload).hexdigest()
     silver_key = f"silver/poi_master/sha256={parquet_sha256}.parquet"
     manifest = build_source_snapshot_manifest(
-        source_id=_SOURCE_ID,
+        source_id=POI_MASTER,
         logical_dttm=activated_at,
         revision_no=0,
         status=SourceSnapshotStatus.SUCCEEDED,
@@ -351,7 +311,7 @@ def refresh_poi_master(
             assets.list_attachment.declared_place_count,
             assets.areas_attachment.declared_place_count,
         ),
-        silver_uri=_s3_uri(silver_key),
+        silver_uri=object_uri(silver_key),
         silver_byte_sha256=parquet_sha256,
         counts=SourceSnapshotCounts(
             expected=table.num_rows,
@@ -363,7 +323,7 @@ def refresh_poi_master(
         planned_parts=_PARTS,
         completed_parts=_PARTS,
     )
-    manifest_key = _manifest_key(activated_at)
+    manifest_key = source_snapshot_manifest_key(POI_MASTER, activated_at, 0)
 
     store = S3ImmutableObjectStore()
     _put_once(store, list_key, assets.list_bytes)
@@ -376,7 +336,7 @@ def refresh_poi_master(
         require_canonical_json=True,
     )
     ref = activate_poi_master(
-        manifest_uri=_s3_uri(manifest_key),
+        manifest_uri=object_uri(manifest_key),
         manifest_sha256=manifest.sha256,
         activated_at=activated_at,
     )

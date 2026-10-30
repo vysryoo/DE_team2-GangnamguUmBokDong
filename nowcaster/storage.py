@@ -6,7 +6,7 @@ archive 경로 규칙은 `core.layout`이 갖는다 — collector의 compaction�
 쓰므로 한쪽만 바뀌면 조용히 어긋난다.
 
 실측 Silver는 경로를 직접 조합하지 않고 공용 source authority reader로 선택한다.
-Nowcast 산출물 경로만 이 모듈이 소유한다.
+Nowcast 산출물 경로는 normalizer도 읽으므로 `core.layout`이 갖는다.
 """
 
 from __future__ import annotations
@@ -20,8 +20,7 @@ import pandas as pd
 import pyarrow as pa
 
 # pyrefly: ignore [missing-import]
-from core.layout import archive_key as _archive_key
-from core.layout import archive_prefix
+from core.layout import archive_key, archive_prefix, nowcast_key
 
 # pyrefly: ignore [missing-import]
 from core.s3 import (
@@ -39,20 +38,9 @@ from core.source_snapshot_io import (
     SourceSnapshotNotFoundError,
     read_exact_source_snapshot,
 )
+from core.sources import LIVING_POPULATION_GRID
 
-GRID_SOURCE_ID = "living_population_grid"
-_NOWCAST_FILENAME = "nowcast.parquet"
-_HISTORICAL_CACHE_PREFIX = f"derived/{GRID_SOURCE_ID}/historical_avg_cache"
-
-
-def _grid_date_prefix(target_date: date) -> str:
-    """해당 날짜의 격자 실버 S3 경로 접두사를 반환한다."""
-    return f"silver/{GRID_SOURCE_ID}/dt={target_date:%Y-%m-%d}/"
-
-
-def _nowcast_key(target_date: date) -> str:
-    """해당 날짜의 추정치 parquet S3 키를 반환한다."""
-    return f"{_grid_date_prefix(target_date)}hh=00/{_NOWCAST_FILENAME}"
+_HISTORICAL_CACHE_PREFIX = f"derived/{LIVING_POPULATION_GRID}/historical_avg_cache"
 
 
 def read_real_grid_silver(logical_dttm: datetime) -> pa.Table | None:
@@ -63,7 +51,7 @@ def read_real_grid_silver(logical_dttm: datetime) -> pa.Table | None:
     손상된 경우에는 예외를 그대로 전파해 데이터 오염을 숨기지 않는다.
     """
     try:
-        snapshot = read_exact_source_snapshot(GRID_SOURCE_ID, logical_dttm)
+        snapshot = read_exact_source_snapshot(LIVING_POPULATION_GRID, logical_dttm)
     except SourceSnapshotNotFoundError:
         return None
     return snapshot.table
@@ -71,14 +59,14 @@ def read_real_grid_silver(logical_dttm: datetime) -> pa.Table | None:
 
 def write_archive(target_date: date, table: pa.Table) -> str:
     """해당 날짜의 데이터를 아카이브 parquet으로 저장하고 저장된 key를 반환한다."""
-    key = _archive_key(GRID_SOURCE_ID, target_date)
+    key = archive_key(LIVING_POPULATION_GRID, target_date)
     write_parquet(table, key)
     return key
 
 
 def list_archive_dates() -> list[date]:
     """아카이브에 저장된 데이터의 날짜 목록을 오름차순으로 반환한다."""
-    prefix = archive_prefix(GRID_SOURCE_ID)
+    prefix = archive_prefix(LIVING_POPULATION_GRID)
     dates = []
     for key in list_keys(prefix):
         if not key.endswith(".parquet"):
@@ -91,25 +79,25 @@ def list_archive_dates() -> list[date]:
 
 def read_archive(target_date: date) -> pa.Table | None:
     """해당 날짜의 아카이브를 읽는다. 없으면 None(4주 lookback 중 결측으로 처리)."""
-    key = _archive_key(GRID_SOURCE_ID, target_date)
+    key = archive_key(LIVING_POPULATION_GRID, target_date)
     return read_parquet(key, as_pandas=False)
 
 
 def write_nowcast(target_date: date, table: pa.Table) -> str:
     """해당 날짜의 추정치 데이터를 nowcast.parquet 파일로 저장한다."""
-    key = _nowcast_key(target_date)
+    key = nowcast_key(target_date)
     write_parquet(table, key)
     return key
 
 
 def nowcast_exists(target_date: date) -> bool:
     """해당 날짜의 추정치 파일 존재 여부를 반환한다."""
-    return object_exists(_nowcast_key(target_date))
+    return object_exists(nowcast_key(target_date))
 
 
 def delete_nowcast(target_date: date) -> None:
     """해당 날짜의 기존 추정치 parquet 파일을 삭제한다."""
-    delete_object(_nowcast_key(target_date))
+    delete_object(nowcast_key(target_date))
 
 
 # --- 과거 전체 평균(estimate_day.historical_average_cached) 캐시 ---

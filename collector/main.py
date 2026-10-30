@@ -49,12 +49,13 @@ import pipeline
 import pyarrow as pa
 import storage
 from config.schema import SourceConfig
+from core.kst import KST, parse_kst_datetime
 from core.poi_master import PoiMasterRef, read_poi_master
+from core.sources import POPULATION_REALTIME
 from logging_setup import configure_httpx_request_logging, configure_logging
 from manifest import RunStatus
 
 _OK_STATUSES = frozenset({RunStatus.SUCCEEDED, RunStatus.PARTIAL, RunStatus.EMPTY, RunStatus.SKIPPED})
-_POPULATION_SOURCE_ID = "population_realtime"
 _POI_CODE_PATTERN = re.compile(r"POI[0-9]{3}\Z")
 
 # httpx 기본값은 모든 단계에 5초다. 서울 열린데이터광장의 1000행 페이지 응답 시간을
@@ -161,7 +162,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.poi_master_manifest_uri is not None
         or args.poi_master_manifest_sha256 is not None
     )
-    if args.source != _POPULATION_SOURCE_ID and (
+    if args.source != POPULATION_REALTIME and (
         args.poi_master_mode != "static" or has_manifest_ref
     ):
         parser.error("POI Master 인자는 population_realtime 소스에만 사용할 수 있다")
@@ -296,10 +297,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.check_due_after_seconds is not None:
         import json
-        from zoneinfo import ZoneInfo
 
         config = config_loader.load(args.source)
-        now = datetime.now(ZoneInfo("Asia/Seoul"))
+        now = datetime.now(KST)
         last = storage.latest_source_snapshot_logical_dttm(args.source, as_of=now)
         elapsed_seconds = None if last is None else (now - last).total_seconds()
         time_rule = config.adapter_params.get("time_rule")
@@ -344,7 +344,7 @@ def main(argv: list[str] | None = None) -> int:
         }))
         return 0
 
-    window_start = datetime.fromisoformat(args.window_start)
+    window_start = parse_kst_datetime(args.window_start)
 
     configure_logging(args.source, window_start, attempt=1)
     config = config_loader.load(args.source)

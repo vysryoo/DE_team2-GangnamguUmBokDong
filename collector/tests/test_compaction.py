@@ -6,7 +6,6 @@ S3를 타는 통합 경로는 test_compaction_run.py에서 따로 본다. 여기
 
 from datetime import datetime
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 import pyarrow as pa
 import pytest
@@ -29,8 +28,8 @@ from config.schema import (
 )
 from config.schema import Storage as StorageConfig
 from core.s3 import S3Object
+from core.kst import KST
 
-KST = ZoneInfo("Asia/Seoul")
 SOURCES_DIR = Path(__file__).resolve().parents[1] / "sources"
 
 

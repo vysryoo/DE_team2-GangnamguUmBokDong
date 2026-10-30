@@ -33,14 +33,12 @@ from __future__ import annotations
 
 import argparse
 import sys
-from datetime import date, datetime, timedelta
-from zoneinfo import ZoneInfo
+from datetime import date, timedelta
 
 import compaction
 import config.loader as config_loader
+from core.kst import today_kst
 from logging_setup import configure_batch_logging
-
-_KST = ZoneInfo("Asia/Seoul")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -110,7 +108,7 @@ def main(argv: list[str] | None = None) -> int:
     configure_batch_logging(args.source)
     config = config_loader.load(args.source)
 
-    today = datetime.now(tz=_KST).date()
+    today = today_kst()
     days = resolve_dates(args, config, today)
     results = compaction.compact_range(config, days, today=today, force=args.force)
 

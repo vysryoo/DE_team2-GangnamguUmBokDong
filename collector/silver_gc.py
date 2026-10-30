@@ -10,14 +10,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from zoneinfo import ZoneInfo
 
 import compaction
 import storage
 from config.schema import SourceConfig
+from core.kst import KST
 from core.s3 import get_object_bytes, object_exists, read_json, write_json
 
-_KST = ZoneInfo("Asia/Seoul")
 NON_AUTHORITY_RETENTION_DAYS = 30
 
 
@@ -75,7 +74,7 @@ def collect_date(
                 "skipped", 0, len(objects), "archive_authority_stale"
             )
     authority_keys = {item.object.key for item in authority.selected}
-    cutoff = (now or datetime.now(_KST)) - timedelta(
+    cutoff = (now or datetime.now(KST)) - timedelta(
         days=NON_AUTHORITY_RETENTION_DAYS
     )
     candidates = [
@@ -110,7 +109,7 @@ def collect_date(
     }
     write_json(
         manifest_key,
-        {**base, "status": "prepared", "prepared_at": datetime.now(_KST).isoformat()},
+        {**base, "status": "prepared", "prepared_at": datetime.now(KST).isoformat()},
     )
     deleted_keys = [obj.key for obj in candidates]
     storage.delete_silver_objects(deleted_keys)
@@ -127,7 +126,7 @@ def collect_date(
             **base,
             "status": "completed",
             "deleted_keys": deleted_keys,
-            "completed_at": datetime.now(_KST).isoformat(),
+            "completed_at": datetime.now(KST).isoformat(),
         },
     )
     return SilverGcResult("completed", len(deleted_keys), len(retained_keys))

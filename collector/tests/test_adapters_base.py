@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from datetime import datetime
 from unittest.mock import MagicMock
-from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -21,6 +20,7 @@ from adapters.base import (
     get_adapter,
     is_adapter_registered,
 )
+from core.kst import KST
 
 
 class _FakeBudgetConfig:
@@ -35,7 +35,6 @@ class _FakeBudgetConfig:
         return timedelta(seconds=self._seconds)
 
 
-KST = ZoneInfo("Asia/Seoul")
 
 
 @pytest.fixture

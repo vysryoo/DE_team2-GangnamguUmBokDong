@@ -9,8 +9,8 @@ import pyarrow.parquet as pq
 import pytest
 import storage
 
-from tests.conftest import (
-    KST,
+from core.kst import KST
+from core.testing import (
     TEST_BUCKET,
     put_partial_source_snapshot,
     put_source_snapshot,

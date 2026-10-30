@@ -6,9 +6,9 @@ import argparse
 import json
 import sys
 from datetime import datetime
-from zoneinfo import ZoneInfo
 
 import httpx
+from core.kst import KST, parse_kst_datetime
 from core.poi_master import PoiMasterError, resolve_poi_master
 
 from publication import PoiPublicationError, refresh_poi_master
@@ -40,7 +40,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def _run_refresh(args: argparse.Namespace) -> int:
     """공식 첨부를 실제로 내려받아 content checksum 기준 refresh를 실행한다."""
-    now = datetime.now(ZoneInfo("Asia/Seoul"))
+    now = datetime.now(KST)
     with httpx.Client(
         timeout=_HTTP_TIMEOUT,
         follow_redirects=True,
@@ -58,7 +58,7 @@ def _run_refresh(args: argparse.Namespace) -> int:
 
 def _run_resolve(args: argparse.Namespace) -> int:
     """기준 시각의 append-only activation 이력에서 exact ref 하나를 출력한다."""
-    as_of = datetime.fromisoformat(args.as_of)
+    as_of = parse_kst_datetime(args.as_of)
     ref = resolve_poi_master(as_of)
     print(json.dumps(ref.as_dict(), ensure_ascii=False, sort_keys=True))
     return 0

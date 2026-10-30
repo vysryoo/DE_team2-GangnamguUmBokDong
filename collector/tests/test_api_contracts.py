@@ -1,7 +1,6 @@
 import os
 from datetime import datetime, timedelta
 from itertools import pairwise
-from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
@@ -11,8 +10,8 @@ import adapters.kma_apihub
 import adapters.seoul_openapi  # noqa: F401
 from adapters.base import Window, get_adapter
 from config import loader
+from core.kst import KST
 
-KST = ZoneInfo("Asia/Seoul")
 
 # 계약 테스트는 외부 API를 직접 호출하므로, 키가 없으면 스킵한다.
 seoul_key = os.environ.get("SEOUL_OPENAPI_KEY")

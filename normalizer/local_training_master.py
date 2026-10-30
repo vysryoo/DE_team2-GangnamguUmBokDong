@@ -7,14 +7,15 @@ import os
 import sys
 from datetime import date, datetime
 from urllib.parse import urlsplit
-from zoneinfo import ZoneInfo
 
 import pyarrow as pa
 import station_master
 import storage
+from core.kst import KST
+from core.layout import archive_key
 from core.s3 import read_parquet
+from core.sources import BIKE_STATION_REALTIME, LIVING_POPULATION_GRID
 
-_KST = ZoneInfo("Asia/Seoul")
 _LOCAL_S3_HOSTS = frozenset(
     {
         "127.0.0.1",
@@ -37,11 +38,6 @@ def _require_local_environment() -> None:
     )
     if parsed.scheme != "http" or not local_host:
         raise ValueError(f"로컬 HTTP S3 endpoint가 필요합니다: {endpoint!r}")
-
-
-def _archive_key(source_id: str, source_date: date) -> str:
-    """Source와 날짜에 대응하는 flat Archive key를 반환한다."""
-    return f"archive/{source_id}/dt={source_date.isoformat()}.parquet"
 
 
 def _master_from_station_archive(table: pa.Table) -> pa.Table:
@@ -78,11 +74,11 @@ def prepare(source_date: date) -> dict[str, object]:
     """실제 station·population Archive로 enriched current snapshot을 게시한다."""
     _require_local_environment()
     station_table = read_parquet(
-        _archive_key("bike_station_realtime", source_date),
+        archive_key(BIKE_STATION_REALTIME, source_date),
         as_pandas=False,
     )
     population_table = read_parquet(
-        _archive_key("living_population_grid", source_date),
+        archive_key(LIVING_POPULATION_GRID, source_date),
         as_pandas=False,
     )
     if station_table is None or population_table is None:
@@ -94,7 +90,7 @@ def prepare(source_date: date) -> dict[str, object]:
         population_table,
         station_table,
     )
-    snapshot = datetime.combine(source_date, datetime.min.time(), tzinfo=_KST)
+    snapshot = datetime.combine(source_date, datetime.min.time(), tzinfo=KST)
     output_key = storage.write_enriched_station_master(snapshot, enriched)
     return {"output_key": output_key, "source_date": source_date.isoformat(), **metrics}
 

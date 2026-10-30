@@ -31,9 +31,10 @@ from storage import (
     write_retry_marker,
     write_source_snapshot_manifest,
 )
-from tests.conftest import KST, TEST_BUCKET
+from core.kst import KST
+from core.testing import TEST_BUCKET
 
-pytestmark = pytest.mark.usefixtures("_bucket")
+pytestmark = pytest.mark.usefixtures("s3_bucket")
 
 WINDOW_START = datetime(2026, 8, 12, 14, 10, tzinfo=KST)
 
@@ -319,7 +320,7 @@ class TestSourceSnapshotWindowListing:
         )
         _s3().put_object(Bucket=TEST_BUCKET, Key=key, Body=b"{}")
 
-        with pytest.raises(ValueError, match="partition"):
+        with pytest.raises(ValueError, match="파티션"):
             list_source_snapshot_windows("test_source", date(2026, 8, 12))
 
 

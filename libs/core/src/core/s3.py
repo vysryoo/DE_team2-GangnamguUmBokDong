@@ -326,9 +326,14 @@ def _clear_client_cache() -> None:
             close()
 
 
-def _bucket() -> str:
+def bucket_name() -> str:
     """대상 S3 버킷 이름을 환경 변수에서 읽어 반환한다."""
     return os.environ.get("S3_BUCKET", "gangnamgu")
+
+
+def object_uri(key: str) -> str:
+    """현재 버킷의 객체 키를 `s3://bucket/key` URI로 만든다."""
+    return f"s3://{bucket_name()}/{key}"
 
 
 def get_object_bytes(key: str, timeout_seconds: float | None = None) -> bytes | None:
@@ -345,7 +350,7 @@ def get_object_bytes(key: str, timeout_seconds: float | None = None) -> bytes | 
             엔드포인트 자체가 응답하지 않으면 그대로 던진다 — 호출부가 폴백을 결정한다.
     """
     try:
-        payload = _client(timeout_seconds).get_object(Bucket=_bucket(), Key=key)["Body"].read()
+        payload = _client(timeout_seconds).get_object(Bucket=bucket_name(), Key=key)["Body"].read()
         _record_object_read(key, payload)
         return payload
     except ClientError as exc:
@@ -362,7 +367,7 @@ def put_object_bytes(
     metadata: dict[str, str] | None = None,
 ) -> None:
     """bytes와 선택적인 S3 user metadata를 객체로 저장한다."""
-    kwargs = {"Bucket": _bucket(), "Key": key, "Body": body}
+    kwargs = {"Bucket": bucket_name(), "Key": key, "Body": body}
     if metadata is not None:
         kwargs["Metadata"] = metadata
     _client().put_object(**kwargs)
@@ -371,40 +376,11 @@ def put_object_bytes(
 def get_object_metadata(key: str) -> dict[str, str] | None:
     """S3 객체 본문을 받지 않고 user metadata만 조회한다. 키가 없으면 None."""
     try:
-        return dict(_client().head_object(Bucket=_bucket(), Key=key).get("Metadata", {}))
+        return dict(_client().head_object(Bucket=bucket_name(), Key=key).get("Metadata", {}))
     except ClientError as exc:
         if exc.response["Error"]["Code"] in {"404", "NoSuchKey"}:
             return None
         raise
-
-
-def get_object_tags(key: str) -> dict[str, str] | None:
-    """S3 object tag를 읽는다. 키가 없으면 None을 반환한다."""
-    try:
-        response = _client().get_object_tagging(Bucket=_bucket(), Key=key)
-        return {item["Key"]: item["Value"] for item in response.get("TagSet", [])}
-    except ClientError as exc:
-        if exc.response["Error"]["Code"] in {"404", "NoSuchKey", "NoSuchTagSet"}:
-            return None
-        raise
-
-
-def merge_object_tags(key: str, tags: dict[str, str]) -> None:
-    """기존 S3 object tag를 보존하면서 지정한 값을 병합한다."""
-    current = get_object_tags(key)
-    if current is None:
-        raise FileNotFoundError(f"tag를 기록할 S3 object가 없다: {key}")
-    merged = {**current, **tags}
-    _client().put_object_tagging(
-        Bucket=_bucket(),
-        Key=key,
-        Tagging={
-            "TagSet": [
-                {"Key": tag_key, "Value": value}
-                for tag_key, value in sorted(merged.items())
-            ]
-        },
-    )
 
 
 def _to_pandas_or_table(table: pq.Table, as_pandas: bool) -> pd.DataFrame | pq.Table:
@@ -709,19 +685,8 @@ def list_keys(prefix: str, delimiter: str = "") -> list[str]:
     paginator = client.get_paginator("list_objects_v2")
     return [
         obj["Key"]
-        for page in paginator.paginate(Bucket=_bucket(), Prefix=prefix, Delimiter=delimiter)
+        for page in paginator.paginate(Bucket=bucket_name(), Prefix=prefix, Delimiter=delimiter)
         for obj in page.get("Contents", [])
-    ]
-
-
-def list_common_prefixes(prefix: str, delimiter: str = "/") -> list[str]:
-    """주어진 prefix 아래의 공통 prefix(디렉터리) 목록을 반환한다."""
-    client = _client()
-    paginator = client.get_paginator("list_objects_v2")
-    return [
-        common_prefix["Prefix"]
-        for page in paginator.paginate(Bucket=_bucket(), Prefix=prefix, Delimiter=delimiter)
-        for common_prefix in page.get("CommonPrefixes", [])
     ]
 
 
@@ -754,7 +719,7 @@ def list_objects(prefix: str, delimiter: str = "") -> list[S3Object]:
     paginator = client.get_paginator("list_objects_v2")
     return [
         S3Object(key=obj["Key"], size=obj["Size"], last_modified=obj["LastModified"])
-        for page in paginator.paginate(Bucket=_bucket(), Prefix=prefix, Delimiter=delimiter)
+        for page in paginator.paginate(Bucket=bucket_name(), Prefix=prefix, Delimiter=delimiter)
         for obj in page.get("Contents", [])
     ]
 
@@ -762,7 +727,7 @@ def list_objects(prefix: str, delimiter: str = "") -> list[S3Object]:
 def object_exists(key: str) -> bool:
     """S3 객체가 존재하는지 확인한다."""
     try:
-        _client().head_object(Bucket=_bucket(), Key=key)
+        _client().head_object(Bucket=bucket_name(), Key=key)
         return True
     except ClientError as exc:
         if exc.response["Error"]["Code"] in {"404", "NoSuchKey"}:
@@ -772,7 +737,7 @@ def object_exists(key: str) -> bool:
 
 def delete_object(key: str) -> None:
     """S3 객체를 삭제한다."""
-    _client().delete_object(Bucket=_bucket(), Key=key)
+    _client().delete_object(Bucket=bucket_name(), Key=key)
 
 
 def delete_objects(keys: list[str]) -> None:
@@ -780,7 +745,7 @@ def delete_objects(keys: list[str]) -> None:
     if not keys:
         return
     client = _client()
-    bucket = _bucket()
+    bucket = bucket_name()
     # delete_objects 한 번에 최대 1000개 삭제 가능
     for i in range(0, len(keys), 1000):
         batch = keys[i : i + 1000]

@@ -9,37 +9,25 @@ import pytest
 from core.gold_publication.errors import ObjectCollisionError, ObjectStoreAccessError
 from core.gold_publication.storage import ImmutablePutOutcome, S3ImmutableObjectStore
 from core.poi_master import read_poi_master, resolve_poi_master
-from moto import mock_aws
+from core.testing import TEST_BUCKET
 from openpyxl import load_workbook
 
 import publication
 from registry import PoiRegistryError
 from tests.conftest import real_source_assets
 
-BUCKET = "poi-master-test"
 FIRST = datetime(2026, 8, 25, 1, 0, tzinfo=UTC)
 
 
 @pytest.fixture(autouse=True)
-def aws(monkeypatch):
+def _mock_s3(s3_bucket):
     """각 테스트에 빈 mock S3 bucket과 고정 credential을 제공한다."""
-    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
-    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
-    monkeypatch.setenv("AWS_DEFAULT_REGION", "ap-northeast-2")
-    monkeypatch.setenv("S3_BUCKET", BUCKET)
-    monkeypatch.delenv("S3_ENDPOINT_URL", raising=False)
-    with mock_aws():
-        boto3.client("s3", region_name="ap-northeast-2").create_bucket(
-            Bucket=BUCKET,
-            CreateBucketConfiguration={"LocationConstraint": "ap-northeast-2"},
-        )
-        yield
 
 
 def _keys(prefix: str = "") -> list[str]:
     """mock bucket의 key를 정렬해 반환한다."""
-    response = boto3.client("s3", region_name="ap-northeast-2").list_objects_v2(
-        Bucket=BUCKET, Prefix=prefix
+    response = boto3.client("s3", region_name="us-east-1").list_objects_v2(
+        Bucket=TEST_BUCKET, Prefix=prefix
     )
     return sorted(item["Key"] for item in response.get("Contents", []))
 
@@ -84,15 +72,15 @@ def test_first_refresh_publishes_raw_silver_manifest_then_activation(
     assert resolve_poi_master(FIRST) == result.ref
     metadata = read_poi_master(result.ref).schema.metadata or {}
     assert metadata[b"list_uri"].startswith(
-        f"s3://{BUCKET}/source_snapshot_raw/poi_master/list/".encode()
+        f"s3://{TEST_BUCKET}/source_snapshot_raw/poi_master/list/".encode()
     )
     assert metadata[b"areas_uri"].startswith(
-        f"s3://{BUCKET}/source_snapshot_raw/poi_master/areas/".encode()
+        f"s3://{TEST_BUCKET}/source_snapshot_raw/poi_master/areas/".encode()
     )
     assert len(writes) == 4
     assert [canonical for _uri, canonical in writes] == [False, False, False, True]
     write_prefixes = [
-        uri.split(f"s3://{BUCKET}/", 1)[1].split("/", 1)[0]
+        uri.split(f"s3://{TEST_BUCKET}/", 1)[1].split("/", 1)[0]
         for uri, _canonical in writes
     ]
     assert write_prefixes == [
@@ -312,14 +300,14 @@ def test_first_refresh_rejects_drop_against_legacy_shapefile(monkeypatch) -> Non
 def test_immutable_write_collision_is_wrapped_without_overwrite() -> None:
     """조건부 PUT 충돌은 publication 오류로 변환하고 기존 bytes를 보존한다."""
     key = "source_snapshot_raw/poi_master/list/sha256=fixture.xlsx"
-    client = boto3.client("s3", region_name="ap-northeast-2")
-    client.put_object(Bucket=BUCKET, Key=key, Body=b"existing")
+    client = boto3.client("s3", region_name="us-east-1")
+    client.put_object(Bucket=TEST_BUCKET, Key=key, Body=b"existing")
 
     with pytest.raises(publication.PoiPublicationError) as caught:
         publication._put_once(S3ImmutableObjectStore(), key, b"incoming")
 
     assert isinstance(caught.value.__cause__, ObjectCollisionError)
-    persisted = client.get_object(Bucket=BUCKET, Key=key)["Body"].read()
+    persisted = client.get_object(Bucket=TEST_BUCKET, Key=key)["Body"].read()
     assert persisted == b"existing"
 
 
@@ -343,9 +331,9 @@ def test_immutable_write_reconciles_applied_put_response_loss() -> None:
     publication._put_once(AppliedThenFailedStore(), key, b"persisted")
 
     payload = (
-        boto3.client("s3", region_name="ap-northeast-2")
+        boto3.client("s3", region_name="us-east-1")
         .get_object(
-            Bucket=BUCKET,
+            Bucket=TEST_BUCKET,
             Key=key,
         )["Body"]
         .read()

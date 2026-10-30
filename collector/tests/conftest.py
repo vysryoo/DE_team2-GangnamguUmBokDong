@@ -6,24 +6,20 @@
 하므로, 이 픽스처만 validator를 우회한다. 실제 YAML 로딩 경로(config.loader.load)는
 `SourceConfig.model_validate`를 쓰므로 이 우회와 무관하게 여전히 막힌다.
 
-storage.py·manifest.py 테스트가 공유하는 moto S3 환경 픽스처도 함께 둔다.
+moto S3 bucket은 `core.testing`의 `s3_bucket` fixture를 쓴다.
 """
 
 from datetime import datetime
-from zoneinfo import ZoneInfo
 
-import boto3
 import pytest
-from core import s3 as s3_io
-from moto import mock_aws
+from core.kst import KST
 
 from adapters import base as adapter_base
 from config.schema import ColumnSpec, Range
 from validation import registry
 from validation.types import Issue, RunContext
 
-TEST_BUCKET = "test-bucket"
-KST = ZoneInfo("Asia/Seoul")
+pytest_plugins = ("core.testing",)
 
 
 @pytest.fixture
@@ -94,19 +90,5 @@ def clean_adapter_registry():
 
 
 @pytest.fixture(autouse=True)
-def _s3_env(monkeypatch):
+def _isolated_s3_env(s3_env):
     """환경과 process-local S3 client cache를 테스트마다 격리한다."""
-    s3_io._clear_client_cache()
-    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
-    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
-    monkeypatch.delenv("S3_ENDPOINT_URL", raising=False)
-    monkeypatch.setenv("S3_BUCKET", TEST_BUCKET)
-    yield
-    s3_io._clear_client_cache()
-
-
-@pytest.fixture
-def _bucket():
-    with mock_aws():
-        boto3.client("s3", region_name="us-east-1").create_bucket(Bucket=TEST_BUCKET)
-        yield

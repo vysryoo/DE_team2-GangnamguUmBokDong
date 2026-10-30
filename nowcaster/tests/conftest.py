@@ -1,30 +1,10 @@
 """테스트 공용 픽스처: moto 기반 S3 환경."""
 
-from zoneinfo import ZoneInfo
-
-import boto3
 import pytest
-from core import s3 as s3_io
-from moto import mock_aws
 
-TEST_BUCKET = "test-bucket"
-KST = ZoneInfo("Asia/Seoul")
+pytest_plugins = ("core.testing",)
 
 
 @pytest.fixture(autouse=True)
-def _s3_env(monkeypatch):
-    """환경과 process-local S3 client cache를 테스트마다 격리한다."""
-    s3_io._clear_client_cache()
-    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
-    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
-    monkeypatch.delenv("S3_ENDPOINT_URL", raising=False)
-    monkeypatch.setenv("S3_BUCKET", TEST_BUCKET)
-    yield
-    s3_io._clear_client_cache()
-
-
-@pytest.fixture(autouse=True)
-def _bucket():
-    with mock_aws():
-        boto3.client("s3", region_name="us-east-1").create_bucket(Bucket=TEST_BUCKET)
-        yield
+def _mock_s3(s3_bucket):
+    """모든 테스트를 moto S3 bucket 안에서 실행한다."""

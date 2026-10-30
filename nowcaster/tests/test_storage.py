@@ -1,7 +1,7 @@
 """storage.py의 S3 I/O를 moto로 검증한다."""
 
 import io
-from datetime import UTC, date, datetime
+from datetime import date, datetime
 
 import boto3
 import pyarrow as pa
@@ -9,67 +9,14 @@ import pyarrow.parquet as pq
 import pytest
 import storage
 from core.gold_publication.canonical import sha256_hex
-from core.source_snapshot import (
-    SourceSnapshotCounts,
-    SourceSnapshotStatus,
-    build_source_snapshot_manifest,
-)
 from core.source_snapshot_io import SourceSnapshotReadError
-from tests.conftest import KST, TEST_BUCKET
+from core.kst import KST
+from core.sources import LIVING_POPULATION_GRID
+from core.testing import TEST_BUCKET, put_source_snapshot
 
 
 def _s3():
     return boto3.client("s3", region_name="us-east-1")
-
-
-def _put_authoritative_snapshot(
-    logical: datetime,
-    table: pa.Table,
-    *,
-    revision: int = 0,
-) -> str:
-    """테스트용 immutable Silver와 exact authority manifest를 저장한다."""
-    buffer = io.BytesIO()
-    pq.write_table(table, buffer)
-    body = buffer.getvalue()
-    checksum = sha256_hex(body)
-    local = logical.astimezone(KST)
-    silver_key = (
-        f"silver/{storage.GRID_SOURCE_ID}/dt={local:%Y-%m-%d}/hh={local:%H}/"
-        f"{local:%H%M}/sha256={checksum}.parquet"
-    )
-    manifest = build_source_snapshot_manifest(
-        source_id=storage.GRID_SOURCE_ID,
-        logical_dttm=logical,
-        revision_no=revision,
-        status=SourceSnapshotStatus.SUCCEEDED,
-        config_version="fixture-v1",
-        silver_uri=f"s3://{TEST_BUCKET}/{silver_key}",
-        silver_byte_sha256=checksum,
-        counts=SourceSnapshotCounts(
-            expected=table.num_rows,
-            fetched=table.num_rows,
-            kept=table.num_rows,
-            repaired=0,
-            dropped=0,
-        ),
-        planned_parts=("page=1",),
-        completed_parts=("page=1",),
-    )
-    utc = logical.astimezone(UTC)
-    manifest_key = (
-        f"source_snapshot_manifest/{storage.GRID_SOURCE_ID}/"
-        f"dt={utc:%Y-%m-%d}/hh={utc:%H}/"
-        f"logical={utc:%Y%m%dT%H%M%S}{utc.microsecond:06d}Z/"
-        f"revision={revision:010d}.json"
-    )
-    _s3().put_object(Bucket=TEST_BUCKET, Key=silver_key, Body=body)
-    _s3().put_object(
-        Bucket=TEST_BUCKET,
-        Key=manifest_key,
-        Body=manifest.canonical_bytes,
-    )
-    return silver_key
 
 
 class TestReadRealGridSilver:
@@ -81,7 +28,7 @@ class TestReadRealGridSilver:
                 "SPOP": [10.0, 20.0],
             }
         )
-        _put_authoritative_snapshot(logical, table)
+        put_source_snapshot(LIVING_POPULATION_GRID, logical, table)
 
         result = storage.read_real_grid_silver(logical)
 
@@ -92,14 +39,16 @@ class TestReadRealGridSilver:
 
     def test_uses_latest_contiguous_correction(self):
         logical = datetime(2026, 8, 11, 3, tzinfo=KST)
-        _put_authoritative_snapshot(
+        put_source_snapshot(
+            LIVING_POPULATION_GRID,
             logical,
             pa.table({"CELL_ID": ["가가00000000"], "SPOP": [10.0]}),
         )
-        _put_authoritative_snapshot(
+        put_source_snapshot(
+            LIVING_POPULATION_GRID,
             logical,
             pa.table({"CELL_ID": ["가가00000001"], "SPOP": [20.0]}),
-            revision=1,
+            revision_no=1,
         )
 
         result = storage.read_real_grid_silver(logical)
@@ -130,10 +79,11 @@ class TestReadRealGridSilver:
 
     def test_raises_when_authoritative_silver_is_corrupted(self):
         logical = datetime(2026, 8, 11, 3, tzinfo=KST)
-        key = _put_authoritative_snapshot(
+        key = put_source_snapshot(
+            LIVING_POPULATION_GRID,
             logical,
             pa.table({"CELL_ID": ["가가00000000"], "SPOP": [10.0]}),
-        )
+        ).silver_key
         _s3().put_object(Bucket=TEST_BUCKET, Key=key, Body=b"corrupted")
 
         with pytest.raises(SourceSnapshotReadError, match="checksum"):
@@ -142,10 +92,11 @@ class TestReadRealGridSilver:
     def test_raises_when_authority_revision_chain_starts_at_one(self):
         """손상된 authority chain을 단순 snapshot 부재로 축소하지 않는다."""
         logical = datetime(2026, 8, 11, 3, tzinfo=KST)
-        _put_authoritative_snapshot(
+        put_source_snapshot(
+            LIVING_POPULATION_GRID,
             logical,
             pa.table({"CELL_ID": ["가가00000000"], "SPOP": [10.0]}),
-            revision=1,
+            revision_no=1,
         )
 
         with pytest.raises(SourceSnapshotReadError, match="0부터 연속"):

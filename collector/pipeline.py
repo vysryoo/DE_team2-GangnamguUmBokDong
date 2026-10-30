@@ -98,9 +98,9 @@ import logging
 import math
 import time
 from datetime import datetime
-from zoneinfo import ZoneInfo
 
 import pyarrow as pa
+from core.kst import KST
 from core.source_snapshot import SourceSnapshotStatus
 
 import manifest as manifest_module
@@ -123,7 +123,6 @@ from validation.engine import BatchValidationFailed, validate_batch
 from validation.types import RunContext
 
 _HTTP_TIMEOUT_SECONDS = 10.0
-_KST = ZoneInfo("Asia/Seoul")
 
 logger = logging.getLogger(__name__)
 
@@ -230,7 +229,7 @@ def _sync_retry_marker(
 
 def _now() -> datetime:
     """KST aware 현재 시각. manifest의 started_at·ended_at에 쓴다."""
-    return datetime.now(_KST)
+    return datetime.now(KST)
 
 
 def get_backfill_targets(config: SourceConfig) -> list[dict[str, str]]:

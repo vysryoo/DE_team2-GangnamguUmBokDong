@@ -8,12 +8,11 @@
 import io
 import logging
 from datetime import datetime
-from zoneinfo import ZoneInfo
 
 import logging_setup
 from logging_setup import configure_httpx_request_logging, configure_logging
+from core.kst import KST
 
-KST = ZoneInfo("Asia/Seoul")
 
 
 def _configure(stream, **kwargs):

@@ -19,9 +19,10 @@ from storage import (
     write_archive_manifest,
     write_silver,
 )
-from tests.conftest import KST, TEST_BUCKET
+from core.kst import KST
+from core.testing import TEST_BUCKET
 
-pytestmark = pytest.mark.usefixtures("_bucket")
+pytestmark = pytest.mark.usefixtures("s3_bucket")
 
 DAY = date(2026, 8, 12)
 

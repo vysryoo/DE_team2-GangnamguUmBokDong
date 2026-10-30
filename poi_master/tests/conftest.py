@@ -2,21 +2,12 @@
 
 from pathlib import Path
 
-import pytest
-from core import s3 as s3_io
-
 from source import Attachment, SourceAssets
+
+pytest_plugins = ("core.testing",)
 
 _ROOT = Path(__file__).resolve().parents[2]
 _DATA = _ROOT / "normalizer" / "data"
-
-
-@pytest.fixture(autouse=True)
-def _clear_s3_client_cache():
-    """각 POI publication 테스트의 moto client를 완전히 격리한다."""
-    s3_io._clear_client_cache()
-    yield
-    s3_io._clear_client_cache()
 
 
 def real_source_assets() -> SourceAssets:

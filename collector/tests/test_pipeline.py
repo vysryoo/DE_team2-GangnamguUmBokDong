@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import ClassVar
-from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
@@ -16,10 +15,10 @@ from adapters.base import FetchErrorKind, FetchResult, adapter
 from config.schema import Backfill, Policies, Quality, Schedule, SourceConfig
 from config.schema import Storage as StorageConfig
 from manifest import FailureReason, RunStatus, Stage
+from core.kst import KST
 
-pytestmark = pytest.mark.usefixtures("_bucket")
+pytestmark = pytest.mark.usefixtures("s3_bucket")
 
-KST = ZoneInfo("Asia/Seoul")
 WINDOW_START = datetime(2026, 8, 12, 14, 10, tzinfo=KST)
 
 

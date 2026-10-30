@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-import os
 import re
 import struct
 from dataclasses import dataclass
@@ -31,14 +30,15 @@ from .gold_publication.errors import (
     TimestampFormatError,
 )
 from .gold_publication.storage import S3ImmutableObjectStore
-from .s3 import get_object_bytes, list_keys
+from .s3 import get_object_bytes, list_keys, object_uri
 from .source_snapshot import SourceSnapshotStatus
 from .source_snapshot_io import (
     SourceSnapshotReadError,
     read_exact_source_snapshot_manifest,
 )
+from .sources import POI_MASTER
 
-POI_MASTER_SOURCE_ID = "poi_master"
+POI_MASTER_SOURCE_ID = POI_MASTER
 """POI Master source snapshot의 고정 source ID다."""
 
 POI_MASTER_SCHEMA_VERSION = "poi-master-v1"
@@ -324,41 +324,25 @@ def activate_poi_master(
             "POI Master geometry 위상 계약이 잘못되어 활성화할 수 없습니다."
         ) from exc
 
-    key = _activation_key(pointer)
-    uri = _object_uri(key)
-    payload = pointer.canonical_bytes
-    payload_sha256 = sha256_hex(payload)
-    store = S3ImmutableObjectStore()
-    put_error: ImmutableObjectError | None = None
+    uri = object_uri(_activation_key(pointer))
     try:
-        store.put_once(
+        readback = S3ImmutableObjectStore().put_verified(
             uri,
-            payload,
-            expected_sha256=payload_sha256,
-            require_canonical_json=True,
-        )
-    except ImmutableObjectError as exc:
-        # PUT 응답이 유실됐어도 객체 자체는 반영됐을 수 있다. 같은 identity의 재시도가
-        # 성공할 수 있도록 exact readback으로 한 번 reconciliation한다.
-        put_error = exc
-    try:
-        readback = store.read_bytes(
-            uri,
-            payload_sha256,
+            pointer.canonical_bytes,
             require_canonical_json=True,
         )
     except ImmutableObjectError as exc:
         detail = "같은 시각의 다른 activation과 충돌했거나 S3 접근에 실패했습니다."
         raise PoiMasterActivationError(
             f"POI Master activation pointer 게시에 실패했습니다: {uri}; {detail}"
-        ) from (put_error or exc)
+        ) from exc
     try:
         parsed = parse_poi_master_activation(readback)
     except PoiMasterContractError as exc:
         raise PoiMasterActivationError(
             f"POI Master activation pointer readback이 손상됐습니다: {uri}"
         ) from exc
-    if readback != payload or parsed != pointer:
+    if parsed != pointer:
         raise PoiMasterActivationError(
             f"POI Master activation pointer readback이 원본과 다릅니다: {uri}"
         )
@@ -828,7 +812,7 @@ def _validated_columns(columns: list[str] | None) -> list[str] | None:
 
 def _read_activation_pointer(key: str) -> PoiMasterActivation:
     """나열된 activation pointer를 exact bytes와 canonical JSON으로 다시 읽는다."""
-    uri = _object_uri(key)
+    uri = object_uri(key)
     try:
         first_read = get_object_bytes(key)
     except (BotoCoreError, ClientError) as exc:
@@ -943,11 +927,6 @@ def _required_string(value: Any, label: str) -> str:
     if type(value) is not str:
         raise PoiMasterContractError(f"{label}은 문자열이어야 합니다.")
     return value
-
-
-def _object_uri(key: str) -> str:
-    """현재 core S3 bucket의 exact object URI를 반환한다."""
-    return f"s3://{os.environ.get('S3_BUCKET', 'gangnamgu')}/{key}"
 
 
 __all__ = [
