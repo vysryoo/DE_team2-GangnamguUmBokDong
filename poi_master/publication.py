@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import io
-import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -28,18 +27,12 @@ from core.source_snapshot import (
     SourceSnapshotStatus,
     build_source_snapshot_manifest,
 )
-from core.source_snapshot_io import (
-    SourceSnapshotData,
-    SourceSnapshotReadError,
-    read_exact_source_snapshot_manifest,
-)
 from core.sources import POI_MASTER
 
 from registry import RegistryBuild, build_registry
 from source import SourceAssets
 
 _PARTS = ("areas_zip", "list_xlsx")
-_AREA_CODE = re.compile(r"\APOI[0-9]{3}\Z")
 _LEGACY_POI_SHP_PATH = (
     Path(__file__).resolve().parents[1]
     / "normalizer"
@@ -112,115 +105,45 @@ def _raw_metadata_table(build: RegistryBuild) -> tuple[pa.Table, str, str]:
     return build.table.replace_schema_metadata(metadata), list_key, areas_key
 
 
-def _metadata_text(table: pa.Table, key: str) -> str | None:
-    """Arrow schema metadata의 UTF-8 값을 안전하게 읽는다."""
-    raw = (table.schema.metadata or {}).get(key.encode("utf-8"))
-    if raw is None:
-        return None
-    try:
-        return raw.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise PoiPublicationError(
-            f"활성 POI Master metadata가 UTF-8이 아닙니다: {key}"
-        ) from exc
-
-
-def _source_hashes(assets: SourceAssets) -> tuple[str, str]:
-    """방금 내려받은 목록과 영역 파일의 SHA-256을 반환한다."""
-    return (
-        hashlib.sha256(assets.list_bytes).hexdigest(),
-        hashlib.sha256(assets.areas_bytes).hexdigest(),
-    )
-
-
-def _config_version(
-    list_sha256: str,
-    areas_sha256: str,
-    list_declared_place_count: int,
-    areas_declared_place_count: int,
-) -> str:
+def _config_version(build: RegistryBuild, assets: SourceAssets) -> str:
     """현재 변환 계약과 source checksum을 결합한 manifest config version을 만든다."""
     digest = hashlib.sha256(
         (
-            f"{POI_MASTER_SCHEMA_VERSION}\n{list_sha256}\n{areas_sha256}\n"
-            f"{list_declared_place_count}\n{areas_declared_place_count}"
+            f"{POI_MASTER_SCHEMA_VERSION}\n{build.list_sha256}\n{build.areas_sha256}\n"
+            f"{assets.list_attachment.declared_place_count}\n"
+            f"{assets.areas_attachment.declared_place_count}"
         ).encode()
     ).hexdigest()
     return f"sha256:{digest}"
 
 
-def _read_refresh_snapshot(ref: PoiMasterRef) -> SourceSnapshotData:
-    """갱신 판단용 이전 snapshot을 exact ref로 읽어 schema migration을 허용한다.
-
-    현재 schema version과 다른 이전 정상본은 consumer 계약으로 읽을 수 없지만 새
-    artifact의 행 감소 기준에는 필요하다. Manifest와 Silver checksum·행 수는 공통
-    source snapshot reader로 그대로 검증하고, 현재 version이면 consumer의 전체 Table
-    계약을 별도로 적용한다.
-    """
-    assert ref.manifest_uri is not None
-    assert ref.manifest_sha256 is not None
-    try:
-        snapshot = read_exact_source_snapshot_manifest(
-            ref.manifest_uri,
-            ref.manifest_sha256,
-        )
-    except (SourceSnapshotReadError, ValueError) as exc:
-        raise PoiPublicationError(
-            f"활성 POI Master snapshot을 읽을 수 없습니다: {ref.manifest_uri}"
-        ) from exc
-    if (
-        snapshot.manifest.source_id != POI_MASTER
-        or snapshot.manifest.status is not SourceSnapshotStatus.SUCCEEDED
-        or snapshot.table is None
-    ):
-        raise PoiPublicationError("활성 POI Master snapshot이 SUCCEEDED 계약이 아닙니다.")
-    return snapshot
-
-
-def _stale_schema_previous_count(table: pa.Table) -> int:
-    """구버전 Table에서 schema와 독립적인 고유 POI code 수만 감소 기준으로 읽는다."""
-    if "AREA_CD" not in table.column_names or table.schema.field("AREA_CD").type != pa.string():
-        raise PoiPublicationError(
-            "구버전 POI Master에 string AREA_CD identity가 없습니다."
-        )
-    area_codes = table.column("AREA_CD").to_pylist()
-    if (
-        not area_codes
-        or len(area_codes) != table.num_rows
-        or any(
-            type(area_code) is not str or _AREA_CODE.fullmatch(area_code) is None
-            for area_code in area_codes
-        )
-        or len(area_codes) != len(set(area_codes))
-    ):
-        raise PoiPublicationError(
-            "구버전 POI Master의 AREA_CD identity가 유효하거나 고유하지 않습니다."
-        )
-    return max(len(area_codes), _legacy_poi_count())
+def _source_fingerprint(assets: SourceAssets) -> dict[bytes, bytes]:
+    """활성본과 비교할 원천 checksum·선언 장소 수를 Table metadata 형태로 만든다."""
+    return {
+        b"list_sha256": hashlib.sha256(assets.list_bytes).hexdigest().encode(),
+        b"areas_sha256": hashlib.sha256(assets.areas_bytes).hexdigest().encode(),
+        b"list_declared_place_count": str(assets.list_attachment.declared_place_count).encode(),
+        b"areas_declared_place_count": str(assets.areas_attachment.declared_place_count).encode(),
+    }
 
 
 def _legacy_poi_count() -> int:
     """최초 활성화의 감소 기준이 되는 repository Shapefile 행 수를 반환한다."""
     try:
         with shapefile.Reader(str(_LEGACY_POI_SHP_PATH)) as reader:
-            row_count = len(reader)
+            return len(reader)
     except (OSError, shapefile.ShapefileException) as exc:
         raise PoiPublicationError(
             f"기존 POI Shapefile 행 수를 읽을 수 없습니다: {_LEGACY_POI_SHP_PATH}"
         ) from exc
-    if row_count <= 0:
-        raise PoiPublicationError("기존 POI Shapefile의 행 수가 0 이하입니다.")
-    return row_count
 
 
 def _validate_drop_guard(
     previous_count: int, candidate_count: int, max_drop_ratio: float
 ) -> None:
     """이전 정상본 대비 지나치게 큰 행 감소를 활성화 전에 차단한다."""
-    if isinstance(max_drop_ratio, bool) or not 0 <= max_drop_ratio <= 1:
+    if not 0 <= max_drop_ratio <= 1:
         raise ValueError("max_drop_ratio는 0과 1 사이여야 합니다.")
-    if previous_count <= 0:
-        raise PoiPublicationError("활성 POI Master의 행 수가 0 이하입니다.")
     drop_ratio = (previous_count - candidate_count) / previous_count
     if drop_ratio > max_drop_ratio:
         raise PoiPublicationError(
@@ -241,59 +164,37 @@ def refresh_poi_master(
     게시 순서는 immutable source raw 두 개, immutable Silver Parquet, immutable source
     manifest, append-only activation pointer 순이다. 앞 단계가 실패하면 마지막
     pointer가 생기지 않아 기존 활성본은 그대로 유지된다.
+
+    Args:
+        assets: 공식 페이지에서 내려받은 목록·영역 첨부
+        activated_at: 새 활성본의 logical 시각(timezone-aware)
+        max_drop_ratio: 이전 정상본 대비 허용하는 최대 행 감소 비율
+    Returns:
+        `unchanged` 또는 `published` 상태와 선택된 exact ref
+    Raises:
+        PoiMasterError: 현재 활성본을 읽거나 검증할 수 없을 때
+        PoiRegistryError: 원천 첨부가 registry 계약을 어길 때
+        PoiPublicationError: 행 감소 guard를 넘거나 불변 객체 게시에 실패했을 때
     """
-    if activated_at.tzinfo is None or activated_at.utcoffset() is None:
-        raise ValueError("activated_at은 timezone-aware datetime이어야 합니다.")
-    list_sha256, areas_sha256 = _source_hashes(assets)
-    expected_config_version = _config_version(
-        list_sha256,
-        areas_sha256,
-        assets.list_attachment.declared_place_count,
-        assets.areas_attachment.declared_place_count,
-    )
+    fingerprint = _source_fingerprint(assets)
     current_ref = resolve_poi_master(activated_at)
-    current_table: pa.Table | None = None
-    previous_count: int | None = None
     if current_ref.mode == "s3":
-        current_snapshot = _read_refresh_snapshot(current_ref)
-        assert current_snapshot.table is not None
-        current_schema_version = _metadata_text(
-            current_snapshot.table,
-            "poi_master_schema_version",
-        )
-        if current_schema_version == POI_MASTER_SCHEMA_VERSION:
-            # 현재 version은 source가 바뀌었더라도 이전 행 수를 신뢰하기 전에 consumer와
-            # 같은 전체 계약을 통과해야 한다. 손상된 활성본을 migration으로 우회하지 않는다.
-            current_table = read_poi_master(current_ref)
-            previous_count = current_table.num_rows
-            if (
-                current_snapshot.manifest.config_version
-                == expected_config_version
-                and _metadata_text(current_table, "list_sha256") == list_sha256
-                and _metadata_text(current_table, "areas_sha256") == areas_sha256
-                and _metadata_text(current_table, "list_declared_place_count")
-                == str(assets.list_attachment.declared_place_count)
-                and _metadata_text(current_table, "areas_declared_place_count")
-                == str(assets.areas_attachment.declared_place_count)
-            ):
-                return RefreshResult(
-                    status="unchanged",
-                    ref=current_ref,
-                    row_count=current_table.num_rows,
-                    list_sha256=list_sha256,
-                    areas_sha256=areas_sha256,
-                )
-        else:
-            # 알 수 없는 구버전의 행 계약을 그대로 신뢰하지 않는다. 현재 artifact와
-            # repository 정상본 중 더 큰 값을 기준으로 삼아 migration이 감소 guard를
-            # 느슨하게 만드는 일을 막는다.
-            previous_count = _stale_schema_previous_count(current_snapshot.table)
+        # read_poi_master가 현재 schema 계약 전체를 검증하므로 손상된 활성본을 기준으로 삼지 않음
+        current_table = read_poi_master(current_ref)
+        current_metadata = current_table.schema.metadata or {}
+        if all(current_metadata.get(key) == value for key, value in fingerprint.items()):
+            return RefreshResult(
+                status="unchanged",
+                ref=current_ref,
+                row_count=current_table.num_rows,
+                list_sha256=fingerprint[b"list_sha256"].decode(),
+                areas_sha256=fingerprint[b"areas_sha256"].decode(),
+            )
+        previous_count = current_table.num_rows
+    else:
+        previous_count = _legacy_poi_count()
 
     build = build_registry(assets)
-    if (build.list_sha256, build.areas_sha256) != (list_sha256, areas_sha256):
-        raise PoiPublicationError("검증 중 POI source bytes의 checksum이 바뀌었습니다.")
-    if previous_count is None:
-        previous_count = _legacy_poi_count()
     _validate_drop_guard(previous_count, build.table.num_rows, max_drop_ratio)
 
     table, list_key, areas_key = _raw_metadata_table(build)
@@ -305,12 +206,7 @@ def refresh_poi_master(
         logical_dttm=activated_at,
         revision_no=0,
         status=SourceSnapshotStatus.SUCCEEDED,
-        config_version=_config_version(
-            build.list_sha256,
-            build.areas_sha256,
-            assets.list_attachment.declared_place_count,
-            assets.areas_attachment.declared_place_count,
-        ),
+        config_version=_config_version(build, assets),
         silver_uri=object_uri(silver_key),
         silver_byte_sha256=parquet_sha256,
         counts=SourceSnapshotCounts(
@@ -344,6 +240,6 @@ def refresh_poi_master(
         status="published",
         ref=ref,
         row_count=table.num_rows,
-        list_sha256=list_sha256,
-        areas_sha256=areas_sha256,
+        list_sha256=build.list_sha256,
+        areas_sha256=build.areas_sha256,
     )
