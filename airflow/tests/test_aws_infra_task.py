@@ -1,17 +1,15 @@
-"""aws_infra_task.py의 mock 기본값 반전과 신규 EMR 상시 클러스터/리사이즈/스텝
-함수를 검증한다.
+"""aws_infra_task.py의 mock 판별과 EMR 상시 클러스터·스텝 함수를 검증한다.
 
-이 레포 airflow venv에는 moto가 없어(2026-08 확인) botocore 내장
-`botocore.stub.Stubber`로 실제 boto3 호출 형태를 검증한다 — `_get_boto3_client`를
-monkeypatch해서 Stubber로 감싼 클라이언트를 대신 반환하게 한다.
+Airflow venv에 moto가 없어 `botocore.stub.Stubber`로 boto3 호출 형태를 검증한다.
 """
 
 from datetime import UTC, datetime
 
 import boto3
-import orchestration.aws_infra_task as infra
 import pytest
 from botocore.stub import Stubber
+
+import orchestration.aws_infra_task as infra
 
 
 @pytest.fixture(autouse=True)
@@ -38,28 +36,31 @@ def _default_emr_subnet(monkeypatch):
 def _stub_emr_client(monkeypatch) -> Stubber:
     client = boto3.client("emr", region_name="ap-northeast-2")
     stubber = Stubber(client)
-    monkeypatch.setattr(infra, "_get_boto3_client", lambda service_name, region_name=None: client)
+    monkeypatch.setattr(infra, "_get_boto3_client", lambda service_name: client)
     return stubber
 
 
-# --- is_mock_mode() 기본값 반전 ---
+# --- is_emr_mock_mode() ---
 
 
-def test_is_mock_mode_defaults_to_real_when_no_override():
-    assert infra.is_mock_mode(None) is False
+def test_is_emr_mock_mode_defaults_to_real_with_non_dummy_key():
+    assert infra.is_emr_mock_mode(None) is False
 
 
-def test_is_mock_mode_force_mock_overrides_to_mock():
-    assert infra.is_mock_mode(infra.MOCK_OVERRIDE_FORCE_MOCK) is True
-
-
-def test_is_mock_mode_force_real_stays_real():
-    assert infra.is_mock_mode(infra.MOCK_OVERRIDE_FORCE_REAL) is False
-
-
-def test_is_mock_mode_env_var_forces_mock_regardless_of_override(monkeypatch):
+def test_is_emr_mock_mode_override_wins_over_environment(monkeypatch):
     monkeypatch.setenv("MOCK_AWS_INFRA", "true")
-    assert infra.is_mock_mode(infra.MOCK_OVERRIDE_FORCE_REAL) is True
+    assert infra.is_emr_mock_mode(infra.MOCK_OVERRIDE_FORCE_REAL) is False
+    assert infra.is_emr_mock_mode(infra.MOCK_OVERRIDE_FORCE_MOCK) is True
+
+
+def test_is_emr_mock_mode_env_var_forces_mock_without_override(monkeypatch):
+    monkeypatch.setenv("MOCK_AWS_INFRA", "true")
+    assert infra.is_emr_mock_mode("auto") is True
+
+
+def test_is_emr_mock_mode_treats_local_dummy_key_as_mock(monkeypatch):
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "minioadmin")
+    assert infra.is_emr_mock_mode(None) is True
 
 
 # --- create_emr_cluster() ---
@@ -94,7 +95,7 @@ def test_create_emr_cluster_sets_keep_alive_and_managed_policy_tag(monkeypatch):
         "describe_cluster",
         lambda **kwargs: {"Cluster": {"Status": {"State": "WAITING"}}},
     )
-    monkeypatch.setattr(infra, "_get_boto3_client", lambda service_name, region_name=None: client)
+    monkeypatch.setattr(infra, "_get_boto3_client", lambda service_name: client)
 
     infra.create_emr_cluster(core_instance_count=3, mock_override=infra.MOCK_OVERRIDE_FORCE_REAL)
 
@@ -138,7 +139,7 @@ def test_create_emr_cluster_adds_bootstrap_action_when_configured(monkeypatch):
         "describe_cluster",
         lambda **kwargs: {"Cluster": {"Status": {"State": "WAITING"}}},
     )
-    monkeypatch.setattr(infra, "_get_boto3_client", lambda service_name, region_name=None: client)
+    monkeypatch.setattr(infra, "_get_boto3_client", lambda service_name: client)
 
     infra.create_emr_cluster(core_instance_count=3, mock_override=infra.MOCK_OVERRIDE_FORCE_REAL)
 
@@ -164,7 +165,7 @@ def test_create_emr_cluster_skips_bootstrap_action_when_explicitly_disabled(monk
         "describe_cluster",
         lambda **kwargs: {"Cluster": {"Status": {"State": "WAITING"}}},
     )
-    monkeypatch.setattr(infra, "_get_boto3_client", lambda service_name, region_name=None: client)
+    monkeypatch.setattr(infra, "_get_boto3_client", lambda service_name: client)
 
     infra.create_emr_cluster(core_instance_count=3, mock_override=infra.MOCK_OVERRIDE_FORCE_REAL)
 
@@ -185,9 +186,7 @@ def test_create_emr_cluster_raises_on_early_termination(monkeypatch):
 
 
 def test_create_emr_cluster_terminates_itself_on_waiting_timeout(monkeypatch):
-    """WAITING 상태 도달 전에 타임아웃되면 cluster_id가 어디에도(XCom 등) 안 실린 채
-    예외만 던져지므로, 이 함수가 직접 종료 요청까지 해야 한다 — 안 그러면 아무도
-    이 클러스터를 못 찾아 계속 과금된다(run_emr_feature_mart_job()의 동일 패턴)."""
+    """WAITING 전에 타임아웃되면 cluster_id가 XCom에 남지 않으므로 직접 종료한다."""
     stubber = _stub_emr_client(monkeypatch)
     stubber.add_response("run_job_flow", {"JobFlowId": "j-created"})
     stubber.add_response("terminate_job_flows", {})
@@ -240,71 +239,6 @@ def test_create_emr_cluster_mock_mode_returns_without_calling_aws(monkeypatch):
     cluster_id = infra.create_emr_cluster(mock_override=infra.MOCK_OVERRIDE_FORCE_MOCK)
 
     assert cluster_id.startswith("mock-j-")
-
-
-# --- get_core_instance_group_id() / resize_emr_cluster() ---
-
-
-def test_get_core_instance_group_id_finds_core_group(monkeypatch):
-    stubber = _stub_emr_client(monkeypatch)
-    stubber.add_response(
-        "list_instance_groups",
-        {
-            "InstanceGroups": [
-                {"Id": "ig-master", "InstanceGroupType": "MASTER"},
-                {"Id": "ig-core", "InstanceGroupType": "CORE"},
-            ]
-        },
-    )
-    stubber.activate()
-
-    group_id = infra.get_core_instance_group_id("j-1", mock_override=infra.MOCK_OVERRIDE_FORCE_REAL)
-
-    assert group_id == "ig-core"
-
-
-def test_resize_emr_cluster_polls_until_target_running_count(monkeypatch):
-    stubber = _stub_emr_client(monkeypatch)
-    stubber.add_response("modify_instance_groups", {})
-    stubber.add_response(
-        "list_instance_groups",
-        {"InstanceGroups": [{"Id": "ig-core", "InstanceGroupType": "CORE", "RunningInstanceCount": 3}]},
-    )
-    stubber.add_response(
-        "list_instance_groups",
-        {"InstanceGroups": [{"Id": "ig-core", "InstanceGroupType": "CORE", "RunningInstanceCount": 8}]},
-    )
-    stubber.activate()
-    monkeypatch.setattr(infra.time, "sleep", lambda _seconds: None)
-
-    infra.resize_emr_cluster(
-        "j-1", "ig-core", target_core_count=8, mock_override=infra.MOCK_OVERRIDE_FORCE_REAL
-    )
-
-    stubber.assert_no_pending_responses()
-
-
-def test_resize_emr_cluster_times_out_when_never_reaches_target(monkeypatch):
-    """timeout_seconds=0이면 while 조건이 즉시 거짓이 되어 list_instance_groups
-    호출 없이도 바로 TimeoutError가 나야 한다 — 실제 시간 경과에 의존하지 않는
-    결정적(deterministic) 경계값 테스트다."""
-    stubber = _stub_emr_client(monkeypatch)
-    stubber.add_response("modify_instance_groups", {})
-    stubber.activate()
-
-    with pytest.raises(TimeoutError, match="리사이즈되지 못했습니다"):
-        infra.resize_emr_cluster(
-            "j-1", "ig-core", target_core_count=8, timeout_seconds=0, mock_override=infra.MOCK_OVERRIDE_FORCE_REAL
-        )
-
-
-def test_resize_emr_cluster_mock_mode_returns_without_calling_aws(monkeypatch):
-    def _fail(*args, **kwargs):
-        raise AssertionError("mock 모드에서는 boto3 클라이언트를 만들면 안 됨")
-
-    monkeypatch.setattr(infra, "_get_boto3_client", _fail)
-
-    infra.resize_emr_cluster("j-1", "ig-core", target_core_count=8, mock_override=infra.MOCK_OVERRIDE_FORCE_MOCK)
 
 
 # --- submit_emr_step() ---
