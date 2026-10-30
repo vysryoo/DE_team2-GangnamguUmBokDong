@@ -12,9 +12,6 @@ dependencies = [
 [tool.uv]
 package = false
 
-[tool.uv.sources]
-ml_core = { path = "../libs/ml_core", editable = true }
-
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
