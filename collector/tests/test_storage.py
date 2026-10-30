@@ -15,9 +15,7 @@ from core.gold_publication.errors import (
 )
 from storage import (
     clear_bronze,
-    delete_retry_marker,
     latest_source_snapshot_logical_dttm,
-    list_retry_markers,
     list_source_snapshot_windows,
     list_window_manifest_payloads,
     next_bronze_revision,
@@ -28,7 +26,6 @@ from storage import (
     write_immutable_silver,
     write_manifest,
     write_quarantine,
-    write_retry_marker,
     write_source_snapshot_manifest,
 )
 from core.kst import KST
@@ -359,33 +356,3 @@ class TestLatestSourceSnapshotLogicalDttm:
         assert result is None
 
 
-class TestRetryMarkerRawIO:
-    def test_write_then_list(self):
-        write_retry_marker(
-            "test_source", WINDOW_START, {"source_id": "test_source", "attempts": 1}
-        )
-
-        result = list_retry_markers("test_source")
-
-        assert result == [{"source_id": "test_source", "attempts": 1}]
-
-    def test_list_only_returns_matching_source(self):
-        write_retry_marker("source_a", WINDOW_START, {"source_id": "source_a"})
-        write_retry_marker("source_b", WINDOW_START, {"source_id": "source_b"})
-
-        result = list_retry_markers("source_a")
-
-        assert result == [{"source_id": "source_a"}]
-
-    def test_list_with_no_markers_returns_empty(self):
-        assert list_retry_markers("no_markers_here") == []
-
-    def test_delete_removes_marker(self):
-        write_retry_marker("test_source", WINDOW_START, {"source_id": "test_source"})
-
-        delete_retry_marker("test_source", WINDOW_START)
-
-        assert list_retry_markers("test_source") == []
-
-    def test_delete_nonexistent_does_not_raise(self):
-        delete_retry_marker("never_written", WINDOW_START)

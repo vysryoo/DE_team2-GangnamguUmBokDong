@@ -22,7 +22,6 @@ from core.gold_publication.storage import S3ImmutableObjectStore
 from core.kst import KST
 from core.s3 import (
     S3Object,
-    delete_object,
     delete_objects,
     get_object_bytes,
     list_keys,
@@ -402,11 +401,6 @@ def list_source_snapshot_manifest_payloads(
     return result
 
 
-def _retry_marker_key(source_id: str, window_start: datetime) -> str:
-    """해당 윈도우의 retry marker 객체 키를 만든다."""
-    return f"_retry_queue/{source_id}/{window_start.isoformat()}.json"
-
-
 def write_manifest(source_id: str, window_start: datetime, data: dict) -> None:
     """해당 윈도우의 manifest를 json으로 저장한다."""
     write_json(layout.window_manifest_key(source_id, window_start), data)
@@ -437,26 +431,3 @@ def list_window_manifest_payloads(
         if data:
             payloads.append(data)
     return payloads
-
-
-def write_retry_marker(source_id: str, window_start: datetime, data: dict) -> None:
-    """해당 윈도우의 retry marker를 JSON으로 저장한다."""
-    key = _retry_marker_key(source_id, window_start)
-    write_json(key, data)
-
-
-def list_retry_markers(source_id: str) -> list[dict]:
-    """해당 소스에 쌓인 retry marker를 모두 읽어 반환한다."""
-    prefix = f"_retry_queue/{source_id}/"
-    markers = []
-    for key in list_keys(prefix):
-        data = read_json(key)
-        if data:
-            markers.append(data)
-    return markers
-
-
-def delete_retry_marker(source_id: str, window_start: datetime) -> None:
-    """해당 윈도우의 retry marker를 삭제한다."""
-    key = _retry_marker_key(source_id, window_start)
-    delete_object(key)

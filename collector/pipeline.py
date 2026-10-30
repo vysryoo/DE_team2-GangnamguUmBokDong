@@ -2,7 +2,7 @@
 
 실행 순서는 config 로드, manifest 로드, 재개 분기, (라운드를 돌며 조각마다 fetch
 후 bronze 즉시 저장), 완결도 게이트, normalize, 검증·정책 적용, silver·quarantine
-저장, manifest 마감(legacy 설정이면 retry marker 동기화) 순이다. 단계를 넘어갈
+저장, manifest 마감 순이다. 단계를 넘어갈
 때마다 manifest의 `stage`를 갱신해, 중간에 죽어도 다음 실행이 어디서부터 재개할지
 알 수 있게 한다.
 
@@ -12,7 +12,6 @@
 | --- | --- |
 | `stage=completed` (일반 실행) | authority 검증 후 `SKIPPED` 반환 |
 | `stage>=bronze_written` (일반 재실행) | 기존 revision의 bronze 로드(fetch 건너뜀) |
-| 누락 존재 & legacy `--backfill` | 기존 성공 조각 + 새 누락 조각을 새 Hot revision에 저장 |
 | 그 외 (또는 `--force`) | 새 immutable Hot revision에 전체 fetch |
 
 bronze 재사용이 재개의 핵심인 이유: 실시간 API(5분 주기)는 몇 분만 지나도 그 시점
@@ -64,10 +63,6 @@ silver가 있으면 하류가 manifest 확인 없이 읽을 위험이 있다. qu
 bronze·config로 재시도해도 결과가 같아 config를 고쳐야 하고, `fetch_error`는 수집
 누락을 뜻한다 — 그래서 `failure_reason`으로 둘을 구분해 남긴다.
 
-legacy 백필 호환: 예전 설정처럼 `backfill.enabled`이면 `_retry_queue` 마커와
-`--backfill` 동작을 유지한다. 현재 운영 source 설정은 이 지연 백필을 켜지 않으므로
-기존 marker도 발견하지 않는다.
-
 `stage`의 최종 정지점은 실패 종류별로 다르다.
 - `fetch_error`·`FATAL` — fetch 단계에서 끝났으므로 `BRONZE_WRITTEN`. 다음
   실행은 manifest가 가리키는 기존 Bronze를 재사용한다.
@@ -115,7 +110,6 @@ from manifest import (
     FailureReason,
     Manifest,
     Missing,
-    RetryMarker,
     RunStatus,
     Stage,
 )
@@ -125,10 +119,6 @@ from validation.types import RunContext
 _HTTP_TIMEOUT_SECONDS = 10.0
 
 logger = logging.getLogger(__name__)
-
-
-class ForceAndBackfillError(ValueError):
-    """`--force`와 `--backfill`은 목적이 반대라 동시에 줄 수 없다."""
 
 
 def _sorted_chunks(chunks: dict[str, bytes]) -> list[bytes]:
@@ -174,91 +164,9 @@ def _build_missing(
     return Missing(parts=parts, rows=None, basis="parts")
 
 
-def _sync_retry_marker(
-    config, window_start: datetime, missing: Missing, first_failed_at: datetime
-) -> str | None:
-    """이번 실행이 남긴 누락에 맞춰 `_retry_queue` 마커를 쓰거나·갱신하거나·지운다.
-
-    누락 조각이 남아 있으면 마커를 쓴다. 이미 마커가 있으면 `first_failed_at`은
-    그대로 두고(나이는 처음 실패한 시점부터 잰다) `missing_parts`만 최신값으로
-    바꾸고 `attempts`를 늘린다. 누락이 없어졌으면(이번에 다 채웠거나 애초에
-    없었으면) 기존 마커를 지운다. `backfill.enabled`가 아닌 소스는 채울 방법이
-    없는 마커를 쌓지 않도록 아예 건드리지 않는다. 이 경로는 기존 설정과 수동
-    도구의 호환용이며, 여기서는 `expires_at`만 계산해 남긴다.
-
-    args:
-        config: `backfill` 설정을 담은 소스 설정.
-        window_start: 이번 실행이 처리한 window의 시작 시각.
-        missing: 이번 실행이 최종적으로 도달한 누락 정보.
-        first_failed_at: 이번 실행을 첫 실패로 볼 때 쓸 시각. 기존 마커가 있으면
-            무시되고 그 마커의 값이 유지된다.
-    returns:
-        마커가 존재하게 됐으면 `"pending"`, 지워졌거나 애초에 필요 없었으면 `None`.
-        manifest의 `backfill_status` 필드에 그대로 쓰인다.
-    """
-    if config.backfill is None or not config.backfill.enabled:
-        return None
-
-    existing = next(
-        (
-            m
-            for m in manifest_module.load_retry_markers(config.source_id)
-            if m.window_start == window_start
-        ),
-        None,
-    )
-
-    if not missing.parts:
-        if existing is not None:
-            manifest_module.clear_retry_marker(config.source_id, window_start)
-        return None
-
-    first_failed = existing.first_failed_at if existing is not None else first_failed_at
-    manifest_module.save_retry_marker(
-        RetryMarker(
-            source_id=config.source_id,
-            window_start=window_start,
-            missing_parts=missing.parts,
-            first_failed_at=first_failed,
-            expires_at=first_failed + config.backfill.max_age,
-            attempts=(existing.attempts + 1) if existing is not None else 1,
-        )
-    )
-    return "pending"
-
-
 def _now() -> datetime:
     """KST aware 현재 시각. manifest의 started_at·ended_at에 쓴다."""
     return datetime.now(KST)
-
-
-def get_backfill_targets(config: SourceConfig) -> list[dict[str, str]]:
-    """legacy 백필 실행 도구에 반환할 백필 대상 목록을 조회한다.
-
-    만료된 마커나 백필이 비활성화된 소스는 거르고, 실행에 필요한 최소한의
-    정보(source_id, window_start)만 JSON 반환용 dict로 추려 반환한다.
-    """
-    if config.backfill is None or not config.backfill.enabled:
-        return []
-
-    now = _now()
-    targets = []
-
-    for marker in manifest_module.load_retry_markers(config.source_id):
-        # 만료된 마커는 걸러낸다 (저장소 보존 주기에 의해 나중에 정리됨)
-        if now > marker.expires_at:
-            continue
-
-        targets.append(
-            {
-                "source_id": marker.source_id,
-                "window_start": marker.window_start.isoformat(),
-            }
-        )
-
-    # 과거 시간부터 채우도록 정렬
-    targets.sort(key=lambda x: x["window_start"])
-    return targets
 
 
 def execute_window(
@@ -267,7 +175,6 @@ def execute_window(
     *,
     client,
     force: bool = False,
-    backfill: bool = False,
     sleep_fn=time.sleep,
 ) -> Manifest:
     """window 하나를 재개 분기에 따라 처리하고 최종 manifest를 반환한다.
@@ -283,16 +190,10 @@ def execute_window(
         window_start: 수집 대상 window의 시작 시각.
         client: 어댑터에 주입할 httpx 클라이언트.
         force: 재개 분기를 모두 무시하고 처음부터 다시 수집한다.
-        backfill: 완결된 window의 누락 조각만 채운다. `force`와 동시에 줄 수 없다.
         sleep_fn: 라운드 간 대기 함수.
     returns:
         이번 실행이 도달한 최종 manifest.
-    raises:
-        ForceAndBackfillError: `force`와 `backfill`을 동시에 줄 때.
     """
-    if force and backfill:
-        raise ForceAndBackfillError("--force와 --backfill은 함께 줄 수 없다")
-
     window_end = window_start + config.schedule.interval
     started_at = _now()
     existing = manifest_module.load(config.source_id, window_start)
@@ -364,69 +265,14 @@ def execute_window(
         manifest_module.finalize_source_snapshot(prepared)
         return value
 
-    if (
-        existing
-        and existing.stage == Stage.COMPLETED
-        and not force
-        and not (backfill and existing.missing.parts)
-    ):
-        # 분기 1: 이미 완결됐고 채울 누락도 없으면(또는 backfill이 아니면) 아무것도
-        # 하지 않는다. immutable output과 이미 확정된 authority manifest는 exact
+    if existing and existing.stage == Stage.COMPLETED and not force:
+        # 분기 1: 이미 완결됐으면 아무것도 하지 않는다. 확정된 authority manifest는 exact
         # replay로 다시 검증하되 mutable 진단 파일에서 새 authority를 만들지는 않는다.
         existing = _verify_completed_authority(existing)
         logger.info("stage=completed status=skipped")
         return existing.model_copy(update={"status": RunStatus.SKIPPED})
 
     if (
-        existing
-        and backfill
-        and existing.missing.parts
-        and existing.stage.value >= Stage.BRONZE_WRITTEN.value
-        and not force
-    ):
-        # 분기 4: legacy 백필. 기존 snapshot은 보존하고, 기존 성공 조각과 새 누락
-        # 조각을 합친 새 Hot revision을 만든다.
-        have_parts = existing.artifacts.bronze.parts
-        prior_revision = existing.artifacts.bronze.revision
-        prior_chunks = dict(
-            zip(
-                have_parts,
-                storage.read_bronze(
-                    config.source_id, window_start, have_parts, prior_revision
-                ),
-            )
-        )
-        bronze_revision = storage.next_bronze_revision(
-            config.source_id, window_start
-        )
-        for key, payload in prior_chunks.items():
-            storage.write_bronze_part(
-                config.source_id, window_start, key, payload, bronze_revision
-            )
-        round_result = fetch_with_rounds(
-            adapter_cls.fetch,
-            config,
-            window,
-            client=client,
-            skip=frozenset(have_parts),
-            expected_total=existing.counts.expected,
-            sleep_fn=sleep_fn,
-            on_chunk=lambda key, payload: storage.write_bronze_part(
-                config.source_id, window_start, key, payload, bronze_revision
-            ),
-            planned_parts=planned_parts,
-        )
-        chunks = {**prior_chunks, **round_result.chunks}
-        missing_keys = round_result.missing
-        # 이번에 새로 알아낸 값이 있으면 그걸 쓰고, 없으면 이전 실행이 남긴 값을 이어받는다.
-        expected_total = (
-            round_result.expected_total
-            if round_result.expected_total is not None
-            else existing.counts.expected
-        )
-        attempt = existing.attempt + 1
-        revision_base = existing.revision
-    elif (
         existing
         and existing.stage.value >= Stage.BRONZE_WRITTEN.value
         and not force
@@ -513,15 +359,12 @@ def execute_window(
         authority_silver: storage.ImmutableSilverArtifact | None = None,
         **over,
     ) -> Manifest:
-        """manifest를 만들고 마커를 동기화해 저장한 뒤 그대로 반환한다.
+        """manifest를 만들어 저장한 뒤 그대로 반환한다.
 
-        아래 모든 종료 지점이 공유한다. `missing`을 넘기지 않은 호출(FATAL 등)은
-        누락 없음으로 보고, 그 경우 마커도 건드리지 않는다. Authority 대상이면
-        immutable Silver를 이미 완성한 뒤 revision을 먼저 결정하고, mutable 진단
-        manifest와 retry marker를 기록한 다음 authority manifest를 마지막에 쓴다.
+        아래 모든 종료 지점이 공유한다. Authority 대상이면 immutable Silver를 이미
+        완성한 뒤 revision을 먼저 결정하고, mutable 진단 manifest를 기록한 다음
+        authority manifest를 마지막에 쓴다.
         """
-        missing = over.get("missing", Missing())
-
         prepared_authority = None
         if authority_status is not None:
             provisional = _base_manifest(**over)
@@ -552,17 +395,9 @@ def execute_window(
             )
             over["revision"] = prepared_authority.manifest.revision_no
 
-        # S3 원자적 갱신 불가 문제 해결: manifest 저장을 먼저 수행하고,
-        # 실패하지 않았을 때만 마커를 갱신/삭제해 무한 대기나 고아 마커를 방지한다.
-        status_str = (
-            "pending"
-            if (config.backfill and config.backfill.enabled and missing.parts)
-            else None
-        )
-        result = _base_manifest(backfill_status=status_str, **over)
+        result = _base_manifest(**over)
         manifest_module.save(result)
 
-        _sync_retry_marker(config, window_start, missing, started_at)
         if prepared_authority is not None:
             try:
                 manifest_module.finalize_source_snapshot(prepared_authority)

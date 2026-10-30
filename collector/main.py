@@ -2,21 +2,14 @@
 
     cd collector
     uv run python main.py --source bike_station_realtime \
-        --window-start 2026-08-12T23:10:00+09:00 [--force] [--backfill]
+        --window-start 2026-08-12T23:10:00+09:00 [--force]
 
 Airflow는 소스별 태스크에서 논리 시각을 KST로 변환해 `--window-start`로 넘긴다.
 일반 재실행은 manifest가 가리키는 기존 Bronze를 재사용한다.
-현재 범용 Backfill DAG는 없으며, `--backfill`과 대상 조회 옵션은 legacy 코드
-호환용으로만 유지한다. 운영 설정은 예전 retry marker를 발견하지 않는다.
 `window_end`는 config의 `schedule.interval`로 계산하며, collector 자체는 스케줄을
 모른다.
 
-`--force`와 `--backfill`은 목적이 반대라 함께 줄 수 없다(오류로 막는다).
-
-| 플래그 | 의미 | bronze |
-| --- | --- | --- |
-| `--force` | 재개 분기를 무시하고 처음부터 다시 | 새 Hot Bronze revision에 전체 재수집 |
-| `--backfill` | 완결된 window의 누락 조각만 채움 | 기존 조각 유지, 빠진 것만 호출 |
+`--force`는 재개 분기를 무시하고 새 Hot Bronze revision에 전체 재수집한다.
 
 종료 코드는 `SUCCEEDED`·`PARTIAL`·`EMPTY`·`SKIPPED`가 0, `FAILED`가 non-zero다.
 누락이 있어도 source별 허용 게이트를 통과했으면 `PARTIAL`(0)로 downstream task를
@@ -82,14 +75,12 @@ def _latest_source_uses_config(
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """CLI 인자를 파싱한다.
 
-    `--force`와 `--backfill`은 목적이 반대라 함께 주면 `argparse`가 사용법 메시지를 찍고 `SystemExit`을 일으키게 막는다.
-
     args:
         argv: 파싱할 인자 목록. 생략하면 `sys.argv`를 그대로 쓴다.
     returns:
         실행 window와 선택한 POI Master ref 필드를 담은 네임스페이스.
     raises:
-        SystemExit: 필수 인자가 없거나 `--force`와 `--backfill`을 함께 줬을 때.
+        SystemExit: 필수 인자가 없거나 POI Master 인자 조합이 잘못됐을 때.
     """
     parser = argparse.ArgumentParser(prog="main.py")
     parser.add_argument("--source", required=True, help="소스 id (sources/{source_id}.yaml)")
@@ -99,8 +90,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="재개 분기를 무시하고 새 Hot Bronze revision에 전체 재수집",
     )
-    parser.add_argument("--backfill", action="store_true", help="완결된 window의 누락 조각만 채운다")
-    parser.add_argument("--list-backfill-targets", action="store_true", help="백필 대상을 JSON으로 출력하고 종료")
     parser.add_argument(
         "--report-window-stats",
         action="store_true",
@@ -141,22 +130,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             setattr(args, field, None)
 
     if (
-        not args.list_backfill_targets
-        and args.check_due_after_seconds is None
+        args.check_due_after_seconds is None
         and not args.report_window_stats
         and not args.window_start
     ):
         parser.error(
             "the following arguments are required: --window-start "
-            "(unless --list-backfill-targets/--check-due-after-seconds/"
-            "--report-window-stats is used)"
+            "(unless --check-due-after-seconds/--report-window-stats is used)"
         )
 
     if args.report_window_stats and not args.window_day:
         parser.error("--report-window-stats에는 --window-day가 필요하다")
-
-    if args.force and args.backfill:
-        parser.error("--force와 --backfill은 함께 줄 수 없다")
 
     has_manifest_ref = (
         args.poi_master_manifest_uri is not None
@@ -273,13 +257,6 @@ def main(argv: list[str] | None = None) -> int:
     """
     args = parse_args(argv)
 
-    if args.list_backfill_targets:
-        import json
-        config = config_loader.load(args.source)
-        targets = pipeline.get_backfill_targets(config)
-        print(json.dumps(targets))
-        return 0
-
     if args.report_window_stats:
         import json
         from datetime import date as date_cls
@@ -361,7 +338,7 @@ def main(argv: list[str] | None = None) -> int:
     # 어댑터는 연결을 모르고 `client` 인자로 주입받기만 한다
     with httpx.Client(timeout=_HTTP_TIMEOUT) as client:
         result = pipeline.execute_window(
-            config, window_start, client=client, force=args.force, backfill=args.backfill,
+            config, window_start, client=client, force=args.force,
         )
 
     return exit_code_for(result.status)

@@ -1,4 +1,4 @@
-"""main.py 테스트: 인자 파싱, --force/--backfill 동시 지정 차단, 종료 코드 매핑."""
+"""main.py 테스트: 인자 파싱, 모드 분기, 종료 코드 매핑."""
 
 from __future__ import annotations
 
@@ -31,7 +31,6 @@ class TestParseArgs:
         assert args.source == "bike_station_realtime"
         assert args.window_start == "2026-08-12T14:10:00+09:00"
         assert args.force is True
-        assert args.backfill is False
 
     def test_missing_source_exits(self):
         with pytest.raises(SystemExit):
@@ -40,16 +39,6 @@ class TestParseArgs:
     def test_missing_window_start_exits(self):
         with pytest.raises(SystemExit):
             main.parse_args(["--source", "bike_station_realtime"])
-
-    def test_force_and_backfill_together_exits(self):
-        with pytest.raises(SystemExit):
-            main.parse_args(
-                [
-                    "--source", "bike_station_realtime",
-                    "--window-start", "2026-08-12T14:10:00+09:00",
-                    "--force", "--backfill",
-                ]
-            )
 
     def test_check_due_after_seconds_does_not_require_window_start(self):
         args = main.parse_args(
@@ -586,11 +575,10 @@ class TestMain:
             captured["loaded_source_id"] = source_id
             return stub_config
 
-        def fake_execute_window(config, window_start, *, client, force, backfill):
+        def fake_execute_window(config, window_start, *, client, force):
             captured["config"] = config
             captured["window_start"] = window_start
             captured["force"] = force
-            captured["backfill"] = backfill
             return SimpleNamespace(status=RunStatus.SUCCEEDED)
 
         monkeypatch.setattr(main.config_loader, "load", fake_load)
@@ -603,7 +591,6 @@ class TestMain:
         assert captured["config"] is stub_config
         assert captured["window_start"] == datetime(2026, 8, 12, 14, 10, tzinfo=KST)
         assert captured["force"] is False
-        assert captured["backfill"] is False
 
     def test_failed_status_returns_nonzero(self, monkeypatch, stub_config):
         monkeypatch.setattr(main.config_loader, "load", lambda source_id: stub_config)
@@ -632,24 +619,6 @@ class TestMain:
         main.main(["--source", "bike_station_realtime", "--window-start", "2026-08-12T14:10:00+09:00"])
 
         assert order == ["logging", "config"]
-
-    def test_passes_force_and_backfill_through(self, monkeypatch, stub_config):
-        captured = {}
-        monkeypatch.setattr(main.config_loader, "load", lambda source_id: stub_config)
-
-        def fake_execute_window(config, window_start, *, client, force, backfill):
-            captured["force"] = force
-            captured["backfill"] = backfill
-            return SimpleNamespace(status=RunStatus.SUCCEEDED)
-
-        monkeypatch.setattr(main.pipeline, "execute_window", fake_execute_window)
-
-        main.main(
-            ["--source", "bike_station_realtime", "--window-start", "2026-08-12T14:10:00+09:00", "--backfill"]
-        )
-
-        assert captured["force"] is False
-        assert captured["backfill"] is True
 
     def test_s3_mode_reads_master_once_before_pipeline(self, monkeypatch):
         config = main.config_loader.load("population_realtime")
