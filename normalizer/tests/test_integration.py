@@ -21,8 +21,8 @@ import pytest
 import storage
 from core.forecast import POPULATION_FORECAST_SLOT_COUNT
 
-from tests.conftest import (
-    KST,
+from core.kst import KST
+from core.testing import (
     TEST_BUCKET,
     put_partial_source_snapshot,
     put_source_snapshot,

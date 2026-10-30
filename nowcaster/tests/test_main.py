@@ -10,7 +10,8 @@ import pyarrow.parquet as pq
 import pytest
 import storage
 from botocore.exceptions import ClientError
-from tests.conftest import KST, TEST_BUCKET
+from core.kst import KST
+from core.testing import TEST_BUCKET
 
 
 def _s3():
@@ -238,7 +239,7 @@ class TestCliDispatch:
         }
 
     def test_estimate_command_rejects_naive_source_window(self):
-        with pytest.raises(ValueError, match="timezone offset"):
+        with pytest.raises(ValueError, match="오프셋"):
             main.main(
                 [
                     "estimate",

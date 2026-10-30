@@ -9,6 +9,8 @@ import sys
 from datetime import datetime
 
 import pyarrow as pa
+from core.kst import parse_kst_datetime
+from core.sources import STATION_MASTER_ENRICHED
 from core.weather_grid import latlon_to_grid
 from pyproj import Transformer
 from shapely import STRtree
@@ -201,12 +203,12 @@ def run(window_start: datetime) -> int:
     storage.write_manifest(
         window_start,
         {
-            "source_id": storage.ENRICHED_STATION_MASTER_SOURCE_ID,
+            "source_id": STATION_MASTER_ENRICHED,
             "baseline_date": baseline_date.isoformat(),
             "output_key": output_key,
             **metrics,
         },
-        source_id=storage.ENRICHED_STATION_MASTER_SOURCE_ID,
+        source_id=STATION_MASTER_ENRICHED,
     )
     print(
         f"station master enriched rows={metrics['station_count']} "
@@ -227,7 +229,7 @@ def main(argv: list[str] | None = None) -> int:
     """CLI 실행 오류를 Airflow가 감지할 수 있는 종료 코드로 바꾼다."""
     args = parse_args(argv)
     try:
-        return run(datetime.fromisoformat(args.window_start))
+        return run(parse_kst_datetime(args.window_start))
     except (storage.PartitionNotFoundError, ValueError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1

@@ -22,7 +22,9 @@ import poi
 import pyarrow as pa
 import storage
 from core.forecast import POPULATION_FORECAST_SLOT_COUNT
+from core.kst import parse_kst_datetime
 from core.poi_master import PoiMasterError, PoiMasterRef
+from core.sources import POPULATION_REALTIME
 
 # 실시간 도시데이터의 예측 시각 포맷(실측: "2026-08-19 22:00", KST 정시).
 _FORECAST_TIME_FORMAT = "%Y-%m-%d %H:%M"
@@ -386,7 +388,7 @@ def run(
     realtime_snapshot = storage.read_realtime_snapshot(window_start)
     realtime_table = realtime_snapshot.table
     source_selection = realtime_snapshot.selection_metadata(
-        storage.REALTIME_SOURCE_ID,
+        POPULATION_REALTIME,
         window_start,
         partial_policy=storage.PARTIAL_POLICY,
     )
@@ -493,7 +495,7 @@ def run(
 def main(argv: list[str] | None = None) -> int:
     """CLI 진입점으로 인자를 파싱하고 정규화 파이프라인을 실행한다."""
     args = parse_args(argv)
-    window_start = datetime.fromisoformat(args.window_start)
+    window_start = parse_kst_datetime(args.window_start)
     try:
         ref = PoiMasterRef(
             mode=args.poi_master_mode,

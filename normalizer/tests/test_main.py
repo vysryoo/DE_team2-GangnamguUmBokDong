@@ -13,7 +13,7 @@ from core.source_snapshot_io import (
 )
 from shapely.geometry import box
 
-from tests.conftest import KST
+from core.kst import KST
 
 
 class TestParseArgs:
