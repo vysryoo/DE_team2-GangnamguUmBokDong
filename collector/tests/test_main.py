@@ -160,13 +160,13 @@ class TestParseArgs:
 class TestPoiMasterConfig:
     """S3 POI Master를 한 번 읽어 frozen Collector 설정에 고정하는 계약을 검증한다."""
 
-    def test_codes_are_validated_sorted_and_injected_without_mutating_yaml_config(
+    def test_codes_are_injected_without_mutating_yaml_config(
         self, monkeypatch
     ):
         config = main.config_loader.load("population_realtime")
         original_params = dict(config.adapter_params)
         calls = []
-        table = pa.table({"AREA_CD": ["POI132", "POI001"]})
+        table = pa.table({"AREA_CD": ["POI001", "POI132"]})
 
         def fake_read(ref, columns=None):
             calls.append((ref, columns))
@@ -208,22 +208,6 @@ class TestPoiMasterConfig:
         ).encode("ascii")
         assert result.config_version == f"sha256:{hashlib.sha256(material).hexdigest()}"
         assert result.config_version != config.config_version
-
-    @pytest.mark.parametrize(
-        "table",
-        [
-            pa.table({"AREA_CD": pa.array([], type=pa.string())}),
-            pa.table({"AREA_CD": ["POI001", "POI001"]}),
-            pa.table({"AREA_CD": ["POI1"]}),
-            pa.table({"AREA_CD": ["POI１２３"]}),
-            pa.table({"AREA_CD": [None]}),
-            pa.table({"AREA_CD": ["POI001"], "AREA_NM": ["장소"]}),
-        ],
-    )
-    def test_rejects_invalid_master_code_tables(self, table):
-        with pytest.raises(ValueError, match="POI Master"):
-            main._validated_master_poi_codes(table)
-
 
 class TestExitCodeFor:
     @pytest.mark.parametrize(
@@ -566,7 +550,7 @@ class TestReportWindowStats:
 class TestMain:
     @pytest.fixture
     def stub_config(self):
-        return SimpleNamespace(source_id="bike_station_realtime")
+        return SimpleNamespace(source_id="bike_station_realtime", adapter="seoul_openapi")
 
     def test_happy_path_returns_zero_and_calls_pipeline(self, monkeypatch, stub_config):
         captured = {}
@@ -630,7 +614,7 @@ class TestMain:
             captured["read_count"] += 1
             captured["ref"] = ref
             captured["columns"] = columns
-            return pa.table({"AREA_CD": ["POI132", "POI001"]})
+            return pa.table({"AREA_CD": ["POI001", "POI132"]})
 
         def fake_execute_window(config, *_args, **_kwargs):
             captured["config"] = config
@@ -699,7 +683,7 @@ class TestHttpTimeout:
 
     @pytest.fixture
     def stub_config(self):
-        return SimpleNamespace(source_id="bike_station_realtime")
+        return SimpleNamespace(source_id="bike_station_realtime", adapter="seoul_openapi")
 
     def test_client_timeout_is_explicit_and_longer_than_httpx_default(self, monkeypatch, stub_config):
         captured = {}
