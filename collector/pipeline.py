@@ -1,20 +1,14 @@
 """window 하나를 수집해 Bronze·Silver·manifest로 남기는 파이프라인.
 
-용어:
-- window manifest: 실행마다 덮어쓰는 진단 기록(`manifest.Manifest`). `attempt`는 실행 횟수다.
-- source snapshot: 하류가 믿는 immutable authority manifest. SUCCEEDED·EMPTY일 때만 쓰며,
-  window manifest의 `revision`은 이 snapshot의 정정 순번이다.
-- Bronze revision: 원본 응답을 담는 Hot Bronze prefix의 순번. `--force`마다 하나씩 늘어난다.
-
 흐름: 재개 분기 → fetch(조각마다 Bronze 즉시 저장) → 완결도 게이트 → normalize·검증
-→ quarantine·Silver 저장 → window manifest·source snapshot 기록. 게이트는 실패 사유만
-반환하고, 실패 마감은 단계별로 한 곳(`_fail_fetch`, `_fail_validated`)에서 한다.
+→ quarantine·Silver 저장 → window manifest·source snapshot 기록.
 
-- 완료 window는 source snapshot만 다시 확인하고 `SKIPPED`를 반환한다.
-  `stage>=bronze_written`이면 기존 Bronze를 재사용한다. 실시간 API는 지난 시점 데이터를
-  다시 받을 수 없기 때문이다.
-- fetch 실패는 `BRONZE_WRITTEN`, 저장·품질 실패는 `VALIDATED`에서 멈춘다. `quality_gate`를
-  `COMPLETED`로 올리면 다음 실행이 `SKIPPED`로 빠져 실패가 성공처럼 보인다.
+- window manifest는 실행마다 덮어쓰는 진단 기록이고, source snapshot은 SUCCEEDED·EMPTY일
+  때만 쓰는 immutable authority다. window manifest의 `revision`은 snapshot 정정 순번이다.
+- 완료 window는 snapshot만 다시 확인하고 `SKIPPED`를 반환한다. `stage>=bronze_written`이면
+  기존 Bronze를 재사용한다. 실시간 API는 지난 시점 데이터를 다시 받을 수 없기 때문이다.
+- fetch 실패는 `BRONZE_WRITTEN`, 저장·품질 실패는 `VALIDATED`에서 멈춘다. `COMPLETED`로
+  올리면 다음 실행이 `SKIPPED`로 빠져 실패가 성공처럼 보인다.
 - 게이트에 걸리면 Silver를 쓰지 않는다. quarantine은 원인 분석용이라 폐기 행이 있으면 쓴다.
 """
 
