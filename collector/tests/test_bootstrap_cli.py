@@ -101,7 +101,7 @@ class TestMain:
 
         load_calls = []
 
-        def fake_load_date(scfg, bcfg_arg, day, rows, *, force, station_map_stats=None):
+        def fake_load_date(scfg, bcfg_arg, day, rows, *, force, station_map_stats=None, materialize_empty=False):
             load_calls.append((scfg, bcfg_arg, day, rows, force))
             return DateResult(day=day, status="loaded", rows=len(rows))
 
@@ -264,7 +264,7 @@ class TestMain:
 
         load_calls = []
 
-        def fake_load_date(scfg, bcfg_arg, day, rows, *, force, station_map_stats=None):
+        def fake_load_date(scfg, bcfg_arg, day, rows, *, force, station_map_stats=None, materialize_empty=False):
             load_calls.append((day, rows))
             return DateResult(day=day, status="loaded", rows=len(rows))
 
@@ -295,7 +295,7 @@ class TestMain:
 
         load_calls = []
 
-        def fake_load_date(scfg, bcfg_arg, day, rows, *, force, station_map_stats=None):
+        def fake_load_date(scfg, bcfg_arg, day, rows, *, force, station_map_stats=None, materialize_empty=False):
             load_calls.append(day)
             return DateResult(day=day, status="loaded", rows=len(rows))
 
@@ -352,7 +352,7 @@ class TestMain:
         monkeypatch.setattr(cli.api_source, "fetch_by_date", fake_fetch_by_date)
         monkeypatch.setattr(
             cli.runner, "load_date",
-            lambda scfg, bcfg_arg, day, rows, *, force, station_map_stats=None: DateResult(day=day, status="loaded", rows=len(rows)),
+            lambda scfg, bcfg_arg, day, rows, *, force, station_map_stats=None, materialize_empty=False: DateResult(day=day, status="loaded", rows=len(rows)),
         )
 
         days = [date(2026, 1, 1) + __import__("datetime").timedelta(days=n) for n in range(9)]
@@ -374,7 +374,7 @@ class TestMain:
         )
         monkeypatch.setattr(
             cli.runner, "load_date",
-            lambda scfg, bcfg_arg, day, rows, *, force, station_map_stats=None: DateResult(
+            lambda scfg, bcfg_arg, day, rows, *, force, station_map_stats=None, materialize_empty=False: DateResult(
                 day=day, status="loaded", rows=len(rows), silver_present=True,
             ),
         )
@@ -400,7 +400,7 @@ class TestMain:
         )
         monkeypatch.setattr(
             cli.runner, "load_date",
-            lambda scfg, bcfg_arg, day, rows, *, force, station_map_stats=None: DateResult(
+            lambda scfg, bcfg_arg, day, rows, *, force, station_map_stats=None, materialize_empty=False: DateResult(
                 day=day, status="loaded", rows=len(rows), dropped=3,
             ),
         )
@@ -479,7 +479,7 @@ class TestStationJoinWiring:
                             lambda cfg, csv_dir, days, station_map=None: {
                                 date(2025, 12, 1): pa.Table.from_pylist([{"row": "d1"}])})
 
-        def fake_load_date(scfg, bcfg_arg, day, rows, *, force, station_map_stats=None):
+        def fake_load_date(scfg, bcfg_arg, day, rows, *, force, station_map_stats=None, materialize_empty=False):
             seen["stats"] = station_map_stats
             return DateResult(day=day, status="loaded", rows=len(rows))
 
