@@ -31,9 +31,7 @@ def _parse_bool(value: Any) -> bool:
     raise ValueError(f"bool로 해석할 수 없다: {value!r}")
 
 
-# precip(강수 mm)·snow(적설 cm)는 기상청 범주 표기를 실수로 바꾼다. loader와 같은
-# 규칙을 써야 해 `core`에 둔다. masked_float는 생활인구 비식별 마스킹(`*`)을 결측으로
-# 판정시킨다.
+# precip·snow는 loader와 같은 규칙을 써야 해 `core`에 둔다.
 _CASTERS: dict[str, Callable[[Any], Any]] = {
     "str": str,
     "int": int,
