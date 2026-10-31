@@ -20,70 +20,48 @@ from validation.engine import _judge_column
 from validation.types import IssueKind
 
 
-class TestNoSnow:
-    def test_no_snow_is_zero(self):
-        assert parse_snow("적설없음") == 0.0
-
-    def test_bare_zero_is_zero(self):
-        """PCP와 마찬가지로 맨 '0'이 섞여 온다."""
-        assert parse_snow("0") == 0.0
-
-
-class TestExactValues:
-    def test_value_with_cm_unit(self):
-        """mm용 파서가 터지던 형태다. 이게 이 모듈이 존재하는 이유다."""
-        assert parse_snow("5.0cm") == 5.0
-
-    def test_value_without_unit(self):
-        assert parse_snow("3.5") == 3.5
-
-    def test_accepts_float_input(self):
-        """silver가 이미 숫자로 저장된 뒤 다시 넘기는 경로."""
-        assert parse_snow(2.0) == 2.0
-
-
-class TestRanges:
-    def test_range_takes_lower_bound(self):
-        assert parse_snow("1.0~4.9cm") == 1.0
-
-    def test_at_least_takes_lower_bound(self):
-        """mm용 파서가 터지던 형태다('이상'을 지운 뒤 'cm'가 남았다)."""
-        assert parse_snow("5.0cm 이상") == 5.0
-
-    def test_below_threshold_is_half_cm(self):
-        """'1.0cm 미만'은 실제로 0.1~1.0cm 구간이다. 0.5cm로 대표한다."""
-        assert parse_snow("1.0cm 미만") == 0.5
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("적설없음", 0.0),
+        # PCP와 마찬가지로 맨 '0'이 섞여 온다.
+        ("0", 0.0),
+        # mm용 파서가 터지던 형태다. 이게 이 모듈이 존재하는 이유다.
+        ("5.0cm", 5.0),
+        ("3.5", 3.5),
+        # silver가 이미 숫자로 저장된 뒤 다시 넘기는 경로.
+        (2.0, 2.0),
+        ("1.0~4.9cm", 1.0),
+        # mm용 파서가 터지던 형태다('이상'을 지운 뒤 'cm'가 남았다).
+        ("5.0cm 이상", 5.0),
+        # '1.0cm 미만'은 실제로 0.1~1.0cm 구간이다. 0.5cm로 대표한다.
+        ("1.0cm 미만", 0.5),
+    ],
+)
+def test_parse_snow_converts_category_to_cm(raw, expected):
+    assert parse_snow(raw) == expected
 
 
-class TestFailures:
-    """캐스터로 쓰이므로 실패는 예외여야 한다(`parse_precip`과 같은 이유)."""
-
-    def test_unparseable_text_raises(self):
-        with pytest.raises(ValueError):
-            parse_snow("맑음")
-
-    def test_none_raises(self):
-        with pytest.raises((TypeError, ValueError)):
-            parse_snow(None)
-
-    def test_rain_label_is_not_accepted(self):
-        """강수 표기를 적설 파서에 넘기는 것은 설정 오류다. 조용히 0이 되면 안 된다."""
-        with pytest.raises(ValueError):
-            parse_snow("강수없음")
+@pytest.mark.parametrize(
+    ("raw", "error"),
+    [
+        ("맑음", ValueError),
+        (None, (TypeError, ValueError)),
+        # 강수 표기를 적설 파서에 넘기는 것은 설정 오류다. 조용히 0이 되면 안 된다.
+        ("강수없음", ValueError),
+    ],
+)
+def test_parse_snow_raises_on_unparseable_value(raw, error):
+    with pytest.raises(error):
+        parse_snow(raw)
 
 
-class TestPrecipNoLongerAcceptsSnow:
-    """단위가 다른 두 표기를 한 함수가 받으면 어느 단위로 저장됐는지 알 수 없다.
-    적설은 `parse_snow`만 받는다."""
-
-    def test_precip_rejects_snow_label(self):
-        with pytest.raises(ValueError):
-            parse_precip("적설없음")
-
-    def test_precip_still_rejects_cm_values(self):
-        """mm 파서가 cm를 조용히 통과시키면 10배 오차가 생긴다."""
-        with pytest.raises(ValueError):
-            parse_precip("5.0cm")
+# 단위가 다른 두 표기를 한 함수가 받으면 어느 단위로 저장됐는지 알 수 없다. mm 파서가
+# cm를 조용히 통과시키면 10배 오차가 생긴다.
+@pytest.mark.parametrize("raw", ["적설없음", "5.0cm"])
+def test_parse_precip_rejects_snow_notation(raw):
+    with pytest.raises(ValueError):
+        parse_precip(raw)
 
 
 class TestRegisteredAsCaster:

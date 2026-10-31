@@ -34,9 +34,7 @@ bronze/hot/<source_id>/dt=YYYY-MM-DD/hh=HH/HHMM/revision=NNNNNNNNNN/part=<part_k
 - part가 도착할 때마다 즉시 쓴다.
 - 일반 Airflow 재실행은 실패 종류와 실행 날짜에 관계없이 manifest가 가리키는 Hot
   Bronze revision을 재사용한다.
-- 최초 수집·`--force`·backfill correction은 기존 원본을 지우지 않고 새 immutable
-  revision을 만든다. backfill correction은 기존 성공 조각과 새 누락 조각을 새
-  revision에 합친다.
+- 최초 수집과 `--force`는 기존 원본을 지우지 않고 새 immutable revision을 만든다.
 - Hot object를 쓰기 전에 `_cold_pending/<source_id>/dt=YYYY-MM-DD/` 아래 window
   revision별 immutable marker를 만든다. part가 많아도 같은 revision은 marker 하나를
   공유한다. Cold worker는 marker key의 날짜를 먼저 판별하고 안정화 기간 6일이 지난

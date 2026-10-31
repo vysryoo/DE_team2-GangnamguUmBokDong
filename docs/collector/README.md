@@ -28,7 +28,7 @@ Collector의 현재 동작은 `collector/` 코드와 source YAML을 최종 기�
 - 검증·quarantine 정책: `collector/validation/`
 - manifest와 source authority: `collector/manifest.py`
 - S3/MinIO key와 I/O: `collector/storage.py`
-- replay·일별 Archive: `collector/compaction.py`, `collector/compact.py`
+- replay·일별 Archive와 GC: `collector/compaction.py`, `collector/maintenance.py`
 - 과거 초기 적재: `collector/bootstrap/`
 - 실행 계약 검증: `collector/tests/`
 

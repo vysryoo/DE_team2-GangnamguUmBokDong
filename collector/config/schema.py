@@ -129,26 +129,6 @@ class Fetch(BaseModel):
     budget: Duration | None = None
 
 
-class Backfill(BaseModel):
-    """폐기된 지연 백필 설정.
-
-    collector 수집 경로는 더 이상 읽지 않는다. `compaction`의 archive 복구 범위 계산만
-    참조한다.
-    """
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    enabled: bool = False
-    max_age: Duration | None = None
-
-    @model_validator(mode="after")
-    def _max_age_required_when_enabled(self) -> Backfill:
-        """enabled=true인데 max_age가 없는 조합을 막는다."""
-        if self.enabled and self.max_age is None:
-            raise ValueError("backfill.enabled=true면 max_age가 필수다")
-        return self
-
-
 class Policies(BaseModel):
     """컬럼 정책 4분면 기본값과 선택적 행 정책."""
 
@@ -173,7 +153,6 @@ class SourceConfig(BaseModel):
     storage: 저장 방식
     quality: 품질 기준
     fetch: fetch 시간 예산
-    backfill: 폐기된 지연 백필 설정(`Backfill` 참고)
     compaction: 하루치 압축 옵션
     policies: 컬럼 정책과 행 정책
     columns: 데이터 스키마(key=컬럼명, value=컬럼 스펙)
@@ -191,7 +170,6 @@ class SourceConfig(BaseModel):
     storage: Storage
     quality: Quality
     fetch: Fetch | None = None
-    backfill: Backfill | None = None
     compaction: Compaction | None = None
     policies: Policies
     columns: dict[str, ColumnSpec]

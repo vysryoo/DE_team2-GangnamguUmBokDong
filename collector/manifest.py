@@ -115,28 +115,10 @@ class ColumnIssueCount(BaseModel):
 
 
 class Manifest(BaseModel):
-    """한 번의 실행이 남기는 실행 기록 전체.
+    """한 번의 실행이 남기는 window 진단 기록.
 
-    source_id: 소스 ID
-    window_start: 윈도우 시작 시간
-    window_end: 윈도우 종료 시간
-    status: 실행 상태
-    stage: 실행 단계
-    failure_reason: 실패 이유
-    attempt: 재시도 횟수
-    revision: authoritative source correction ordinal
-    started_at: 시작 시간
-    ended_at: 종료 시간
-    duration_ms: 실행 시간
-    artifacts: 실행 결과물
-    counts: 개수 정보
-    missing: 누락 정보
-    drop_ratio: 드롭 비율
-    completeness: 완료 비율
-    backfill_status: 폐기된 지연 백필의 상태. 저장된 manifest 호환용으로 항상 None
-    column_issues: 컬럼 이슈
-    policy_actions: 정책 실행
-    config_version: 설정 버전
+    `attempt`는 실행 횟수, `revision`은 authority content의 correction ordinal이다.
+    `backfill_status`는 폐기된 지연 백필 필드로, 기존 manifest를 읽기 위해서만 남긴다.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -200,12 +182,8 @@ def load_window_manifests(
 def summarize_window(manifests: list[Manifest]) -> dict:
     """manifest 목록을 데이터 수집 모니터링 알림용 통계로 요약한다.
 
-    행(row) 단위로만 집계한다 — 컬럼 값 단위 `column_issues`(결측·이상치)는 소스마다
-    "정상 기준선"이 크게 달라(예: 비회원 대여의 성별·생년 컬럼은 평소에도 결측이
-    30%에 가깝다) 일률적인 임계값을 적용하면 노이즈가 크다. 대신 collector가 이미
-    각 실행마다 정확히 남기는 `RunStatus`와 `Counts`(fetched·kept·dropped)를 그대로
-    합산한다 — quality gate(collector/pipeline.py)가 내린 성공/실패 판정과
-    "실제로 몇 행을 살렸고 몇 행을 버렸는지"만 본다.
+    `column_issues`는 소스마다 정상 결측 수준이 크게 달라 일률 임계값이 노이즈가 되므로
+    합산하지 않고, status와 행 단위 counts만 합산한다.
     """
     status_counts: dict[str, int] = {}
     fetched = kept = dropped = repaired = 0
@@ -257,37 +235,6 @@ def load_source_snapshots(
     return tuple(snapshots)
 
 
-def publish_source_snapshot(
-    *,
-    source_id: str,
-    logical_dttm: datetime,
-    status: SourceSnapshotStatus,
-    config_version: str,
-    silver: storage.ImmutableSilverArtifact | None,
-    counts: Counts,
-    planned_parts: tuple[str, ...],
-    completed_parts: tuple[str, ...],
-) -> PublishedSourceSnapshot:
-    """Output 완성 뒤 source snapshot revision을 결정해 manifest를 마지막 기록한다.
-
-    최초 authoritative 결과는 revision 0이다. 직전 결과와 status, Silver checksum,
-    count, plan, config가 모두 같으면 같은 revision의 exact replay이며, 하나라도 달라진
-    correction은 다음 revision을 사용한다. PARTIAL/FAILED는 이 함수의 status 타입으로
-    표현할 수 없어 authority manifest를 열 수 없다.
-    """
-    prepared = prepare_source_snapshot(
-        source_id=source_id,
-        logical_dttm=logical_dttm,
-        status=status,
-        config_version=config_version,
-        silver=silver,
-        counts=counts,
-        planned_parts=planned_parts,
-        completed_parts=completed_parts,
-    )
-    return finalize_source_snapshot(prepared)
-
-
 def prepare_source_snapshot(
     *,
     source_id: str,
@@ -299,7 +246,12 @@ def prepare_source_snapshot(
     planned_parts: tuple[str, ...],
     completed_parts: tuple[str, ...],
 ) -> PublishedSourceSnapshot:
-    """쓸 authority revision을 부작용 없이 준비한다."""
+    """쓸 authority revision을 부작용 없이 준비한다.
+
+    최초 authoritative 결과는 revision 0이다. 직전 결과와 status, Silver checksum, count,
+    plan, config가 모두 같으면 같은 revision의 exact replay이고, 하나라도 다르면 다음
+    revision을 쓴다. PARTIAL/FAILED는 status 타입으로 표현할 수 없어 authority를 열 수 없다.
+    """
     typed_counts = SourceSnapshotCounts(
         expected=counts.expected,
         fetched=counts.fetched,

@@ -1,4 +1,4 @@
-"""데이터 검증 과정에서 여러 모듈들의 공통 언어를 정의해 둔 곳"""
+"""검증 엔진·정책·레지스트리가 함께 쓰는 타입."""
 
 from __future__ import annotations
 
@@ -36,19 +36,10 @@ class RowVerdict(Enum):
 
 @dataclass(frozen=True, slots=True)
 class Issue:
-    """컬럼 하나에 문제가 있을 때, 그 상황에 대한 페이로드를 만들어
-    정책 함수로 전달하기 위한 객체
+    """컬럼 하나의 판정 이슈. 정책 함수에 넘긴다.
 
-    column: 문제가 생긴 컬럼명
-    kind: 문제 종류
-    required: 필수 여부
-    raw_value: 캐스팅 전 원시값
-    spec: 컬럼 스펙
-
-    엔진이 정책에 넘기는 value 
-    MISSING: 정규화된 None
-    TYPE_ERROR: 캐스팅에 실패한 원시값
-    OUTLIER: 캐스팅에 성공한 값
+    엔진이 함께 넘기는 value는 MISSING이면 None, TYPE_ERROR면 원시값, OUTLIER면
+    캐스팅된 값이다.
     """
 
     column: str
@@ -60,13 +51,7 @@ class Issue:
 
 @dataclass(frozen=True, slots=True)
 class RunContext:
-    """정책이 참조할 수 있는 실행 맥락.
-    
-    source_id: 데이터 소스 식별자
-    window_start: 배치 시작 시각
-    window_end: 배치 종료 시각
-    attempt: 재시도 횟수
-    """
+    """정책이 참조할 수 있는 실행 맥락."""
 
     source_id: str
     window_start: datetime

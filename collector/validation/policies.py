@@ -1,26 +1,9 @@
-"""값 이슈 발견 시 처리 방식을 정의하는 공통 정책 함수 모음.
+"""값 이슈를 처리하는 공통 정책 함수 모음.
 
-소스 지식 없이 동작하며, 소스별 차이는 YAML 설정(4분면 기본값, 컬럼별 오버라이드)으로만 제어한다.
-컬럼 정책 7종·행 정책 3종이며, 모두 로그·S3 접근이 없는 순수 함수다.
-
-## 컬럼 정책 7종: `(value, issue, row, ctx) -> tuple[Any, Action]`
-
-| 이름 | 반환값 | repaired | 방어 가드 |
-| --- | --- | --- | --- |
-| `keep_null` | 원래 값 그대로 | 아니오 | — |
-| `set_null` | None | 예 | — |
-| `fill_zero` | 0 | 예 | `TYPE_ERROR` 제외 |
-| `fill_default` | spec에 선언된 기본값 | 예 | `TYPE_ERROR` 제외 |
-| `clip_to_range` | 정상 범위의 경계로 자른 값 | 예 | `OUTLIER`·`range` 선언 컬럼만 |
-| `drop_row` | — (행 폐기) | — | — |
-| `fail_batch` | — (배치 실패) | — | — |
-
-`keep_null`과 `set_null`은 값을 바꾸는지 여부로 구분한다. 값을 바꾸지 않는 `keep_null`은
-`repaired`가 아니고, None으로 교체하는 `set_null`은 `repaired`다. 이 기준을 엔진의
-`_row_status` 판정과 맞춘다.
-
-`fail_batch`는 최후 수단이다. 4분면 기본값에 걸면 한 행 때문에 배치 전체가 죽는다.
-스키마 계약 위반처럼 데이터 전체를 의심할 때만 쓴다.
+소스 지식 없이 동작하며, 소스별 차이는 YAML(4분면 기본값, 컬럼별 오버라이드)로만 정한다.
+값을 바꾸는 정책(`set_null`, `fill_*`, `clip_to_range`)은 엔진이 `repaired`로 센다.
+교정형 정책은 적용 조건이 맞지 않는 이슈(예: `TYPE_ERROR`)에는 None을 반환한다.
+`fail_batch`는 한 행 때문에 배치 전체가 죽으므로 스키마 계약 위반에만 쓴다.
 """
 
 from __future__ import annotations

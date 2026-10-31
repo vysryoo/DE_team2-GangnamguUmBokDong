@@ -21,52 +21,35 @@ from validation.engine import _judge_column
 from validation.types import IssueKind
 
 
-class TestNoPrecipitation:
-    def test_no_rain_is_zero(self):
-        assert parse_precip("강수없음") == 0.0
-
-    def test_bare_zero_is_zero(self):
-        """실호출에서 '강수없음'과 맨 '0'이 같은 응답에 섞여 나온다."""
-        assert parse_precip("0") == 0.0
-
-
-class TestExactValues:
-    def test_value_with_unit(self):
-        assert parse_precip("2.0mm") == 2.0
-
-    def test_value_without_unit(self):
-        assert parse_precip("5.5") == 5.5
-
-    def test_accepts_float_input(self):
-        """silver가 이미 숫자로 저장된 뒤 loader가 다시 넘기는 경로."""
-        assert parse_precip(2.0) == 2.0
-
-
-class TestRanges:
-    def test_range_takes_lower_bound(self):
-        assert parse_precip("30.0~50.0mm") == 30.0
-
-    def test_at_least_takes_lower_bound(self):
-        """상한이 없어 평균을 정의할 수 없다. 하한 규칙을 그대로 적용한다."""
-        assert parse_precip("50.0mm 이상") == 50.0
-
-    def test_below_threshold_is_half(self):
-        """'1.0mm 미만'은 실제로 0.1~1.0 구간이다. 0.5로 대표한다."""
-        assert parse_precip("1.0mm 미만") == 0.5
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("강수없음", 0.0),
+        # 실호출에서 '강수없음'과 맨 '0'이 같은 응답에 섞여 나온다.
+        ("0", 0.0),
+        ("2.0mm", 2.0),
+        ("5.5", 5.5),
+        # silver가 이미 숫자로 저장된 뒤 loader가 다시 넘기는 경로.
+        (2.0, 2.0),
+        ("30.0~50.0mm", 30.0),
+        # 상한이 없어 평균을 정의할 수 없다. 하한 규칙을 그대로 적용한다.
+        ("50.0mm 이상", 50.0),
+        # '1.0mm 미만'은 실제로 0.1~1.0 구간이다. 0.5로 대표한다.
+        ("1.0mm 미만", 0.5),
+    ],
+)
+def test_parse_precip_converts_category_to_mm(raw, expected):
+    assert parse_precip(raw) == expected
 
 
-class TestFailures:
-    """캐스터로 쓰이므로 실패는 예외여야 한다 — `_try_cast`가 다음 타입으로 넘어가고,
-    전부 실패하면 TYPE_ERROR 이슈가 되어 정책이 처리한다. None을 돌려주면 이 흐름이
-    결측(MISSING)과 구분되지 않는다."""
-
-    def test_unparseable_text_raises(self):
-        with pytest.raises(ValueError):
-            parse_precip("맑음")
-
-    def test_none_raises(self):
-        with pytest.raises((TypeError, ValueError)):
-            parse_precip(None)
+@pytest.mark.parametrize(
+    ("raw", "error"), [("맑음", ValueError), (None, (TypeError, ValueError))]
+)
+def test_parse_precip_raises_on_unparseable_value(raw, error):
+    """캐스터로 쓰이므로 실패는 예외여야 한다. None을 돌려주면 `_try_cast`가 결측과
+    타입 오류를 구분하지 못한다."""
+    with pytest.raises(error):
+        parse_precip(raw)
 
 
 class TestRegisteredAsCaster:

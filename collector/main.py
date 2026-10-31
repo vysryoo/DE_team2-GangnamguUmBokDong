@@ -41,8 +41,8 @@ from manifest import RunStatus
 
 _OK_STATUSES = frozenset({RunStatus.SUCCEEDED, RunStatus.PARTIAL, RunStatus.EMPTY, RunStatus.SKIPPED})
 
-# 서울 열린데이터광장 1000행 페이지 응답이 실측 0.6~7.2초로 흔들려 httpx 기본값(5초)
-# 이면 느린 시점마다 라운드 재시도로 fetch 예산을 태운다. read는 실측 최댓값의 4배.
+# 서울 1000행 페이지 응답이 최대 7초 안팎까지 걸려 httpx 기본값(5초)이면 라운드 재시도로
+# fetch 예산을 태운다. read는 그 4배로 잡는다.
 _HTTP_TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=30.0)
 
 
@@ -56,6 +56,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     Raises:
         SystemExit: 모드에 필요한 인자가 없거나 POI Master 인자 조합이 잘못됐을 때.
     """
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+
+    # Airflow는 static 모드에서도 같은 명령 형태로 빈 ref 값을 넘긴다.
+    for field in ("poi_master_manifest_uri", "poi_master_manifest_sha256"):
+        value = getattr(args, field)
+        if value is not None and not value.strip():
+            setattr(args, field, None)
+
+    if (
+        args.check_due_after_seconds is None
+        and not args.report_window_stats
+        and not args.window_start
+    ):
+        parser.error(
+            "the following arguments are required: --window-start "
+            "(unless --check-due-after-seconds/--report-window-stats is used)"
+        )
+    if args.report_window_stats and not args.window_day:
+        parser.error("--report-window-stats에는 --window-day가 필요하다")
+    _check_poi_master_args(parser, args)
+    return args
+
+
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="main.py")
     parser.add_argument("--source", required=True, help="소스 id (sources/{source_id}.yaml)")
     parser.add_argument("--window-start", help="ISO8601, KST 오프셋(+09:00) 포함")
@@ -93,27 +118,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="마지막 성공 수집 이후 이 초만큼 안 지났으면 수집을 건너뛰어도 되는지 JSON으로 출력하고 종료",
     )
-    args = parser.parse_args(argv)
+    return parser
 
-    # Airflow는 static 모드에서도 같은 명령 형태로 빈 ref 값을 넘긴다.
-    for field in ("poi_master_manifest_uri", "poi_master_manifest_sha256"):
-        value = getattr(args, field)
-        if value is not None and not value.strip():
-            setattr(args, field, None)
 
-    if (
-        args.check_due_after_seconds is None
-        and not args.report_window_stats
-        and not args.window_start
-    ):
-        parser.error(
-            "the following arguments are required: --window-start "
-            "(unless --check-due-after-seconds/--report-window-stats is used)"
-        )
-
-    if args.report_window_stats and not args.window_day:
-        parser.error("--report-window-stats에는 --window-day가 필요하다")
-
+def _check_poi_master_args(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> None:
     has_manifest_ref = (
         args.poi_master_manifest_uri is not None
         or args.poi_master_manifest_sha256 is not None
@@ -129,8 +139,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         or args.poi_master_manifest_sha256 is None
     ):
         parser.error("s3 모드에는 POI Master manifest URI와 SHA-256이 모두 필요하다")
-
-    return args
 
 
 def _config_with_poi_master(config: SourceConfig, ref: PoiMasterRef) -> SourceConfig:
