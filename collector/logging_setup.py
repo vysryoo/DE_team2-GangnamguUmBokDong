@@ -76,13 +76,13 @@ def configure_logging(
 
     `main.py`가 pipeline을 부르기 전에 호출해야 pipeline이 남기는 로그에도 고정 필드가 붙는다.
 
-    args:
+    Args:
         source_id: 이번 실행의 소스 id.
         window_start: 이번 실행이 처리하는 window의 시작 시각.
         attempt: 이번 실행이 몇 번째 시도인지. manifest의 attempt와 같은 값을 쓴다.
         level: root 로거의 최소 레벨.
         stream: 로그를 보낼 스트림. 생략하면 컨테이너 stdout(`sys.stdout`).
-    returns:
+    Returns:
         설정이 끝난 root 로거.
     """
     fields = _FixedFieldsFilter(
@@ -109,11 +109,11 @@ def configure_batch_logging(
     compaction처럼 날짜 범위를 처리하는 배치에는 window·attempt가 없다. 실행 시각 등으로
     억지로 채우면 실제 수집 window로 오해하므로, 같은 포매터를 쓰되 없는 필드만 뺀다.
 
-    args:
+    Args:
         source_id: 이번 실행의 소스 id.
         level: root 로거의 최소 레벨.
         stream: 로그를 보낼 스트림. 생략하면 컨테이너 stdout(`sys.stdout`).
-    returns:
+    Returns:
         설정이 끝난 root 로거.
     """
     return _install_root_handler(_FixedFieldsFilter(source_id=source_id), level, stream)
