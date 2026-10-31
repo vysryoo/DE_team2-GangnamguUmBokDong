@@ -12,6 +12,41 @@ def _frame(rows):
     return pd.DataFrame(rows)
 
 
+_NAN = float("nan")
+
+
+def _spop_frame(value):
+    """SPOP 하나짜리 프레임. None이면 그 주차 archive가 없음, NaN이면 행만 있고 값이 결측."""
+    if value is None:
+        return None
+    return _frame([{"H_DNG_CD": "H1", "CELL_ID": "C1", "TT": "10", "SPOP": value}])
+
+
+@pytest.mark.parametrize(
+    ("candidates", "extended", "historical", "expected", "method"),
+    [
+        ([100.0, 200.0, 300.0, 400.0], [], None, 100.0 * 0.4 + 200.0 * 0.3 + 300.0 * 0.2 + 400.0 * 0.1, "weighted_avg"),
+        ([100.0, None, 300.0, 400.0], [], None, (100.0 * 0.4 + 300.0 * 0.2 + 400.0 * 0.1) / 0.7, "reweighted_avg"),
+        ([100.0, None, None, 400.0], [], None, (100.0 * 0.4 + 400.0 * 0.1) / 0.5, "reweighted_avg"),
+        ([None, None, 300.0, None], [], None, 300.0, "single_week_fallback"),
+        ([_NAN, None, None, None], [None, 250.0, 260.0], None, 250.0, "extended_lookback_fallback"),
+        ([_NAN, None, None, None], [None, None], 180.0, 180.0, "grid_historical_avg"),
+        ([_NAN, None, None, None], [None], None, 0.0, "no_data"),
+    ],
+)
+def test_single_cell_estimation_rule(candidates, extended, historical, expected, method):
+    """후보 가중평균 → 재조정 → 단일 주차 → 확장 주차 → 과거 평균 → 0 순서를 따른다."""
+    result = estimate_day.build_nowcast_table(
+        [_spop_frame(value) for value in candidates],
+        extended_frames=[_spop_frame(value) for value in extended],
+        historical_avg_frame=_spop_frame(historical),
+    )
+
+    row = result.iloc[0]
+    assert row["SPOP"] == pytest.approx(expected)
+    assert row["estimation_method"] == method
+
+
 class TestBuildNowcastTable:
     def test_all_four_weeks_present_uses_weighted_avg(self):
         week1 = _frame([{"H_DNG_CD": "H1", "CELL_ID": "C1", "TT": "10", "SPOP": 100.0}])
