@@ -252,8 +252,7 @@ class S3ImmutableObjectStore:
         try:
             response = self._client.get_object(Bucket=location.bucket, Key=location.key)
         except ClientError as exc:
-            error_code = _client_error_code(exc)
-            status_code = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+            error_code, status_code = _client_error(exc)
             if error_code in _MISSING_ERROR_CODES or status_code == 404:
                 raise ObjectMissingError(f"immutable object가 없습니다: {uri}") from exc
             raise ObjectStoreAccessError(
@@ -311,8 +310,7 @@ class S3ImmutableObjectStore:
                 IfNoneMatch="*",
             )
         except ClientError as exc:
-            error_code = _client_error_code(exc)
-            status_code = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+            error_code, status_code = _client_error(exc)
             if error_code in _CONDITIONAL_CONFLICT_CODES or status_code in {409, 412}:
                 return True
             raise ObjectStoreAccessError(
@@ -373,6 +371,9 @@ def _validate_canonical_json(uri: str, payload: bytes) -> None:
         ) from exc
 
 
-def _client_error_code(exc: ClientError) -> str:
-    """botocore ClientError의 서비스 오류 코드를 안정적인 문자열로 반환한다."""
-    return str(exc.response.get("Error", {}).get("Code", "Unknown"))
+def _client_error(exc: ClientError) -> tuple[str, int | None]:
+    """botocore ClientError의 서비스 오류 코드 문자열과 HTTP status를 반환한다."""
+    return (
+        str(exc.response.get("Error", {}).get("Code", "Unknown")),
+        exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode"),
+    )

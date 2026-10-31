@@ -15,7 +15,7 @@ import pendulum
 from airflow import DAG
 from airflow.providers.standard.operators.empty import EmptyOperator
 from airflow.providers.standard.operators.python import ShortCircuitOperator
-from airflow.sdk import BaseOperator
+from airflow.sdk import BaseOperator, chain
 from airflow.task.trigger_rule import TriggerRule
 from airflow.timetables.trigger import CronTriggerTimetable
 
@@ -237,9 +237,8 @@ def _build_rental_replay_chain(dag: DAG, collect_rental: BaseOperator) -> None:
     완결된 윈도우를 다시 받아야 하므로 ``--force``를 쓰고, 현재 tick 성패와 무관하게
     실행되도록 ``ALL_DONE``으로 둠.
     """
-    replay_chain = collect_rental
-    for hours_back in range(1, RENTAL_HISTORY_LOOKBACK_HOURS + 1):
-        replay = build_collector_task(
+    replays = [
+        build_collector_task(
             dag,
             RENTAL_HISTORY_SOURCE,
             task_id=f"collect_bike_rental_history_replay_{hours_back}h",
@@ -247,8 +246,9 @@ def _build_rental_replay_chain(dag: DAG, collect_rental: BaseOperator) -> None:
             force=True,
             trigger_rule=TriggerRule.ALL_DONE,
         )
-        replay_chain >> replay
-        replay_chain = replay
+        for hours_back in range(1, RENTAL_HISTORY_LOOKBACK_HOURS + 1)
+    ]
+    chain(collect_rental, *replays)
 
 
 def _gate_root_tasks(dag: DAG) -> None:

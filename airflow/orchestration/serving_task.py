@@ -45,6 +45,15 @@ def _ref_env(task_id: str, refs: dict[str, str]) -> dict[str, str]:
     return env
 
 
+def _ref_args(*prefixes: str) -> list[str]:
+    # _ref_env가 채운 환경변수를 같은 prefix의 --<name>-uri/--<name>-sha256 인자로 넘김
+    args = []
+    for prefix in prefixes:
+        flag = prefix.lower()
+        args += [f"--{flag}-uri", f'"${prefix}_URI"', f"--{flag}-sha256", f'"${prefix}_SHA256"']
+    return args
+
+
 def build_event_publication_task(dag, source_id: str) -> BashOperator:
     """행사 source authority를 Gold로 게시하는 태스크를 만든다.
 
@@ -107,7 +116,7 @@ def build_inference_task(dag, *, plan_task_id: str = "prepare_serving_plan") -> 
         ML_DIR,
         uv_python_command(
             "-m", "inference.publication_cli",
-            "--plan-uri", '"$PLAN_URI"', "--plan-sha256", '"$PLAN_SHA256"',
+            *_ref_args("PLAN"),
             project="inference",
         ),
         execution_timeout=INFERENCE_EXECUTION_TIMEOUT,
@@ -141,9 +150,7 @@ def build_finalize_serving_task(
         LOADER_DIR,
         uv_python_command(
             "serving_cli.py", "finalize",
-            "--plan-uri", '"$PLAN_URI"', "--plan-sha256", '"$PLAN_SHA256"',
-            "--inference-uri", '"$INFERENCE_URI"',
-            "--inference-sha256", '"$INFERENCE_SHA256"',
+            *_ref_args("PLAN", "INFERENCE"),
         ),
         env={
             **_ref_env(plan_task_id, {"PLAN": "plan"}),
@@ -170,9 +177,7 @@ def build_urgency_task(dag, *, final_task_id: str = "finalize_serving_release") 
         LOADER_DIR,
         uv_python_command(
             "serving_cli.py", "urgency",
-            "--station-uri", '"$STATION_URI"', "--station-sha256", '"$STATION_SHA256"',
-            "--demand-uri", '"$DEMAND_URI"', "--demand-sha256", '"$DEMAND_SHA256"',
-            "--stock-uri", '"$STOCK_URI"', "--stock-sha256", '"$STOCK_SHA256"',
+            *_ref_args("STATION", "DEMAND", "STOCK"),
         ),
         execution_timeout=URGENCY_EXECUTION_TIMEOUT,
         env=_ref_env(
@@ -203,7 +208,7 @@ def build_routes_task(dag, *, urgency_task_id: str = "publish_station_urgency") 
         LOADER_DIR,
         uv_python_command(
             "serving_cli.py", "route",
-            "--urgency-uri", '"$URGENCY_URI"', "--urgency-sha256", '"$URGENCY_SHA256"',
+            *_ref_args("URGENCY"),
         ),
         execution_timeout=ROUTES_EXECUTION_TIMEOUT,
         env=_ref_env(urgency_task_id, {"URGENCY": "station_urgency"}),

@@ -24,13 +24,13 @@ from .gold_publication.errors import HashFormatError, ImmutableObjectError
 from .gold_publication.storage import S3ImmutableObjectStore
 from .s3 import bucket_name, get_object_bytes, list_keys
 from .source_snapshot import (
+    _SOURCE_ID_PATTERN,
     SourceSnapshotContractError,
     SourceSnapshotManifest,
     SourceSnapshotStatus,
     parse_source_snapshot_manifest,
 )
 
-_SOURCE_ID = re.compile(r"[a-z][a-z0-9_]*\Z")
 _SILVER_CHECKSUM = re.compile(r"/sha256=([0-9a-f]{64})\.parquet\Z")
 
 
@@ -187,32 +187,9 @@ def read_available_source_snapshot(
     if type(partial_policy) is not PartialConsumptionPolicy:
         raise TypeError("partial_policy는 PartialConsumptionPolicy여야 합니다.")
     logical = _aware_utc(logical_dttm)
-    try:
-        exact = read_exact_source_snapshot(source_id, logical, columns=columns)
-    except SourceSnapshotNotFoundError:
-        exact = None
-    if exact is not None and exact.table is not None:
-        return AvailableSourceSnapshot(
-            SourceDataStatus.SUCCESS,
-            SourceFreshness.CURRENT,
-            exact.manifest.logical_dttm,
-            exact.table,
-            exact.manifest,
-        )
-
-    if partial_policy is PartialConsumptionPolicy.REPAIR:
-        try:
-            partial = read_partial_source_snapshot(source_id, logical, columns=columns)
-        except SourceSnapshotNotFoundError:
-            partial = None
-        if partial is not None:
-            return AvailableSourceSnapshot(
-                SourceDataStatus.PARTIAL,
-                SourceFreshness.CURRENT,
-                logical,
-                partial,
-                None,
-            )
+    current = _read_current_snapshot(source_id, logical, partial_policy, columns)
+    if current is not None:
+        return current
     stale = read_latest_source_snapshot(
         source_id,
         logical - timedelta(microseconds=1),
@@ -225,6 +202,40 @@ def read_available_source_snapshot(
         stale.manifest.logical_dttm,
         stale.table,
         stale.manifest,
+    )
+
+
+def _read_current_snapshot(
+    source_id: str,
+    logical: datetime,
+    partial_policy: PartialConsumptionPolicy,
+    columns: list[str] | None,
+) -> AvailableSourceSnapshot | None:
+    """현재 window의 SUCCEEDED를, 없으면 REPAIR 정책일 때만 PARTIAL을 반환한다."""
+    try:
+        exact = read_exact_source_snapshot(source_id, logical, columns=columns)
+    except SourceSnapshotNotFoundError:
+        exact = None
+    if exact is not None and exact.table is not None:
+        return AvailableSourceSnapshot(
+            SourceDataStatus.SUCCESS,
+            SourceFreshness.CURRENT,
+            exact.manifest.logical_dttm,
+            exact.table,
+            exact.manifest,
+        )
+    if partial_policy is not PartialConsumptionPolicy.REPAIR:
+        return None
+    try:
+        partial = read_partial_source_snapshot(source_id, logical, columns=columns)
+    except SourceSnapshotNotFoundError:
+        return None
+    return AvailableSourceSnapshot(
+        SourceDataStatus.PARTIAL,
+        SourceFreshness.CURRENT,
+        logical,
+        partial,
+        None,
     )
 
 
@@ -514,7 +525,7 @@ def _read_content_addressed_parquet(
 
 def _validated_source_id(value: str) -> str:
     """Authority 경로에 쓸 source ID를 검증한다."""
-    if type(value) is not str or _SOURCE_ID.fullmatch(value) is None:
+    if type(value) is not str or _SOURCE_ID_PATTERN.fullmatch(value) is None:
         raise ValueError("source_id는 lowercase snake_case여야 합니다.")
     return value
 
