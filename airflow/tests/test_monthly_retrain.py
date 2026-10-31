@@ -2,6 +2,7 @@
 
 from datetime import timedelta
 from functools import partial
+from typing import NamedTuple
 from unittest.mock import MagicMock
 
 import pytest
@@ -10,6 +11,34 @@ from airflow.task.trigger_rule import TriggerRule
 import dags.monthly_retrain as monthly_dag
 
 _DAG = monthly_dag.dag
+
+
+class _SubmittedStep(NamedTuple):
+    cluster_id: str
+    name: str
+    command: list[str]
+    timeout_seconds: int | None
+
+
+@pytest.fixture
+def submitted_steps(monkeypatch) -> list[_SubmittedStep]:
+    """`submit_emr_step` 호출을 순서대로 기록하고 항상 COMPLETED를 반환한다."""
+    steps: list[_SubmittedStep] = []
+
+    def _submit(cluster_id, name, command, **kwargs):
+        steps.append(_SubmittedStep(cluster_id, name, command, kwargs.get("timeout_seconds")))
+        return {"StepId": f"s-{len(steps)}", "State": "COMPLETED"}
+
+    monkeypatch.setattr(monthly_dag, "submit_emr_step", _submit)
+    return steps
+
+
+def _names(steps: list[_SubmittedStep]) -> list[str]:
+    return [step.name for step in steps]
+
+
+def _commands(steps: list[_SubmittedStep]) -> dict[str, list[str]]:
+    return {step.name: step.command for step in steps}
 
 
 def test_monthly_retrain_is_a_single_combined_dag() -> None:
@@ -132,67 +161,50 @@ def test_champion_profile_name_none_when_no_champion_yet(monkeypatch) -> None:
     assert monthly_dag._champion_profile_name("rental") is None
 
 
-def test_refresh_feature_mart_submits_feature_mart_steps_for_champion_profile(monkeypatch) -> None:
+def test_refresh_feature_mart_submits_feature_mart_steps_for_champion_profile(monkeypatch, submitted_steps) -> None:
     """챔피언 프로필로 run_pipeline과 build_multi_horizon 스텝을 제출한다."""
     mock_ti = MagicMock()
     mock_ti.xcom_pull.return_value = "j-created"
     monkeypatch.setattr(monthly_dag, "_champion_profile_name", lambda model_name: "leaves127")
 
-    submitted_steps = []
-    monkeypatch.setattr(
-        monthly_dag,
-        "submit_emr_step",
-        lambda cluster_id, name, command, **kwargs: submitted_steps.append((cluster_id, name)),
-    )
 
     task_fn = partial(monthly_dag._refresh_feature_mart, "rental")
     task_fn(ti=mock_ti, params={})
 
-    assert ("j-created", "Spark-RunPipeline-leaves127") in submitted_steps
-    assert ("j-created", "Spark-BuildMultiHorizon-leaves127") in submitted_steps
+    assert {step.cluster_id for step in submitted_steps} == {"j-created"}
+    assert "Spark-RunPipeline-leaves127" in _names(submitted_steps)
+    assert "Spark-BuildMultiHorizon-leaves127" in _names(submitted_steps)
     pushed = {call.kwargs["key"]: call.kwargs["value"] for call in mock_ti.xcom_push.call_args_list}
     assert pushed["profile"] == "leaves127"
 
 
-def test_refresh_feature_mart_waits_for_yarn_nodes_before_spark_steps(monkeypatch) -> None:
+def test_refresh_feature_mart_waits_for_yarn_nodes_before_spark_steps(monkeypatch, submitted_steps) -> None:
     """WAITING 직후에는 YARN이 AM 등록을 받지 못할 수 있어 첫 Spark 스텝 전에 노드를 기다린다."""
     mock_ti = MagicMock()
     mock_ti.xcom_pull.return_value = "j-created"
     monkeypatch.setattr(monthly_dag, "_champion_profile_name", lambda model_name: "leaves127")
 
-    submitted_names = []
-    monkeypatch.setattr(
-        monthly_dag,
-        "submit_emr_step",
-        lambda cluster_id, name, command, **kwargs: submitted_names.append(name),
-    )
 
     task_fn = partial(monthly_dag._refresh_feature_mart, "rental")
     task_fn(ti=mock_ti, params={})
 
-    assert submitted_names[0] == "Wait-YARN-Nodes"
-    assert submitted_names.index("Wait-YARN-Nodes") < submitted_names.index("Spark-RunPipeline-leaves127")
+    assert _names(submitted_steps)[0] == "Wait-YARN-Nodes"
+    assert _names(submitted_steps).index("Wait-YARN-Nodes") < _names(submitted_steps).index("Spark-RunPipeline-leaves127")
 
 
-def test_refresh_feature_mart_falls_back_to_builtin_default_when_no_champion(monkeypatch) -> None:
+def test_refresh_feature_mart_falls_back_to_builtin_default_when_no_champion(monkeypatch, submitted_steps) -> None:
     mock_ti = MagicMock()
     mock_ti.xcom_pull.return_value = "j-created"
     monkeypatch.setattr(monthly_dag, "_champion_profile_name", lambda model_name: None)
 
-    submitted_steps = []
-    monkeypatch.setattr(
-        monthly_dag,
-        "submit_emr_step",
-        lambda cluster_id, name, command, **kwargs: submitted_steps.append(name),
-    )
 
     task_fn = partial(monthly_dag._refresh_feature_mart, "rental")
     task_fn(ti=mock_ti, params={})
 
-    assert any("builtin-default" in s for s in submitted_steps)
+    assert any("builtin-default" in s for s in _names(submitted_steps))
 
 
-def test_refresh_feature_mart_skips_champion_build_when_test_profile_only(monkeypatch) -> None:
+def test_refresh_feature_mart_skips_champion_build_when_test_profile_only(monkeypatch, submitted_steps) -> None:
     """test_profile_only=True면 챔피언 feature mart는 만들 필요가 없다 —
     orchestrate_retrain_loop가 TEST_ONLY_PROFILE_NAME으로 어차피 다시 만든다.
     다만 Wait-YARN-Nodes는 그대로 제출해야 한다 — 뒤에 오는 retrain 루프의 첫
@@ -200,93 +212,60 @@ def test_refresh_feature_mart_skips_champion_build_when_test_profile_only(monkey
     mock_ti = MagicMock()
     mock_ti.xcom_pull.return_value = "j-created"
 
-    submitted_names = []
-    monkeypatch.setattr(
-        monthly_dag,
-        "submit_emr_step",
-        lambda cluster_id, name, command, **kwargs: submitted_names.append(name),
-    )
 
     task_fn = partial(monthly_dag._refresh_feature_mart, "rental")
     task_fn(ti=mock_ti, params={"test_profile_only": True})
 
-    assert submitted_names == ["Wait-YARN-Nodes"]
-    assert not any("Spark-RunPipeline" in s for s in submitted_names)
+    assert _names(submitted_steps) == ["Wait-YARN-Nodes"]
+    assert not any("Spark-RunPipeline" in s for s in _names(submitted_steps))
 
 
-def test_refresh_feature_mart_gives_wait_for_yarn_nodes_a_short_timeout(monkeypatch) -> None:
+def test_refresh_feature_mart_gives_wait_for_yarn_nodes_a_short_timeout(monkeypatch, submitted_steps) -> None:
     """YARN 노드 대기는 스텝 기본 timeout 대신 짧은 상한을 써서 피처마트 갱신 전체 timeout을 넘기지 않는다."""
     mock_ti = MagicMock()
     mock_ti.xcom_pull.return_value = "j-created"
-    captured_timeouts = {}
-    monkeypatch.setattr(
-        monthly_dag,
-        "submit_emr_step",
-        lambda cluster_id, name, command, **kwargs: captured_timeouts.update({name: kwargs.get("timeout_seconds")}),
-    )
 
     task_fn = partial(monthly_dag._refresh_feature_mart, "rental")
     task_fn(ti=mock_ti, params={"test_profile_only": True})
 
-    assert captured_timeouts["Wait-YARN-Nodes"] == 1200
+    assert {step.name: step.timeout_seconds for step in submitted_steps}["Wait-YARN-Nodes"] == 1200
 
 
-def test_evaluate_uses_same_profile_refresh_feature_mart_just_built(monkeypatch) -> None:
+def test_evaluate_uses_same_profile_refresh_feature_mart_just_built(monkeypatch, submitted_steps) -> None:
     """evaluate는 refresh_feature_mart가 XCom에 남긴 프로필로 방금 갱신한 피처마트를 읽는다."""
     mock_ti = MagicMock()
     mock_ti.xcom_pull.side_effect = lambda task_ids, key: {
         "cluster_id": "j-created",
         "profile": "champion-profile-x",
     }.get(key)
-    submitted = {}
-    monkeypatch.setattr(
-        monthly_dag,
-        "submit_emr_step",
-        lambda cluster_id, name, command, **kwargs: submitted.update(command=command)
-        or {"StepId": "s-1", "State": "COMPLETED"},
-    )
     monkeypatch.setattr(monthly_dag, "read_s3_json", lambda key: {"needs_retrain": False})
 
     task_fn = partial(monthly_dag._evaluate, "rental")
     task_fn(ti=mock_ti, params={}, run_id="run-1")
 
-    script = submitted["command"][2]
+    script = submitted_steps[-1].command[2]
     assert "-shell_env ML_PROFILE=champion-profile-x" in script
 
 
-def test_evaluate_defaults_profile_to_builtin_when_refresh_pushed_nothing(monkeypatch) -> None:
+def test_evaluate_defaults_profile_to_builtin_when_refresh_pushed_nothing(monkeypatch, submitted_steps) -> None:
     """refresh_feature_mart가 profile을 xcom에 못 남긴 경우(예: 과거 실행 기록이
     없는 등)에도 evaluate가 죽지 않고 builtin-default로 안전하게 fallback한다."""
     mock_ti = MagicMock()
     mock_ti.xcom_pull.side_effect = lambda task_ids, key: {"cluster_id": "j-created"}.get(key)
-    submitted = {}
-    monkeypatch.setattr(
-        monthly_dag,
-        "submit_emr_step",
-        lambda cluster_id, name, command, **kwargs: submitted.update(command=command)
-        or {"StepId": "s-1", "State": "COMPLETED"},
-    )
     monkeypatch.setattr(monthly_dag, "read_s3_json", lambda key: {"needs_retrain": False})
 
     task_fn = partial(monthly_dag._evaluate, "rental")
     task_fn(ti=mock_ti, params={}, run_id="run-1")
 
-    script = submitted["command"][2]
+    script = submitted_steps[-1].command[2]
     assert "-shell_env ML_PROFILE=builtin-default" in script
 
 
-def test_evaluate_pushes_needs_retrain(monkeypatch) -> None:
+def test_evaluate_pushes_needs_retrain(monkeypatch, submitted_steps) -> None:
     """create_cluster가 xcom에 남긴 cluster_id로 평가 스텝을 제출하고, 결과(S3 JSON)를
     읽어 needs_retrain/candidate_profiles를 xcom에 남긴다."""
     mock_ti = MagicMock()
     mock_ti.xcom_pull.return_value = "j-created"
-    submitted = {}
-    monkeypatch.setattr(
-        monthly_dag,
-        "submit_emr_step",
-        lambda cluster_id, name, command, **kwargs: submitted.update(name=name, command=command)
-        or {"StepId": "s-1", "State": "COMPLETED"},
-    )
     monkeypatch.setattr(
         monthly_dag,
         "read_s3_json",
@@ -303,10 +282,10 @@ def test_evaluate_pushes_needs_retrain(monkeypatch) -> None:
     # master 노드 OOM(exitCode 137) 이후 evaluate는 core 노드의 YARN
     # distributed-shell 컨테이너에서 돌아야 한다 — _yarn_python_module_step()
     # docstring 참고.
-    assert "org.apache.hadoop.yarn.applications.distributedshell.Client" in submitted["command"][2]
+    assert "org.apache.hadoop.yarn.applications.distributedshell.Client" in submitted_steps[-1].command[2]
 
 
-def test_evaluate_passes_eval_num_workers_matching_provisioned_core_count(monkeypatch) -> None:
+def test_evaluate_passes_eval_num_workers_matching_provisioned_core_count(monkeypatch, submitted_steps) -> None:
     """평가(predict)는 학습과 달리 워커끼리 통신할 필요가 없는 embarrassingly
     parallel 작업이라(monitor_performance.combine_evaluation_shards() 참고),
     create_cluster가 이미 띄워둔 core 노드 수만큼 그대로 나눠 돌릴 수 있다 —
@@ -314,19 +293,12 @@ def test_evaluate_passes_eval_num_workers_matching_provisioned_core_count(monkey
     존재하지 않는 컨테이너를 기다리다 barrier가 타임아웃난다."""
     mock_ti = MagicMock()
     mock_ti.xcom_pull.return_value = "j-created"
-    submitted = {}
-    monkeypatch.setattr(
-        monthly_dag,
-        "submit_emr_step",
-        lambda cluster_id, name, command, **kwargs: submitted.update(command=command)
-        or {"StepId": "s-1", "State": "COMPLETED"},
-    )
     monkeypatch.setattr(monthly_dag, "read_s3_json", lambda key: {"needs_retrain": False})
 
     task_fn = partial(monthly_dag._evaluate, "rental")
     task_fn(ti=mock_ti, params={}, run_id="run-1")
 
-    script = submitted["command"][2]
+    script = submitted_steps[-1].command[2]
     expected = monthly_dag.CORE_INSTANCE_COUNT - monthly_dag._WRAPPER_NODE_RESERVATION
     assert f"--eval-num-workers {expected}" in script
 
@@ -352,7 +324,7 @@ def test_emr_core_instance_count_param_minimum_matches_wrapper_reservation() -> 
     assert param.schema["minimum"] == monthly_dag._WRAPPER_NODE_RESERVATION + 1
 
 
-def test_evaluate_eval_num_workers_respects_core_instance_count_override(monkeypatch) -> None:
+def test_evaluate_eval_num_workers_respects_core_instance_count_override(monkeypatch, submitted_steps) -> None:
     """override(5) - _WRAPPER_NODE_RESERVATION(3) = 2 — outer AM/워커 컨테이너 +
     inner distributed-shell 자신의 AM까지, 최악의 배치(co-locate 안 됨)를
     가정하면 노드 3개가 필요하므로 그만큼 빼야 barrier가 존재하지 않는
@@ -360,28 +332,20 @@ def test_evaluate_eval_num_workers_respects_core_instance_count_override(monkeyp
     2026-08-26)."""
     mock_ti = MagicMock()
     mock_ti.xcom_pull.return_value = "j-created"
-    submitted = {}
-    monkeypatch.setattr(
-        monthly_dag,
-        "submit_emr_step",
-        lambda cluster_id, name, command, **kwargs: submitted.update(command=command)
-        or {"StepId": "s-1", "State": "COMPLETED"},
-    )
     monkeypatch.setattr(monthly_dag, "read_s3_json", lambda key: {"needs_retrain": False})
 
     task_fn = partial(monthly_dag._evaluate, "rental")
     task_fn(ti=mock_ti, params={"emr_core_instance_count": 5}, run_id="run-1")
 
-    script = submitted["command"][2]
+    script = submitted_steps[-1].command[2]
     assert "--eval-num-workers 2" in script
 
 
-def test_evaluate_defaults_to_needs_retrain_when_no_result(monkeypatch) -> None:
+def test_evaluate_defaults_to_needs_retrain_when_no_result(monkeypatch, submitted_steps) -> None:
     """스텝이 결과를 못 남겼을 때(주로 mock 모드) 재학습 루프 구조가 계속 검증되도록
     needs_retrain=True로 기본값을 잡는다."""
     mock_ti = MagicMock()
     mock_ti.xcom_pull.return_value = "mock-j-1"
-    monkeypatch.setattr(monthly_dag, "submit_emr_step", lambda *args, **kwargs: {"StepId": "mock-s-1", "State": "COMPLETED"})
     monkeypatch.setattr(monthly_dag, "read_s3_json", lambda key: None)
 
     task_fn = partial(monthly_dag._evaluate, "rental")
@@ -391,21 +355,17 @@ def test_evaluate_defaults_to_needs_retrain_when_no_result(monkeypatch) -> None:
     assert result["candidate_profiles"] == ["builtin-default"]
 
 
-def test_evaluate_forces_test_profile_when_test_profile_only(monkeypatch) -> None:
+def test_evaluate_forces_test_profile_when_test_profile_only(monkeypatch, submitted_steps) -> None:
     """test_profile_only=True면 실제 EMR 성능 점검 스텝을 아예 제출하지 않고,
     바로 TEST_ONLY_PROFILE_NAME 하나만 재학습 대상으로 xcom에 남긴다 — 재평가를
     건너뛰고 작은 프로필로 전체 파이프라인을 빠르게 스모크 테스트하는 용도."""
     mock_ti = MagicMock()
     mock_ti.xcom_pull.return_value = "j-created"
-    submit_calls = []
-    monkeypatch.setattr(
-        monthly_dag, "submit_emr_step", lambda *a, **k: submit_calls.append(a) or {"StepId": "s", "State": "COMPLETED"}
-    )
 
     task_fn = partial(monthly_dag._evaluate, "rental")
     result = task_fn(ti=mock_ti, params={"test_profile_only": True}, run_id="run-1")
 
-    assert submit_calls == []
+    assert submitted_steps == []
     assert result["needs_retrain"] is True
     assert result["candidate_profiles"] == [monthly_dag.TEST_ONLY_PROFILE_NAME]
     pushed = {call.kwargs["key"]: call.kwargs["value"] for call in mock_ti.xcom_push.call_args_list}
@@ -413,7 +373,7 @@ def test_evaluate_forces_test_profile_when_test_profile_only(monkeypatch) -> Non
     assert pushed["candidate_profiles"] == [monthly_dag.TEST_ONLY_PROFILE_NAME]
 
 
-def test_orchestrate_retrain_loop_submits_feature_mart_then_trains_without_resize(monkeypatch) -> None:
+def test_orchestrate_retrain_loop_submits_feature_mart_then_trains_without_resize(monkeypatch, submitted_steps) -> None:
     """재학습 루프가 프로필마다 피처마트 스텝을 제출하고 YARN distributed-shell 학습
     스텝을 제출한다 — 클러스터가 이미 학습 단계 노드 수로 생성돼 있으므로(resize
     로직이 진행 중이던 작업을 죽이거나 목표치까지 못 올라가는 사례가 의심돼
@@ -424,15 +384,6 @@ def test_orchestrate_retrain_loop_submits_feature_mart_then_trains_without_resiz
         "candidate_profiles": ["profile-a", "profile-b"],
     }.get(key)
 
-    submitted_steps = []
-    submitted_commands = {}
-
-    def _fake_submit_emr_step(cluster_id, name, command, **kwargs):
-        submitted_steps.append(name)
-        submitted_commands[name] = command
-        return {"StepId": "s", "State": "COMPLETED"}
-
-    monkeypatch.setattr(monthly_dag, "submit_emr_step", _fake_submit_emr_step)
     # 첫 프로필은 승격 실패, 두 번째 프로필은 승격 성공 -> 루프가 거기서 멈춰야 한다.
     monkeypatch.setattr(
         monthly_dag,
@@ -446,21 +397,21 @@ def test_orchestrate_retrain_loop_submits_feature_mart_then_trains_without_resiz
     assert result["status"] == "completed"
     assert result["profiles"]["profile-a"]["promoted"] is False
     assert result["profiles"]["profile-b"]["promoted"] is True
-    assert any("Spark-RunPipeline-profile-a" in s for s in submitted_steps)
-    assert any("Spark-RunPipeline-profile-b" in s for s in submitted_steps)
-    assert any("Train-rental-profile-a" in s for s in submitted_steps)
-    assert any("Train-rental-profile-b" in s for s in submitted_steps)
+    assert any("Spark-RunPipeline-profile-a" in s for s in _names(submitted_steps))
+    assert any("Spark-RunPipeline-profile-b" in s for s in _names(submitted_steps))
+    assert any("Train-rental-profile-a" in s for s in _names(submitted_steps))
+    assert any("Train-rental-profile-b" in s for s in _names(submitted_steps))
     # 학습 오케스트레이터도 master가 아니라 core 노드 YARN distributed-shell
     # 컨테이너에서 돌아야 한다(evaluate와 같은 이유 — _yarn_python_module_step()
     # docstring 참고).
-    train_command = submitted_commands["Train-rental-profile-a"][2]
+    train_command = _commands(submitted_steps)["Train-rental-profile-a"][2]
     assert "org.apache.hadoop.yarn.applications.distributedshell.Client" in train_command
     assert "--performance-already-checked" in train_command
     expected_machines = monthly_dag.CORE_INSTANCE_COUNT - monthly_dag._WRAPPER_NODE_RESERVATION
     assert f"-shell_env LGB_NUM_MACHINES={expected_machines}" in train_command
 
 
-def test_orchestrate_retrain_loop_passes_no_promote_when_test_profile_only(monkeypatch) -> None:
+def test_orchestrate_retrain_loop_passes_no_promote_when_test_profile_only(monkeypatch, submitted_steps) -> None:
     """test_profile_only는 "재평가만 건너뛴다"는 뜻이지 "승격을 막는다"는 뜻이
     아니다 — 테스트 프로필이 우연히 챔피언보다 좋게 나오면 이 플래그 없이는
     진짜 챔피언이 바뀐다. 학습 스텝에 --no-promote를 반드시 같이 실어야 한다."""
@@ -470,19 +421,12 @@ def test_orchestrate_retrain_loop_passes_no_promote_when_test_profile_only(monke
         "candidate_profiles": [monthly_dag.TEST_ONLY_PROFILE_NAME],
     }.get(key)
 
-    submitted_commands = {}
-
-    def _fake_submit_emr_step(cluster_id, name, command, **kwargs):
-        submitted_commands[name] = command
-        return {"StepId": "s", "State": "COMPLETED"}
-
-    monkeypatch.setattr(monthly_dag, "submit_emr_step", _fake_submit_emr_step)
     monkeypatch.setattr(monthly_dag, "read_s3_json", lambda key: {"promoted": {"rental": False}})
 
     loop_fn = partial(monthly_dag._orchestrate_retrain_loop, "rental")
     loop_fn(ti=mock_ti, params={"test_profile_only": True}, run_id="run-1")
 
-    train_command = submitted_commands[f"Train-rental-{monthly_dag.TEST_ONLY_PROFILE_NAME}"][2]
+    train_command = _commands(submitted_steps)[f"Train-rental-{monthly_dag.TEST_ONLY_PROFILE_NAME}"][2]
     assert "--no-promote" in train_command
 
 
@@ -512,31 +456,23 @@ def test_terminate_cluster_task_no_ops_when_cluster_id_missing(monkeypatch) -> N
     assert terminated == []
 
 
-def test_start_mlflow_calls_docker_action(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    "task_fn,mock_mode,expected_calls",
+    [
+        (monthly_dag._start_mlflow, None, ["start"]),
+        (monthly_dag._start_mlflow, "force_mock", []),
+        (monthly_dag._stop_mlflow, None, ["stop"]),
+    ],
+)
+def test_mlflow_tasks_call_docker_action_unless_force_mock(
+    monkeypatch, task_fn, mock_mode, expected_calls
+) -> None:
     calls = []
     monkeypatch.setattr(monthly_dag, "_docker_mlflow_container_action", lambda action: calls.append(action))
 
-    monthly_dag._start_mlflow(params={})
+    task_fn(params={} if mock_mode is None else {"mock_mode": mock_mode})
 
-    assert calls == ["start"]
-
-
-def test_start_mlflow_skips_when_force_mock(monkeypatch) -> None:
-    calls = []
-    monkeypatch.setattr(monthly_dag, "_docker_mlflow_container_action", lambda action: calls.append(action))
-
-    monthly_dag._start_mlflow(params={"mock_mode": "force_mock"})
-
-    assert calls == []
-
-
-def test_stop_mlflow_calls_docker_action(monkeypatch) -> None:
-    calls = []
-    monkeypatch.setattr(monthly_dag, "_docker_mlflow_container_action", lambda action: calls.append(action))
-
-    monthly_dag._stop_mlflow(params={})
-
-    assert calls == ["stop"]
+    assert calls == expected_calls
 
 
 def test_stop_mlflow_does_not_raise_when_docker_action_fails(monkeypatch) -> None:
