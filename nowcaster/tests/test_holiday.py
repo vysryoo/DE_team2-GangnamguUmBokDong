@@ -2,21 +2,23 @@
 
 from datetime import date
 
+import pytest
+
 import holiday
 
 
 class TestIsSpecialDay:
-    def test_sunday_is_special(self):
-        assert holiday.is_special_day(date(2026, 8, 16)) is True  # 일요일
-
-    def test_regular_weekday_is_not_special(self):
-        assert holiday.is_special_day(date(2026, 8, 12)) is False  # 수요일
-
-    def test_public_holiday_is_special(self):
-        assert holiday.is_special_day(date(2026, 5, 5)) is True  # 어린이날(화요일)
-
-    def test_saturday_is_not_special(self):
-        assert holiday.is_special_day(date(2026, 8, 22)) is False  # 토요일(공휴일 아님)
+    @pytest.mark.parametrize(
+        ("day", "expected"),
+        [
+            (date(2026, 8, 16), True),  # 일요일
+            (date(2026, 8, 12), False),  # 수요일
+            (date(2026, 5, 5), True),  # 어린이날(화요일)
+            (date(2026, 8, 22), False),  # 토요일(공휴일 아님)
+        ],
+    )
+    def test_sunday_and_public_holiday_are_special(self, day, expected):
+        assert holiday.is_special_day(day) is expected
 
 
 class TestCandidateDates:
