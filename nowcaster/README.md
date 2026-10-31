@@ -39,7 +39,6 @@
 |---|---|
 | `main.py` | CLI 진입점 (`backfill-archive`, `estimate`) 및 파이프라인 제어 |
 | `estimate_day.py` | 주차별 가중평균 연산, 다단계 폴백 판정, 결합 테이블 벡터화 생성 |
-| `estimator.py` | 가중평균 및 폴백 단위 수치 계산 알고리즘 |
 | `holiday.py` | 공휴일·주말 패턴 판별 및 1~4주 전 / 5~8주 전 후보 일자 매핑 |
 | `storage.py` | S3 `archive/` 및 `silver/` 파티션 읽기/쓰기/삭제 I/O |
 | `backfill.py` | 원본 CSV 정규화 및 YMD 기준 일자별 테이블 분리 |

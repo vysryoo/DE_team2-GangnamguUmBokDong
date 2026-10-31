@@ -2,6 +2,8 @@
 
 from datetime import datetime, timedelta
 
+import baseline
+import forecast
 import main
 import poi
 import pyarrow as pa
@@ -80,7 +82,7 @@ class TestCollectForecasts:
         # 실측과 같은 형태: 20:55 관측인데 첫 슬롯이 22:00이다(21:00이 아니다).
         table = pa.Table.from_pylist([_forecast_row("POI001", first_hour=22)])
 
-        result = main._collect_forecasts(table, window_start)
+        result = forecast.collect_forecasts(table, window_start)
 
         assert set(result) == {"POI001"}
         assert min(result["POI001"]) == datetime(2026, 8, 12, 22, 0, tzinfo=KST)
@@ -91,7 +93,7 @@ class TestCollectForecasts:
         # 18:00부터 12슬롯 → 18/19/20시는 과거이거나 현재, 나머지는 12시간 안에 든다.
         table = pa.Table.from_pylist([_forecast_row("POI001", first_hour=18)])
 
-        result = main._collect_forecasts(table, window_start)
+        result = forecast.collect_forecasts(table, window_start)
 
         targets = sorted(result["POI001"])
         assert targets[0] == datetime(2026, 8, 12, 21, 0, tzinfo=KST)
@@ -101,7 +103,7 @@ class TestCollectForecasts:
         window_start = datetime(2026, 8, 12, 20, 0, tzinfo=KST)
         table = pa.Table.from_pylist([_forecast_row("POI001", first_hour=21, fcst_yn="N")])
 
-        assert main._collect_forecasts(table, window_start) == {}
+        assert forecast.collect_forecasts(table, window_start) == {}
 
     def test_targets_are_the_sorted_union_across_pois(self):
         window_start = datetime(2026, 8, 12, 20, 0, tzinfo=KST)
@@ -110,8 +112,8 @@ class TestCollectForecasts:
             _forecast_row("POI002", first_hour=22, slots=3),
         ])
 
-        forecasts = main._collect_forecasts(table, window_start)
-        targets = main._forecast_targets(forecasts)
+        forecasts = forecast.collect_forecasts(table, window_start)
+        targets = forecast.forecast_targets(forecasts)
 
         assert targets == [
             datetime(2026, 8, 12, 21, 0, tzinfo=KST),
@@ -126,7 +128,7 @@ class TestCollectForecasts:
         row["FCST_1_TIME"] = "어제쯤"
         table = pa.Table.from_pylist([row])
 
-        result = main._collect_forecasts(table, window_start)
+        result = forecast.collect_forecasts(table, window_start)
 
         assert sorted(result["POI001"]) == [datetime(2026, 8, 12, 22, 0, tzinfo=KST)]
 
@@ -136,13 +138,13 @@ class TestBuildForecastSnapshots:
         window_start = datetime(2026, 8, 12, 20, 0, tzinfo=KST)
         target = datetime(2026, 8, 12, 21, 0, tzinfo=KST)
         table = pa.Table.from_pylist([_forecast_row("POI001", first_hour=21, slots=1)])
-        forecasts = main._collect_forecasts(table, window_start)
+        forecasts = forecast.collect_forecasts(table, window_start)
         areas = (
             poi.PoiArea(area_cd="POI001", area_nm="가", geometry=box(0, 0, 100, 100), area_m2=10000.0),
             poi.PoiArea(area_cd="POI002", area_nm="나", geometry=box(0, 0, 100, 100), area_m2=10000.0),
         )
 
-        snapshots = main._build_forecast_snapshots(areas, forecasts, target)
+        snapshots = forecast.build_forecast_snapshots(areas, forecasts, target)
 
         assert set(snapshots) == {"POI001"}
         assert snapshots["POI001"].pop_estimate == pytest.approx((100.0 + 600.0) / 2)
@@ -223,8 +225,8 @@ class TestRealtimePoiContract:
             lambda _ref: (_poi_area("POI001"),),
         )
         monkeypatch.setattr(
-            main,
-            "_load_baseline_cells",
+            baseline,
+            "load_baseline_cells",
             lambda *_args: pytest.fail("Master 불일치 뒤 baseline을 읽으면 안 됩니다."),
         )
         monkeypatch.setattr(
@@ -250,7 +252,7 @@ class TestFilterGridRowsForHour:
             },
         })
 
-        result = main._filter_grid_rows_for_hour(table, hour=14)
+        result = baseline.filter_grid_rows_for_hour(table, hour=14)
 
         assert set(result.keys()) == {"다사53815262"}
         assert result["다사53815262"].spop == 50.0
@@ -270,7 +272,7 @@ class TestFilterGridRowsForHour:
             **{c: [None] for c in main.merge.AGE_COLUMNS},
         })
 
-        result = main._filter_grid_rows_for_hour(table, hour=hour)
+        result = baseline.filter_grid_rows_for_hour(table, hour=hour)
 
         assert result["다사53815262"].spop == 10.0
 
@@ -285,7 +287,7 @@ class TestFilterGridRowsForHour:
         })
 
         with pytest.raises(ValueError, match="TT가 잘못됐습니다"):
-            main._filter_grid_rows_for_hour(table, hour=9)
+            baseline.filter_grid_rows_for_hour(table, hour=9)
 
     def test_rejects_invalid_tt_even_when_another_row_matches_selected_hour(self):
         table = pa.table({
@@ -297,7 +299,7 @@ class TestFilterGridRowsForHour:
         })
 
         with pytest.raises(ValueError, match="TT가 잘못됐습니다"):
-            main._filter_grid_rows_for_hour(table, hour=14)
+            baseline.filter_grid_rows_for_hour(table, hour=14)
 
     @pytest.mark.parametrize("raw_h_dng_cd", [None, "", "  ", "H1", "１２３"])
     def test_rejects_invalid_h_dng_cd(self, raw_h_dng_cd):
@@ -310,7 +312,7 @@ class TestFilterGridRowsForHour:
         })
 
         with pytest.raises(ValueError, match="H_DNG_CD가 잘못됐습니다"):
-            main._filter_grid_rows_for_hour(table, hour=14)
+            baseline.filter_grid_rows_for_hour(table, hour=14)
 
     def test_trims_valid_ascii_h_dng_cd(self):
         table = pa.table({
@@ -321,7 +323,7 @@ class TestFilterGridRowsForHour:
             **{c: [None] for c in main.merge.AGE_COLUMNS},
         })
 
-        result = main._filter_grid_rows_for_hour(table, hour=14)
+        result = baseline.filter_grid_rows_for_hour(table, hour=14)
 
         assert result["다사53815262"].h_dng_cd == "1100053"
 
@@ -336,7 +338,7 @@ class TestFilterGridRowsForHour:
         })
 
         with pytest.raises(ValueError, match="CELL_ID가 잘못됐습니다"):
-            main._filter_grid_rows_for_hour(table, hour=14)
+            baseline.filter_grid_rows_for_hour(table, hour=14)
 
     def test_null_spop_becomes_zero(self):
         table = pa.table({
@@ -347,7 +349,7 @@ class TestFilterGridRowsForHour:
             **{c: [None] for c in main.merge.AGE_COLUMNS},
         })
 
-        result = main._filter_grid_rows_for_hour(table, hour=14)
+        result = baseline.filter_grid_rows_for_hour(table, hour=14)
 
         assert result["다사53815262"].spop == 0.0
 
@@ -360,7 +362,7 @@ class TestFilterGridRowsForHour:
             **{c: [None] for c in main.merge.AGE_COLUMNS},
         })
 
-        result = main._filter_grid_rows_for_hour(table, hour=14)
+        result = baseline.filter_grid_rows_for_hour(table, hour=14)
 
         assert all(v == 0.0 for v in result["다사53815262"].ages.values())
 
@@ -381,7 +383,7 @@ def test_run_rejects_empty_current_window_cells(monkeypatch):
     )
     monkeypatch.setattr(main.poi, "load_poi_master_areas", lambda _ref: ())
     monkeypatch.setattr(main.storage, "read_nowcast_grid", lambda _date: None)
-    monkeypatch.setattr(main, "_filter_grid_rows_for_hour", lambda _table, _hour: {})
+    monkeypatch.setattr(baseline, "filter_grid_rows_for_hour", lambda _table, _hour: {})
 
     with pytest.raises(ValueError, match="현재 window"):
         main.run(window_start)

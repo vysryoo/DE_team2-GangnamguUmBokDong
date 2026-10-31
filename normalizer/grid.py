@@ -13,8 +13,7 @@ _GRID_LETTERS = "가나다라마바사아자차카타파하"
 def cell_id_to_epsg5179_sw_corner(cell_id: str) -> tuple[float, float]:
     """CELL_ID를 EPSG:5179 남서쪽 꼭짓점 좌표로 변환한다.
 
-    국가지점번호 체계는 격자의 좌하단(남서쪽, X·Y 최소점)을 기준점으로 코드를 부여합니다.
-    이 남서쪽 기준점 좌표에 격자 크기(250m)를 더해 정사각 폴리곤 영역을 정의합니다.
+    국가지점번호 체계는 격자의 좌하단(남서쪽, X·Y 최소점)을 기준점으로 코드를 부여함.
 
     args:
         cell_id: 한글 2자 + 숫자 8자리 국가지점번호 형식 (예: "다사53815262")
@@ -47,6 +46,5 @@ def cell_id_to_epsg5179_sw_corner(cell_id: str) -> tuple[float, float]:
 
 def cell_id_to_polygon(cell_id: str) -> Polygon:
     """CELL_ID에 대응하는 250m x 250m 정사각 격자 폴리곤(EPSG:5179)을 생성한다."""
-    
     x, y = cell_id_to_epsg5179_sw_corner(cell_id)
     return box(x, y, x + GRID_SIZE_M, y + GRID_SIZE_M)

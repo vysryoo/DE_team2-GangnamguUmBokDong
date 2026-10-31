@@ -154,7 +154,6 @@ uv run --frozen python main.py backfill-archive --csv-dir /path/to/csv
 | `backfill.py` | CSV schema 정규화, YMD별 분할, 실측 metadata |
 | `holiday.py` | 평일·special 분류와 후보 날짜 |
 | `estimate_day.py` | Vectorized weighted/fallback 추정과 cache |
-| `estimator.py` | 단일 값 추정 규칙 |
 | `storage.py` | Archive, nowcast, historical cache S3 I/O |
 
 ## 검증

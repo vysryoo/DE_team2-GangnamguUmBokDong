@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import io
 import math
 import re
@@ -209,18 +208,8 @@ def _safe_shape_members(payload: bytes) -> dict[str, bytes]:
         members: dict[str, bytes] = {}
         stems: set[str] = set()
         for info in infos:
-            normalized = info.filename.replace("\\", "/")
-            path = PurePosixPath(normalized)
-            file_mode = (info.external_attr >> 16) & 0o170000
-            if (
-                normalized.startswith("/")
-                or re.match(r"[A-Za-z]:", normalized)
-                or ".." in path.parts
-                or file_mode == stat.S_IFLNK
-            ):
-                raise PoiRegistryError(
-                    f"POI 영역 ZIP에 안전하지 않은 경로가 있습니다: {info.filename!r}"
-                )
+            _reject_unsafe_member(info)
+            path = PurePosixPath(info.filename.replace("\\", "/"))
             if info.is_dir():
                 continue
             suffix = path.suffix.casefold()
@@ -241,6 +230,21 @@ def _safe_shape_members(payload: bytes) -> dict[str, bytes]:
             f"POI 영역 ZIP sidecar의 파일 stem이 다릅니다: stems={sorted(stems)}"
         )
     return members
+
+
+def _reject_unsafe_member(info: zipfile.ZipInfo) -> None:
+    """절대 경로, 상위 경로 이동, 심볼릭 링크 member를 거부한다."""
+    normalized = info.filename.replace("\\", "/")
+    file_mode = (info.external_attr >> 16) & 0o170000
+    if (
+        normalized.startswith("/")
+        or re.match(r"[A-Za-z]:", normalized)
+        or ".." in PurePosixPath(normalized).parts
+        or file_mode == stat.S_IFLNK
+    ):
+        raise PoiRegistryError(
+            f"POI 영역 ZIP에 안전하지 않은 경로가 있습니다: {info.filename!r}"
+        )
 
 
 def _validate_shape_crs(members: dict[str, bytes]) -> None:
@@ -267,35 +271,19 @@ def _read_shape_rows(payload: bytes) -> tuple[_ShapeRow, ...]:
     members = _safe_shape_members(payload)
     _validate_shape_crs(members)
     try:
-        reader = shapefile.Reader(
+        with shapefile.Reader(
             shp=io.BytesIO(members[".shp"]),
             shx=io.BytesIO(members[".shx"]),
             dbf=io.BytesIO(members[".dbf"]),
             encoding="utf-8",
-        )
-        fields = {field[0] for field in reader.fields[1:]}
-        missing_fields = {"AREA_CD", "AREA_NM", "CATEGORY"} - fields
-        if missing_fields:
-            raise PoiRegistryError(
-                f"POI 영역 DBF에 필수 필드가 없습니다: missing={sorted(missing_fields)}"
-            )
-        rows: list[_ShapeRow] = []
-        for shape_record in reader.iterShapeRecords():
-            record = shape_record.record.as_dict()
-            area_cd = _required_text(record.get("AREA_CD"), "shape AREA_CD")
-            if _AREA_CODE.fullmatch(area_cd) is None:
+        ) as reader:
+            fields = {field[0] for field in reader.fields[1:]}
+            missing_fields = {"AREA_CD", "AREA_NM", "CATEGORY"} - fields
+            if missing_fields:
                 raise PoiRegistryError(
-                    f"POI shape AREA_CD 형식이 잘못됐습니다: {area_cd!r}"
+                    f"POI 영역 DBF에 필수 필드가 없습니다: missing={sorted(missing_fields)}"
                 )
-            rows.append(
-                _ShapeRow(
-                    area_cd=area_cd,
-                    area_nm=_required_text(record.get("AREA_NM"), "shape AREA_NM"),
-                    category=_required_text(record.get("CATEGORY"), "shape CATEGORY"),
-                    geometry=shape(shape_record.shape.__geo_interface__),
-                )
-            )
-        reader.close()
+            rows = [_shape_row(shape_record) for shape_record in reader.iterShapeRecords()]
     except PoiRegistryError:
         raise
     except (OSError, ValueError, shapefile.ShapefileException) as exc:
@@ -306,6 +294,20 @@ def _read_shape_rows(payload: bytes) -> tuple[_ShapeRow, ...]:
     if len(codes) != len(set(codes)):
         raise PoiRegistryError("POI 영역 Shapefile에 중복 AREA_CD가 있습니다.")
     return tuple(rows)
+
+
+def _shape_row(shape_record: shapefile.ShapeRecord) -> _ShapeRow:
+    """Shapefile 레코드 하나를 검증해 WGS84 geometry 행으로 변환한다."""
+    record = shape_record.record.as_dict()
+    area_cd = _required_text(record.get("AREA_CD"), "shape AREA_CD")
+    if _AREA_CODE.fullmatch(area_cd) is None:
+        raise PoiRegistryError(f"POI shape AREA_CD 형식이 잘못됐습니다: {area_cd!r}")
+    return _ShapeRow(
+        area_cd=area_cd,
+        area_nm=_required_text(record.get("AREA_NM"), "shape AREA_NM"),
+        category=_required_text(record.get("CATEGORY"), "shape CATEGORY"),
+        geometry=shape(shape_record.shape.__geo_interface__),
+    )
 
 
 def _largest_polygon(geometry: BaseGeometry, area_cd: str) -> BaseGeometry:
@@ -369,9 +371,7 @@ def _bounds_within(
     )
 
 
-def _metadata(
-    assets: SourceAssets, list_sha256: str, areas_sha256: str
-) -> dict[bytes, bytes]:
+def _metadata(assets: SourceAssets) -> dict[bytes, bytes]:
     """Parquet schema에 결합할 원천 provenance metadata를 만든다."""
     values = {
         "poi_master_schema_version": POI_MASTER_SCHEMA_VERSION,
@@ -383,14 +383,14 @@ def _metadata(
         "list_declared_place_count": str(
             assets.list_attachment.declared_place_count
         ),
-        "list_sha256": list_sha256,
+        "list_sha256": assets.list_sha256,
         "areas_filename": assets.areas_attachment.filename,
         "areas_sequence": assets.areas_attachment.sequence,
         "areas_modified_date": assets.areas_attachment.modified_date,
         "areas_declared_place_count": str(
             assets.areas_attachment.declared_place_count
         ),
-        "areas_sha256": areas_sha256,
+        "areas_sha256": assets.areas_sha256,
     }
     return {key.encode("utf-8"): value.encode("utf-8") for key, value in values.items()}
 
@@ -425,8 +425,6 @@ def _master_row(list_row: _ListRow, shape_row: _ShapeRow) -> tuple[dict[str, obj
 
 def build_registry(assets: SourceAssets) -> RegistryBuild:
     """두 공식 첨부를 교차 검증해 정렬된 EPSG:5179 POI Master를 만든다."""
-    list_sha256 = hashlib.sha256(assets.list_bytes).hexdigest()
-    areas_sha256 = hashlib.sha256(assets.areas_bytes).hexdigest()
     list_rows = _read_list_rows(assets.list_bytes)
     shape_rows = _read_shape_rows(assets.areas_bytes)
     list_by_code = {row.area_cd: row for row in list_rows}
@@ -456,8 +454,8 @@ def build_registry(assets: SourceAssets) -> RegistryBuild:
             f"counts={place_counts}"
         )
     return RegistryBuild(
-        table=table.replace_schema_metadata(_metadata(assets, list_sha256, areas_sha256)),
+        table=table.replace_schema_metadata(_metadata(assets)),
         repaired_count=sum(repaired for _, repaired in merged),
-        list_sha256=list_sha256,
-        areas_sha256=areas_sha256,
+        list_sha256=assets.list_sha256,
+        areas_sha256=assets.areas_sha256,
     )

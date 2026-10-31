@@ -120,8 +120,8 @@ def _config_version(build: RegistryBuild, assets: SourceAssets) -> str:
 def _source_fingerprint(assets: SourceAssets) -> dict[bytes, bytes]:
     """활성본과 비교할 원천 checksum·선언 장소 수를 Table metadata 형태로 만든다."""
     return {
-        b"list_sha256": hashlib.sha256(assets.list_bytes).hexdigest().encode(),
-        b"areas_sha256": hashlib.sha256(assets.areas_bytes).hexdigest().encode(),
+        b"list_sha256": assets.list_sha256.encode(),
+        b"areas_sha256": assets.areas_sha256.encode(),
         b"list_declared_place_count": str(assets.list_attachment.declared_place_count).encode(),
         b"areas_declared_place_count": str(assets.areas_attachment.declared_place_count).encode(),
     }

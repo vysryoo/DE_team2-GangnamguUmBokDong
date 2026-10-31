@@ -100,7 +100,32 @@ def _read_file_into_batches(
     station_map: StationMap | None = None,
 ) -> None:
     """CSV 한 파일을 청크 단위로 읽어 `batches`에 날짜별 RecordBatch를 쌓는다."""
-    physical_columns = [
+    physical_columns = _physical_columns(cfg)
+    with path.open(encoding=cfg.encoding, errors="replace", newline="") as handle:
+        chunk: dict[date, dict[str, list[str]]] = {}
+        rows_in_chunk = 0
+        for raw in csv.DictReader(handle):
+            converted = _physical_row(raw, cfg, days, na_values, station_map)
+            if converted is None:
+                continue
+            day, row = converted
+            day_columns = chunk.setdefault(day, {name: [] for name in physical_columns})
+            for name in physical_columns:
+                day_columns[name].append(row[name])
+
+            rows_in_chunk += 1
+            if rows_in_chunk >= _CHUNK_ROWS:
+                _flush_chunk(chunk, batches)
+                chunk = {}
+                rows_in_chunk = 0
+
+        if chunk:
+            _flush_chunk(chunk, batches)
+
+
+def _physical_columns(cfg: BootstrapConfig) -> list[str]:
+    """설정의 모든 채움 경로가 만드는 물리 컬럼 목록을 반환한다."""
+    return [
         name
         for name in (
             *cfg.column_map.values(),
@@ -114,42 +139,34 @@ def _read_file_into_batches(
         if not name.startswith("_")
     ]
 
-    with path.open(encoding=cfg.encoding, errors="replace", newline="") as handle:
-        chunk: dict[date, dict[str, list[str]]] = {}
-        rows_in_chunk = 0
 
-        for raw in csv.DictReader(handle):
-            row = {
-                physical: ("" if raw.get(header) in na_values else (raw.get(header) or ""))
-                for header, physical in cfg.column_map.items()
-            }
-            row.update(cfg.constants)
-            # 날짜 버킷팅이 분해·결합 결과를 읽으므로 그보다 먼저 계산함
-            row.update(_derived_time_values(raw, cfg))
-            row.update(_composed_time_values(raw, cfg))
-            day = _row_date(row, cfg)
-            if day not in days:
-                continue
-            for column, mapping in cfg.value_map.items():
-                if column in row and row[column] in mapping:
-                    row[column] = mapping[row[column]]
+def _physical_row(
+    raw: dict,
+    cfg: BootstrapConfig,
+    days: set[date],
+    na_values: set[str],
+    station_map: StationMap | None,
+) -> tuple[date, dict[str, str]] | None:
+    """CSV 원본 한 행을 (날짜, 물리 행)으로 바꾼다. 요청 날짜가 아니면 None을 반환한다."""
+    row = {
+        physical: ("" if raw.get(header) in na_values else (raw.get(header) or ""))
+        for header, physical in cfg.column_map.items()
+    }
+    row.update(cfg.constants)
+    # 날짜 버킷팅이 분해·결합 결과를 읽으므로 그보다 먼저 계산함
+    row.update(_derived_time_values(raw, cfg))
+    row.update(_composed_time_values(raw, cfg))
+    day = _row_date(row, cfg)
+    if day not in days:
+        return None
+    for column, mapping in cfg.value_map.items():
+        if column in row and row[column] in mapping:
+            row[column] = mapping[row[column]]
 
-            # value_map이 풍속·풍향과 조인 키를 고칠 수 있으므로 파생과 조인은 그 뒤에 함
-            row.update(_derived_wind_values(row, cfg))
-            row.update(_join_values(row, cfg, station_map))
-
-            day_columns = chunk.setdefault(day, {name: [] for name in physical_columns})
-            for name in physical_columns:
-                day_columns[name].append(row[name])
-
-            rows_in_chunk += 1
-            if rows_in_chunk >= _CHUNK_ROWS:
-                _flush_chunk(chunk, batches)
-                chunk = {}
-                rows_in_chunk = 0
-
-        if chunk:
-            _flush_chunk(chunk, batches)
+    # value_map이 풍속·풍향과 조인 키를 고칠 수 있으므로 파생과 조인은 그 뒤에 함
+    row.update(_derived_wind_values(row, cfg))
+    row.update(_join_values(row, cfg, station_map))
+    return day, row
 
 
 def _flush_chunk(

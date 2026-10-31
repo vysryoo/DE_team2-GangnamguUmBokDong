@@ -184,8 +184,8 @@ def run_bootstrap_lookback(
     return 0
 
 
-def main(argv: list[str] | None = None) -> int:
-    """CLI 인자를 파싱하여 적재 또는 나우캐스팅 추정 명령을 실행한다."""
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """backfill-archive, bootstrap-lookback, estimate 하위 명령의 인자를 파싱한다."""
     parser = argparse.ArgumentParser(prog="seoul-pop-nowcasting")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -212,7 +212,12 @@ def main(argv: list[str] | None = None) -> int:
         help="Collector와 동일한 ISO 8601 logical window (timezone offset 필수)",
     )
 
-    args = parser.parse_args(argv)
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI 인자를 파싱하여 적재 또는 나우캐스팅 추정 명령을 실행한다."""
+    args = parse_args(argv)
     if args.command == "backfill-archive":
         return run_backfill_archive(args.csv_dir)
 

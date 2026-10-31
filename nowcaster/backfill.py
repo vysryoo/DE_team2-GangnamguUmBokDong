@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 # pyrefly: ignore [missing-import]
 import pandas as pd
@@ -78,8 +77,7 @@ def group_rows_by_date(table: pa.Table) -> dict[date, pa.Table]:
     ymd_values = table.column("YMD").to_pylist()
     grouped: dict[date, pa.Table] = {}
     for ymd in sorted(set(ymd_values)):
-        target_date = datetime.strptime(ymd, "%Y%m%d").replace(tzinfo=ZoneInfo("Asia/Seoul")).date()
-        mask = pc.equal(table.column("YMD"), ymd)
-        grouped[target_date] = table.filter(mask)
+        target_date = datetime.strptime(ymd, "%Y%m%d").date()
+        grouped[target_date] = table.filter(pc.equal(table.column("YMD"), ymd))
     return grouped
 
