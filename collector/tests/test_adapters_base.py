@@ -75,35 +75,8 @@ def test_fetch_result_failure_carries_error_kind():
     assert result.error is FetchErrorKind.TRANSIENT
 
 
-def test_fetch_result_metadata_is_not_persisted_but_updates_expected_total(window):
-    """probe 종료 메타데이터는 bronze 조각이 아니지만 전체 행 수는 전달한다."""
-
-    def fetch_fn(config, win, *, client, skip, expected_total):
-        yield FetchResult(key="page-1", payload=b"data", error=None, expected_total=None)
-        yield FetchResult(
-            key="probe-end-2",
-            payload=None,
-            error=None,
-            expected_total=1,
-            persist=False,
-        )
-
-    on_chunk = MagicMock()
-    result = fetch_with_rounds(
-        fetch_fn,
-        _FakeBudgetConfig(),
-        window,
-        client=object(),
-        on_chunk=on_chunk,
-    )
-
-    assert result.chunks == {"page-1": b"data"}
-    assert result.expected_total == 1
-    on_chunk.assert_called_once_with("page-1", b"data")
-
-
-def test_fetch_with_rounds_rejects_persisted_success_without_payload(window):
-    """어댑터가 metadata 플래그를 빼먹어 빈 bronze를 쓰는 일을 막는다."""
+def test_fetch_with_rounds_rejects_success_without_payload(window):
+    """payload 없는 성공 조각으로 빈 bronze를 쓰는 일을 막는다."""
 
     def fetch_fn(config, win, *, client, skip, expected_total):
         yield FetchResult(key="broken", payload=None, error=None, expected_total=None)
