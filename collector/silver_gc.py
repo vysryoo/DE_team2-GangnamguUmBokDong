@@ -12,12 +12,12 @@ from datetime import date, datetime, timedelta
 
 from core import layout
 from core.kst import KST
-from core.s3 import delete_objects, list_keys, write_json
 
 import cold_bronze
 import compaction
 import storage
 from config.schema import SourceConfig
+from gc_manifest import delete_with_manifest
 
 NON_AUTHORITY_RETENTION_DAYS = 30
 
@@ -81,39 +81,30 @@ def collect_date(
     if not candidates:
         return SilverGcResult("skipped", 0, len(retained_keys), "nothing_to_delete")
 
-    gc_manifest = {
-        "source_id": source_id,
-        "date": day.isoformat(),
-        "archive_key": archive_manifest.get("archive_key") if archive_manifest else None,
-        "archive_required": require_archive,
-        "archive_silver_signature": signature if require_archive else None,
-        "cold_key": cold_manifest["cold_key"],
-        "retained_authority_keys": sorted(authority_keys),
-        "retained_keys": retained_keys,
-        "retention_days": NON_AUTHORITY_RETENTION_DAYS,
-        "cutoff": cutoff.isoformat(),
-        "deletion_candidates": [
-            {
-                "key": obj.key,
-                "size": obj.size,
-                "last_modified": obj.last_modified.isoformat(),
-            }
-            for obj in candidates
-        ],
-    }
-    gc_key = f"_silver_gc_manifest/{source_id}/dt={day.isoformat()}.json"
-    write_json(gc_key, {**gc_manifest, "status": "prepared"})
-    delete_objects(deleted_keys)
-    # S3 DeleteObjects는 key별 실패를 예외 없이 응답 본문에만 담으므로 다시 나열해 확인함
-    remaining = set(deleted_keys) & set(list_keys(layout.silver_day_prefix(source_id, day)))
-    if remaining:
-        raise RuntimeError(f"non-authority Silver 삭제 확인에 실패했다: {sorted(remaining)[:5]}")
-    write_json(
-        gc_key,
+    delete_with_manifest(
+        f"_silver_gc_manifest/{source_id}/dt={day.isoformat()}.json",
         {
-            **gc_manifest,
-            "status": "completed",
-            "completed_at": datetime.now(KST).isoformat(),
+            "source_id": source_id,
+            "date": day.isoformat(),
+            "archive_key": archive_manifest.get("archive_key") if archive_manifest else None,
+            "archive_required": require_archive,
+            "archive_silver_signature": signature if require_archive else None,
+            "cold_key": cold_manifest["cold_key"],
+            "retained_authority_keys": sorted(authority_keys),
+            "retained_keys": retained_keys,
+            "retention_days": NON_AUTHORITY_RETENTION_DAYS,
+            "cutoff": cutoff.isoformat(),
+            "deletion_candidates": [
+                {
+                    "key": obj.key,
+                    "size": obj.size,
+                    "last_modified": obj.last_modified.isoformat(),
+                }
+                for obj in candidates
+            ],
         },
+        deleted_keys,
+        layout.silver_day_prefix(source_id, day),
+        completed={"status": "completed"},
     )
     return SilverGcResult("completed", len(deleted_keys), len(retained_keys))

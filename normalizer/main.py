@@ -34,6 +34,9 @@ _MAX_HORIZON = timedelta(hours=12)
 _POI_CODE_PATTERN = re.compile(r"POI[0-9]{3}\Z")
 
 
+MergeCell = Callable[[merge.GridCell, list[tuple[merge.PoiSnapshot, float]]], merge.MergedCell]
+
+
 class RealtimePoiContractError(ValueError):
     """실시간 생활인구의 POI 식별자 계약이 선택된 Master와 맞지 않는다."""
 
@@ -349,7 +352,7 @@ def _write_normalized(
     cells_by_id: dict[str, merge.GridCell],
     overlap_areas: dict[str, list[tuple[str, float]]],
     snapshots_by_code: dict[str, merge.PoiSnapshot],
-    merge_cell: Callable[[merge.GridCell, list[tuple[merge.PoiSnapshot, float]]], merge.MergedCell],
+    merge_cell: MergeCell,
 ) -> str | None:
     """한 시각의 보정 결과를 더 최신 세대를 보존하며 tick 키에 쓴다."""
     output_rows = [
@@ -366,15 +369,64 @@ def _write_normalized(
     )
 
 
+def _merge_plan(
+    window_start: datetime,
+    targets: list[datetime],
+    observed_snapshots: list[merge.PoiSnapshot],
+    poi_areas: tuple[poi.PoiArea, ...],
+    forecasts_by_code: dict[str, dict[datetime, tuple[float, float]]],
+    cells_by_target: dict[datetime, dict[str, merge.GridCell]],
+) -> dict[datetime, tuple[dict[str, merge.PoiSnapshot], MergeCell]]:
+    """시각마다 쓸 POI 스냅샷과 합성 함수를 정한다. baseline이 없는 미래 시각은 뺀다.
+
+    현재 시각은 실측 성비로 성·연령까지 재분배하고, 미래 시각은 예측값에 성비가 없어
+    총량만 합성한다.
+    """
+    plan: dict[datetime, tuple[dict[str, merge.PoiSnapshot], MergeCell]] = {
+        window_start: (
+            {snapshot.area_cd: snapshot for snapshot in observed_snapshots},
+            merge.merge_cell,
+        )
+    }
+    for target in targets:
+        if target in cells_by_target:
+            plan[target] = (
+                _build_forecast_snapshots(poi_areas, forecasts_by_code, target),
+                merge.merge_cell_total_only,
+            )
+    return plan
+
+
+def _write_merge_plan(
+    merge_plan: dict[datetime, tuple[dict[str, merge.PoiSnapshot], MergeCell]],
+    window_start: datetime,
+    cells_by_target: dict[datetime, dict[str, merge.GridCell]],
+    overlap_areas: dict[str, list[tuple[str, float]]],
+) -> tuple[dict[str, str], list[str]]:
+    """시각별 보정 결과를 쓰고 쓴 키와 더 최신 세대가 있어 건너뛴 시각을 반환한다."""
+    written: dict[str, str] = {}
+    stale_generation_skipped: list[str] = []
+    for target, (snapshots_by_code, merge_cell) in merge_plan.items():
+        output_key = _write_normalized(
+            target,
+            window_start,
+            cells_by_target[target],
+            overlap_areas,
+            snapshots_by_code,
+            merge_cell,
+        )
+        if output_key is None:
+            stale_generation_skipped.append(target.isoformat())
+        else:
+            written[target.isoformat()] = output_key
+    return written, stale_generation_skipped
+
+
 def run(
     window_start: datetime,
     poi_master_ref: PoiMasterRef | None = None,
 ) -> int:
     """현재 시각과 향후 12시간 예측 시각을 각각 보정해 그 시각의 Silver tick에 쓴다.
-
-    현재 시각은 실측 POI 인구와 성비로 성·연령까지 재분배하고(`merge.merge_cell`), 미래
-    시각은 예측 인구로 총량만 합성한다(`merge.merge_cell_total_only`). 예측값에는 성비가
-    없기 때문이다.
 
     Args:
         window_start: 수집 기준 시각
@@ -400,34 +452,12 @@ def run(
     overlap_areas = merge.find_overlap_areas(list(union_cells.values()), list(poi_areas))
 
     observed_snapshots = _build_poi_snapshots(poi_areas, realtime_table)
-    merge_plan = {
-        window_start: (
-            {snapshot.area_cd: snapshot for snapshot in observed_snapshots},
-            merge.merge_cell,
-        )
-    }
-    for target in targets:
-        if target in cells_by_target:
-            merge_plan[target] = (
-                _build_forecast_snapshots(poi_areas, forecasts_by_code, target),
-                merge.merge_cell_total_only,
-            )
-
-    written: dict[str, str] = {}
-    stale_generation_skipped: list[str] = []
-    for target, (snapshots_by_code, merge_cell) in merge_plan.items():
-        output_key = _write_normalized(
-            target,
-            window_start,
-            cells_by_target[target],
-            overlap_areas,
-            snapshots_by_code,
-            merge_cell,
-        )
-        if output_key is None:
-            stale_generation_skipped.append(target.isoformat())
-        else:
-            written[target.isoformat()] = output_key
+    merge_plan = _merge_plan(
+        window_start, targets, observed_snapshots, poi_areas, forecasts_by_code, cells_by_target
+    )
+    written, stale_generation_skipped = _write_merge_plan(
+        merge_plan, window_start, cells_by_target, overlap_areas
+    )
 
     is_partial = realtime_snapshot.status.value == "partial"
     storage.write_manifest(

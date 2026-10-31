@@ -59,7 +59,10 @@ def read_nowcast_grid(target_date: date) -> pa.Table:
     Raises:
         PartitionNotFoundError: 해당 일자의 추정치 파일이 없을 때
     """
-    key = layout.nowcast_key(target_date)
+    return _read_nowcast(layout.nowcast_key(target_date))
+
+
+def _read_nowcast(key: str) -> pa.Table:
     body = get_object_bytes(key)
     if body is None:
         raise PartitionNotFoundError(f"{LIVING_POPULATION_GRID}의 nowcast 추정치 없음: {key}")
@@ -93,10 +96,7 @@ def read_latest_nowcast_grid(target_date: date) -> tuple[date, pa.Table]:
             f"{LIVING_POPULATION_GRID}의 {target_date.isoformat()} 이전 nowcast 추정치 없음"
         )
     snapshot_date, key = max(candidates)
-    body = get_object_bytes(key)
-    if body is None:
-        raise PartitionNotFoundError(f"{LIVING_POPULATION_GRID}의 nowcast 추정치 없음: {key}")
-    return snapshot_date, pq.read_table(io.BytesIO(body))
+    return snapshot_date, _read_nowcast(key)
 
 
 def read_realtime_snapshot(window_start: datetime) -> AvailableSourceSnapshot:
@@ -114,7 +114,15 @@ def read_realtime_snapshot(window_start: datetime) -> AvailableSourceSnapshot:
 
 def read_station_master_silver(window_start: datetime) -> pa.Table:
     """Collector가 같은 window에 쓴 대여소 master Silver를 읽는다."""
-    return _read_exact_collector_snapshot(BIKE_STATION_MASTER, window_start)
+    try:
+        snapshot = read_exact_source_snapshot(BIKE_STATION_MASTER, window_start)
+    except SourceSnapshotReadError as exc:
+        raise PartitionNotFoundError(str(exc)) from exc
+    if snapshot.table is None:
+        raise PartitionNotFoundError(
+            f"{BIKE_STATION_MASTER} exact source snapshot이 EMPTY입니다: {window_start.isoformat()}"
+        )
+    return snapshot.table
 
 
 def read_latest_bike_realtime_silver(window_start: datetime) -> pa.Table | None:
@@ -129,19 +137,6 @@ def read_latest_bike_realtime_silver(window_start: datetime) -> pa.Table | None:
         return None
     except SourceSnapshotReadError as exc:
         raise PartitionNotFoundError(str(exc)) from exc
-    return snapshot.table
-
-
-def _read_exact_collector_snapshot(source_id: str, window_start: datetime) -> pa.Table:
-    """Collector authority가 가리키는 exact-window Parquet을 읽는다."""
-    try:
-        snapshot = read_exact_source_snapshot(source_id, window_start)
-    except SourceSnapshotReadError as exc:
-        raise PartitionNotFoundError(str(exc)) from exc
-    if snapshot.table is None:
-        raise PartitionNotFoundError(
-            f"{source_id} exact source snapshot이 EMPTY입니다: {window_start.isoformat()}"
-        )
     return snapshot.table
 
 

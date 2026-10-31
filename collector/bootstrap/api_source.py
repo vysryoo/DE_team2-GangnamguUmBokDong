@@ -1,20 +1,8 @@
 """과거 조회 API에서 하루치 원시 행을 받아온다.
 
-## 시각 인자는 10자리다
-
-`bikeListHist`는 `YYYYMMDDHH`를 받는다. 8자리(`20260817`)를 주면 **에러 없이 무시하고
-최신 스냅샷을 반환한다** — 조용히 틀린 데이터가 들어오므로 형식을 설정으로 고정하고
-테스트로 못 박는다.
-
-## 병렬도
-
-시간당 7페이지, 호출당 약 0.9초다. 1년이면 61,320콜이라 순차로는 15시간이 걸린다.
-기본 병렬도를 4로 잡는다 — 서울 열린데이터광장은 공공 서비스이므로 기본을 보수적으로
-두고 필요할 때 명시적으로 올린다.
-
-## 인증키
-
-URL 경로에 그대로 박히므로 예외 메시지에 노출되지 않게 가린다.
+`bikeListHist`는 시각을 `YYYYMMDDHH`로 받는다. 8자리를 주면 에러 없이 최신 스냅샷을
+돌려주므로 형식을 설정(`time_format`)으로 고정한다. 공공 서비스라 기본 병렬도는 보수적으로
+4로 둔다. 인증키는 URL 경로에 들어가므로 예외 메시지에서 가린다.
 """
 
 from __future__ import annotations
@@ -94,13 +82,7 @@ def _hour(
 ) -> list[dict]:
     """한 시각을 페이지 끝까지 받아온다. 일시적 실패는 재시도하고, 확정적 실패는 즉시 포기한다.
 
-    재시도 사이에는 지수 백오프로 잠깐 쉰다(1초, 2초, ...) — sleep 없이 즉시
-    연타하면 쿼터·레이트리밋 상황을 악화시킨다. 마지막 시도가 실패했을 때는
-    재시도가 없으므로 자지 않는다.
-
-    args:
-        sleep: 실제로 잠드는 함수. 기본은 `time.sleep`이지만 테스트에서 즉시
-            반환하는 함수를 주입해 속도를 지키거나 호출 인자를 검증할 수 있다.
+    재시도 사이에는 쿼터·레이트리밋을 악화시키지 않도록 1초, 2초, ... 지수 백오프로 쉰다.
     """
     effective_sleep = sleep if sleep is not None else time.sleep
     last_error: Exception | None = None
@@ -148,11 +130,8 @@ def fetch_by_date(
     """
     stamps = [datetime(day.year, day.month, day.day, hour).strftime(cfg.time_format) for hour in range(24)]
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
-        # `pool.map()`은 첫 예외가 이터레이션에 드러나는 순간 아직 시작하지 않은 나머지
-        # future를 취소해버린다. 그러면 인증키 오류처럼 모든 시각이 같은 이유로 실패하는
-        # 경우 실제로 몇 번 호출됐는지 예측할 수 없다. `submit()` + `result()`로 직접
-        # 모으면 취소 없이 24번 모두 시도되고, 그중 하나라도 실패하면 그 예외를 그대로
-        # 올린다.
+        # `pool.map()`은 첫 예외에서 남은 future를 취소해 호출 횟수가 들쭉날쭉해짐.
+        # 24시각을 모두 시도한 뒤 첫 실패를 올림
         futures = [pool.submit(_hour, cfg, stamp, client, max_retries, sleep) for stamp in stamps]
         chunks: list[list[dict]] = []
         first_error: FetchFailed | None = None

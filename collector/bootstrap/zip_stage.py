@@ -1,26 +1,14 @@
-"""대형 원본 ZIP에서 부트스트랩에 필요한 CSV만 안전하게 준비한다.
+"""대형 원본 ZIP에서 부트스트랩에 필요한 CSV만 골라 스트리밍 복사한다.
 
-이 모듈은 CSV 본문을 해석하지 않는다. ZIP 중앙 디렉터리의 파일명과 크기만으로
-요청 날짜에 필요한 월별 대여·재고, ASOS 관측, 일별 거주인구 파일을 고른 뒤
-각 출력 디렉터리로 스트리밍 복사한다. 따라서 수십 GB 원본을 통째로 풀 필요가 없다.
+CSV 본문은 해석하지 않고 중앙 디렉터리의 파일명과 크기만 본다. 수십 GB 원본을 통째로
+풀지 않으려는 것이다.
 
-실행 예시::
+    python -m bootstrap.zip_stage --zip ../data/archive.zip \
+        --bootstrap-dir ../data/bootstrap --population-dir ../data/population \
+        --from 2025-01-01 --to 2025-12-31 --rental-context-before-days 35 --dry-run
 
-    python -m bootstrap.zip_stage \
-        --zip ../data/archive.zip \
-        --bootstrap-dir ../data/bootstrap \
-        --population-dir ../data/population \
-        --from 2025-01-01 --to 2025-12-31 \
-        --rental-context-before-days 35 \
-        --rental-context-after-days 7 --dry-run
-
-ASOS 파일은 중앙 디렉터리만 보고 요청 날짜 전체를 포함하는지 확정할 수 없다.
-이 단계에서는 ``raw_forecast``의 ASOS 파일이 정확히 하나인지까지만 확인하며,
-실제 행 날짜 제한은 뒤의 bootstrap 날짜 필터가 담당한다.
-
-대여 타깃은 시작 경계 이전에 출발한 트립과 종료 경계 뒤에 반납된 트립도 읽는다.
-두 context 옵션은 그 구간과 겹치는 **대여 월 파일만** 추가하며, 본 기간 밖 재고·
-인구 파일까지 요구하지 않는다.
+ASOS는 파일이 정확히 하나인지만 확인하고 행 날짜 제한은 bootstrap 날짜 필터가 맡는다.
+대여 context 옵션은 경계 밖 트립을 위해 **대여 월 파일만** 추가한다.
 """
 
 from __future__ import annotations
@@ -175,8 +163,24 @@ def _months(first: date, last: date) -> list[str]:
     return result
 
 
-def _one(logical_name: str, candidates: list[Member]) -> Member:
-    """논리 입력에 대응하는 멤버가 정확히 하나인지 확인한다."""
+def _find_member(
+    members: list[Member],
+    logical_name: str,
+    parent_path: tuple[str, ...],
+    pattern: re.Pattern[str],
+    key: str | None = None,
+) -> Member:
+    """부모 경로와 파일명 패턴이 맞는 멤버가 정확히 하나인지 확인해 반환한다.
+
+    `key`를 주면 패턴의 첫 그룹이 그 값과 같은 멤버만 고른다.
+    """
+    candidates = [
+        member
+        for member in members
+        if _has_path(member, *parent_path)
+        and (match := pattern.fullmatch(member.basename)) is not None
+        and (key is None or match.group(1) == key)
+    ]
     if len(candidates) != 1:
         raise StageError(
             f"{logical_name} 멤버가 정확히 하나여야 한다: matches={len(candidates)}"
@@ -184,25 +188,18 @@ def _one(logical_name: str, candidates: list[Member]) -> Member:
     return candidates[0]
 
 
-def _rental_selection(
-    members: list[Member], bootstrap_dir: Path, yymm: str
-) -> Selection:
-    """요청 월의 대여 이력 하나를 선택해 출력 계획을 반환한다."""
-    rental = _one(
-        f"rental:{yymm}",
-        [
-            member
-            for member in members
-            if _has_path(member, "raw")
-            and (match := _RENTAL_RE.fullmatch(member.basename)) is not None
-            and match.group("yymm") == yymm
-        ],
-    )
-    return Selection(
-        logical_name=f"rental:{yymm}",
-        member=rental,
-        destination=bootstrap_dir / rental.basename,
-    )
+def _validate_range(
+    first: date, last: date, rental_context_before_days: int, rental_context_after_days: int
+) -> None:
+    """요청 기간과 대여 context 일수가 staging 가능한 범위인지 확인한다."""
+    if first > last:
+        raise StageError(f"--from({first})이 --to({last})보다 뒤다")
+    if first.year != last.year:
+        raise StageError(
+            "ASOS 출력이 연도별 하나이므로 --from과 --to는 같은 연도여야 한다"
+        )
+    if rental_context_before_days < 0 or rental_context_after_days < 0:
+        raise StageError("대여 컨텍스트 일수는 0 이상이어야 한다")
 
 
 def _select(
@@ -215,79 +212,33 @@ def _select(
     rental_context_after_days: int = 0,
 ) -> list[Selection]:
     """요청 기간과 대여 컨텍스트의 논리 파일을 선택해 출력 계획을 만든다."""
-    if first > last:
-        raise StageError(f"--from({first})이 --to({last})보다 뒤다")
-    if first.year != last.year:
-        raise StageError(
-            "ASOS 출력이 연도별 하나이므로 --from과 --to는 같은 연도여야 한다"
-        )
-    if rental_context_before_days < 0 or rental_context_after_days < 0:
-        raise StageError("대여 컨텍스트 일수는 0 이상이어야 한다")
-
+    _validate_range(first, last, rental_context_before_days, rental_context_after_days)
     selections: list[Selection] = []
-    primary_months = _months(first, last)
     context_months = _months(
         first - timedelta(days=rental_context_before_days),
         last + timedelta(days=rental_context_after_days),
     )
     for yymm in context_months:
-        selections.append(_rental_selection(members, bootstrap_dir, yymm))
+        name = f"rental:{yymm}"
+        rental = _find_member(members, name, ("raw",), _RENTAL_RE, yymm)
+        selections.append(Selection(name, rental, bootstrap_dir / rental.basename))
 
-    for yymm in primary_months:
-        station = _one(
-            f"station:{yymm}",
-            [
-                member
-                for member in members
-                if _has_path(member, "raw_station")
-                and (match := _STATION_RE.fullmatch(member.basename)) is not None
-                and match.group("yymm") == yymm
-            ],
-        )
-        selections.append(
-            Selection(
-                logical_name=f"station:{yymm}",
-                member=station,
-                destination=bootstrap_dir
-                / f"대여소별 공공자전거 대여가능 수량_{yymm}.csv",
-            )
-        )
+    for yymm in _months(first, last):
+        name = f"station:{yymm}"
+        station = _find_member(members, name, ("raw_station",), _STATION_RE, yymm)
+        destination = bootstrap_dir / f"대여소별 공공자전거 대여가능 수량_{yymm}.csv"
+        selections.append(Selection(name, station, destination))
 
-    asos = _one(
-        "weather:ASOS",
-        [
-            member
-            for member in members
-            if _has_path(member, "raw_forecast") and _ASOS_RE.fullmatch(member.basename)
-        ],
-    )
-    selections.append(
-        Selection(
-            logical_name="weather:ASOS",
-            member=asos,
-            destination=bootstrap_dir / f"weather_realtime_{first.year}.csv",
-        )
-    )
+    asos = _find_member(members, "weather:ASOS", ("raw_forecast",), _ASOS_RE)
+    destination = bootstrap_dir / f"weather_realtime_{first.year}.csv"
+    selections.append(Selection("weather:ASOS", asos, destination))
 
     for day in _days(first, last):
         ymd = day.strftime("%Y%m%d")
-        population = _one(
-            f"population:{ymd}",
-            [
-                member
-                for member in members
-                if _has_path(member, "raw_people", "250m", "resd")
-                and (match := _POPULATION_RE.fullmatch(member.basename)) is not None
-                and match.group("ymd") == ymd
-            ],
-        )
-        selections.append(
-            Selection(
-                logical_name=f"population:{ymd}",
-                member=population,
-                destination=population_dir / population.basename,
-            )
-        )
+        name = f"population:{ymd}"
+        path = ("raw_people", "250m", "resd")
+        population = _find_member(members, name, path, _POPULATION_RE, ymd)
+        selections.append(Selection(name, population, population_dir / population.basename))
 
     _validate_destinations(selections)
     return selections

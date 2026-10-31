@@ -144,26 +144,14 @@ class PoiMasterRef:
         """Exact 3-key builtin dict를 검증해 POI Master ref로 파싱한다."""
         if type(value) is not dict:
             raise PoiMasterContractError("POI Master ref는 JSON object여야 합니다.")
-        document = cast(dict[str, object], value)
+        document = cast(dict[str, Any], value)
         if frozenset(document) != _REF_KEYS:
             raise PoiMasterContractError("POI Master ref key가 정확하지 않습니다.")
-        mode = document["mode"]
-        manifest_uri = document["manifest_uri"]
-        manifest_sha256 = document["manifest_sha256"]
-        if type(mode) is not str:
-            raise PoiMasterContractError("POI Master ref mode는 문자열이어야 합니다.")
-        if manifest_uri is not None and type(manifest_uri) is not str:
-            raise PoiMasterContractError(
-                "POI Master manifest_uri는 문자열 또는 null이어야 합니다."
-            )
-        if manifest_sha256 is not None and type(manifest_sha256) is not str:
-            raise PoiMasterContractError(
-                "POI Master manifest_sha256은 문자열 또는 null이어야 합니다."
-            )
+        # 필드 타입과 mode별 조합은 __post_init__이 검증함
         return cls(
-            mode=mode,
-            manifest_uri=manifest_uri,
-            manifest_sha256=manifest_sha256,
+            mode=document["mode"],
+            manifest_uri=document["manifest_uri"],
+            manifest_sha256=document["manifest_sha256"],
         )
 
 
@@ -400,8 +388,15 @@ def read_poi_master(
 
 def _validate_poi_master_table(table: pa.Table) -> None:
     """POI Master Table의 schema, CRS와 모든 행 불변식을 검증한다."""
-    if type(table) is not pa.Table:
-        raise PoiMasterContractError("POI Master artifact는 PyArrow Table이어야 합니다.")
+    _validate_schema_and_metadata(table)
+    if table.num_rows <= 0:
+        raise PoiMasterContractError("POI Master에는 한 행 이상 있어야 합니다.")
+    _validate_row_values(table)
+    _validate_declared_areas(table)
+
+
+def _validate_schema_and_metadata(table: pa.Table) -> None:
+    """Exact schema와 schema version·CRS metadata를 확인한다."""
     if not table.schema.remove_metadata().equals(
         _POI_MASTER_SCHEMA,
         check_metadata=True,
@@ -432,11 +427,15 @@ def _validate_poi_master_table(table: pa.Table) -> None:
         raise PoiMasterContractError(
             "POI Master schema metadata geometry_crs는 EPSG:5179여야 합니다."
         )
-    if table.num_rows <= 0:
-        raise PoiMasterContractError("POI Master에는 한 행 이상 있어야 합니다.")
 
+
+def _validate_row_values(table: pa.Table) -> None:
+    """코드·이름·번호·면적 값의 형식과 고유성을 확인한다.
+
+    Exact schema를 통과한 뒤라 각 값은 선언 타입이거나 None이다.
+    """
     area_codes = table.column("AREA_CD").to_pylist()
-    if any(type(value) is not str or _AREA_CODE.fullmatch(value) is None for value in area_codes):
+    if any(value is None or _AREA_CODE.fullmatch(value) is None for value in area_codes):
         raise PoiMasterContractError(
             "POI Master AREA_CD는 null이 아닌 POI 세 자리 코드여야 합니다."
         )
@@ -447,37 +446,36 @@ def _validate_poi_master_table(table: pa.Table) -> None:
 
     for column_name in _REQUIRED_TEXT_COLUMNS:
         values = table.column(column_name).to_pylist()
-        if any(
-            type(value) is not str or not value or value != value.strip()
-            for value in values
-        ):
+        if any(not value or value != value.strip() for value in values):
             raise PoiMasterContractError(
                 f"POI Master {column_name}은 공백 없는 trimmed 문자열이어야 합니다."
             )
 
     source_numbers = table.column("SOURCE_NO").to_pylist()
-    if any(type(value) is not int or value <= 0 for value in source_numbers):
+    if any(value is None or value <= 0 for value in source_numbers):
         raise PoiMasterContractError("POI Master SOURCE_NO는 양의 정수여야 합니다.")
     if len(source_numbers) != len(set(source_numbers)):
         raise PoiMasterContractError("POI Master SOURCE_NO는 고유해야 합니다.")
 
-    areas = table.column("AREA_M2").to_pylist()
     if any(
-        type(value) is not float or not math.isfinite(value) or value <= 0
-        for value in areas
+        value is None or not math.isfinite(value) or value <= 0
+        for value in table.column("AREA_M2").to_pylist()
     ):
         raise PoiMasterContractError(
             "POI Master AREA_M2는 유한한 양의 실수여야 합니다."
         )
 
+
+def _validate_declared_areas(table: pa.Table) -> None:
+    """GEOMETRY_WKB가 유효한 2D Polygon이고 그 면적이 AREA_M2와 같은지 확인한다."""
     for area_code, geometry_wkb, declared_area in zip(
-        area_codes,
+        table.column("AREA_CD").to_pylist(),
         table.column("GEOMETRY_WKB").to_pylist(),
-        areas,
+        table.column("AREA_M2").to_pylist(),
         strict=True,
     ):
         try:
-            computed_area = _validate_polygon_wkb(geometry_wkb)
+            computed_area = _polygon_area(_parse_polygon_wkb(geometry_wkb))
         except PoiMasterContractError as exc:
             raise PoiMasterContractError(
                 f"POI Master {area_code} GEOMETRY_WKB가 유효한 2D Polygon이 아닙니다."
@@ -493,9 +491,12 @@ def _validate_poi_master_table(table: pa.Table) -> None:
             )
 
 
-def _validate_polygon_wkb(payload: object) -> float:
-    """외부 geometry 의존성 없이 2D Polygon WKB 구조를 검증하고 면적을 반환한다."""
-    if type(payload) is not bytes or len(payload) < 9:
+_Ring = tuple[tuple[float, float], ...]
+
+
+def _parse_polygon_wkb(payload: bytes | None) -> tuple[_Ring, ...]:
+    """외부 geometry 의존성 없이 2D Polygon WKB 구조를 검증하고 ring 좌표를 반환한다."""
+    if payload is None or len(payload) < 9:
         raise PoiMasterContractError("Polygon WKB bytes가 없거나 너무 짧습니다.")
     byte_order = payload[0]
     if byte_order not in {0, 1}:
@@ -509,7 +510,7 @@ def _validate_polygon_wkb(payload: object) -> float:
         raise PoiMasterContractError("Polygon에는 ring이 하나 이상 있어야 합니다.")
 
     offset = 9
-    ring_areas: list[float] = []
+    rings: list[_Ring] = []
     for _ring_index in range(ring_count):
         if offset + 4 > len(payload):
             raise PoiMasterContractError("Polygon ring header가 잘렸습니다.")
@@ -518,16 +519,27 @@ def _validate_polygon_wkb(payload: object) -> float:
         point_bytes = point_count * 16
         if point_count < 4 or offset + point_bytes > len(payload):
             raise PoiMasterContractError("Polygon ring point 수 또는 길이가 잘못됐습니다.")
-        points: list[tuple[float, float]] = []
-        for point_offset in range(offset, offset + point_bytes, 16):
-            point = struct.unpack_from(f"{endian}dd", payload, point_offset)
-            if not all(math.isfinite(coordinate) for coordinate in point):
-                raise PoiMasterContractError("Polygon 좌표는 유한해야 합니다.")
-            points.append(point)
+        points = tuple(
+            struct.unpack_from(f"{endian}dd", payload, point_offset)
+            for point_offset in range(offset, offset + point_bytes, 16)
+        )
+        if not all(math.isfinite(coordinate) for point in points for coordinate in point):
+            raise PoiMasterContractError("Polygon 좌표는 유한해야 합니다.")
         if points[0] != points[-1] or len(set(points[:-1])) < 3:
             raise PoiMasterContractError(
                 "Polygon ring은 닫혀 있고 서로 다른 점이 세 개 이상이어야 합니다."
             )
+        rings.append(points)
+        offset += point_bytes
+    if offset != len(payload):
+        raise PoiMasterContractError("Polygon WKB 뒤에 불필요한 bytes가 있습니다.")
+    return tuple(rings)
+
+
+def _polygon_area(rings: tuple[_Ring, ...]) -> float:
+    """Exterior 면적에서 hole 면적을 뺀 Polygon 면적을 shoelace 공식으로 계산한다."""
+    ring_areas: list[float] = []
+    for points in rings:
         origin_x, origin_y = points[0]
         twice_area = math.fsum(
             (first[0] - origin_x) * (second[1] - origin_y)
@@ -537,9 +549,6 @@ def _validate_polygon_wkb(payload: object) -> float:
         if twice_area == 0:
             raise PoiMasterContractError("Polygon ring 면적은 0보다 커야 합니다.")
         ring_areas.append(abs(twice_area) / 2.0)
-        offset += point_bytes
-    if offset != len(payload):
-        raise PoiMasterContractError("Polygon WKB 뒤에 불필요한 bytes가 있습니다.")
     polygon_area = ring_areas[0] - math.fsum(ring_areas[1:])
     if not math.isfinite(polygon_area) or polygon_area <= 0:
         raise PoiMasterContractError("Polygon의 ring 면적 합계는 0보다 커야 합니다.")
@@ -554,36 +563,14 @@ def _validate_poi_master_topology(table: pa.Table) -> None:
         strict=True,
     ):
         try:
-            rings = _polygon_rings(geometry_wkb)
-            _validate_polygon_rings(rings)
+            _validate_polygon_rings(_parse_polygon_wkb(geometry_wkb))
         except PoiMasterContractError as exc:
             raise PoiMasterContractError(
                 f"POI Master {area_code} Polygon 위상이 유효하지 않습니다."
             ) from exc
 
 
-def _polygon_rings(payload: bytes) -> tuple[tuple[tuple[float, float], ...], ...]:
-    """구조 검증을 통과한 2D Polygon WKB의 ring 좌표를 반환한다."""
-    byte_order = payload[0]
-    endian = "<" if byte_order == 1 else ">"
-    ring_count = struct.unpack_from(f"{endian}I", payload, 5)[0]
-    offset = 9
-    rings: list[tuple[tuple[float, float], ...]] = []
-    for _ring_index in range(ring_count):
-        point_count = struct.unpack_from(f"{endian}I", payload, offset)[0]
-        offset += 4
-        points = tuple(
-            struct.unpack_from(f"{endian}dd", payload, point_offset)
-            for point_offset in range(offset, offset + point_count * 16, 16)
-        )
-        rings.append(points)
-        offset += point_count * 16
-    return tuple(rings)
-
-
-def _validate_polygon_rings(
-    rings: tuple[tuple[tuple[float, float], ...], ...],
-) -> None:
+def _validate_polygon_rings(rings: tuple[_Ring, ...]) -> None:
     """Polygon exterior와 hole이 OGC의 단순 ring·포함 불변식을 지키는지 검사한다."""
     normalized_rings = tuple(
         _collapse_consecutive_points(ring) for ring in rings
@@ -839,8 +826,6 @@ def _read_activation_pointer(key: str) -> PoiMasterActivation:
 
 def _activation_time_from_key(key: str) -> datetime:
     """Canonical activation key에서 UTC 시각을 복원한다."""
-    if type(key) is not str:
-        raise PoiMasterReadError("POI Master activation key는 문자열이어야 합니다.")
     matched = _ACTIVATION_KEY.fullmatch(key)
     if matched is None:
         raise PoiMasterReadError(
@@ -912,8 +897,6 @@ def _validate_poi_manifest_uri(uri: str) -> str:
 
 def _validated_sha256(value: object, label: str) -> str:
     """값을 lowercase SHA-256으로 검증하고 POI 계약 오류로 변환한다."""
-    if type(value) is not str:
-        raise PoiMasterContractError(f"{label}은 문자열이어야 합니다.")
     try:
         return validate_sha256_hex(value)
     except HashFormatError as exc:

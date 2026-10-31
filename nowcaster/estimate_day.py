@@ -117,18 +117,32 @@ def build_nowcast_table(
         추정치 및 추정 방식 메타데이터가 포함된 DataFrame
     """
     n_candidates = len(candidate_frames)
-
-    candidate_prepped = _prep(candidate_frames, "c")
-    extended_prepped = _prep(extended_frames, "e")
-    historical_prepped = _prep([historical_avg_frame] if historical_avg_frame is not None else [], "h")
-
-    all_prepped = candidate_prepped + extended_prepped + historical_prepped
+    n_extended = len(extended_frames)
+    all_prepped = (
+        _prep(candidate_frames, "c")
+        + _prep(extended_frames, "e")
+        + _prep([historical_avg_frame] if historical_avg_frame is not None else [], "h")
+    )
     if not all_prepped:
         return pd.DataFrame(columns=[*KEY_COLS, *VALUE_COLS, "is_estimated", "estimation_method"])
 
     wide = pd.concat(all_prepped, axis=1, join="outer")
+    result = pd.DataFrame(index=wide.index)
+    for col in VALUE_COLS:
+        result[col] = _estimate_column(wide, col, n_candidates, n_extended)
+    result["is_estimated"] = True
+    result["estimation_method"] = _estimation_method(wide, n_candidates)
+    return result.reset_index()
 
-    spop_cand_cols = [f"SPOP__c{i}" for i in range(1, n_candidates + 1) if f"SPOP__c{i}" in wide.columns]
+
+def _present(wide: pd.DataFrame, col: str, tag: str, count: int) -> list[str]:
+    """`{col}__{tag}{i}` 중 실제로 있는 컬럼을 순번 순으로 반환한다."""
+    return [f"{col}__{tag}{i}" for i in range(1, count + 1) if f"{col}__{tag}{i}" in wide.columns]
+
+
+def _estimation_method(wide: pd.DataFrame, n_candidates: int) -> pd.Series:
+    """SPOP 기준으로 격자·시간대마다 어느 추정 단계가 쓰였는지 판정한다."""
+    spop_cand_cols = _present(wide, "SPOP", "c", n_candidates)
     if spop_cand_cols:
         count_valid = wide[spop_cand_cols].notna().sum(axis=1)
     else:
@@ -140,42 +154,35 @@ def build_nowcast_table(
     method[(count_valid > 1) & (count_valid < n_candidates)] = "reweighted_avg"
     need_fallback = count_valid == 0
 
-    ext_prefix_cols = [c for c in wide.columns if "__e" in c]
-    if need_fallback.any() and ext_prefix_cols:
-        spop_ext_cols = [c for c in ext_prefix_cols if c.startswith("SPOP__e")]
-        if spop_ext_cols:
-            has_ext = wide.loc[need_fallback, spop_ext_cols].notna().any(axis=1)
-            method.loc[has_ext[has_ext].index] = "extended_lookback_fallback"
-            need_fallback.loc[has_ext[has_ext].index] = False
+    spop_ext_cols = [c for c in wide.columns if c.startswith("SPOP__e")]
+    if need_fallback.any() and spop_ext_cols:
+        has_ext = wide.loc[need_fallback, spop_ext_cols].notna().any(axis=1)
+        method.loc[has_ext[has_ext].index] = "extended_lookback_fallback"
+        need_fallback.loc[has_ext[has_ext].index] = False
 
     if need_fallback.any() and "SPOP__h1" in wide.columns:
         has_hist = wide.loc[need_fallback, "SPOP__h1"].notna()
         method.loc[has_hist[has_hist].index] = "grid_historical_avg"
+    return method
 
-    result = pd.DataFrame(index=wide.index)
-    for col in VALUE_COLS:
-        cand_cols = [f"{col}__c{i}" for i in range(1, n_candidates + 1) if f"{col}__c{i}" in wide.columns]
-        if cand_cols:
-            week_weights = np.array([_WEIGHTS[int(c.rsplit("__c", 1)[1])] for c in cand_cols])
-            cand_values = wide[cand_cols]
-            valid = cand_values.notna()
-            weight_sum = (valid * week_weights).sum(axis=1)
-            weighted_sum = (cand_values.fillna(0.0) * week_weights).sum(axis=1)
-            value = weighted_sum / weight_sum.where(weight_sum > 0)
-        else:
-            value = pd.Series(np.nan, index=wide.index)
 
-        ext_cols = [f"{col}__e{i}" for i in range(1, len(extended_frames) + 1) if f"{col}__e{i}" in wide.columns]
-        if ext_cols:
-            ext_value = wide[ext_cols].bfill(axis=1).iloc[:, 0]
-            value = value.where(value.notna(), ext_value)
+def _estimate_column(wide: pd.DataFrame, col: str, n_candidates: int, n_extended: int) -> pd.Series:
+    """한 값 컬럼을 후보 가중평균 → 확장 주차 → 과거 평균 → 0 순으로 채운다."""
+    cand_cols = _present(wide, col, "c", n_candidates)
+    if cand_cols:
+        week_weights = np.array([_WEIGHTS[int(c.rsplit("__c", 1)[1])] for c in cand_cols])
+        cand_values = wide[cand_cols]
+        weight_sum = (cand_values.notna() * week_weights).sum(axis=1)
+        weighted_sum = (cand_values.fillna(0.0) * week_weights).sum(axis=1)
+        value = weighted_sum / weight_sum.where(weight_sum > 0)
+    else:
+        value = pd.Series(np.nan, index=wide.index)
 
-        hist_col = f"{col}__h1"
-        if hist_col in wide.columns:
-            value = value.where(value.notna(), wide[hist_col])
+    ext_cols = _present(wide, col, "e", n_extended)
+    if ext_cols:
+        value = value.where(value.notna(), wide[ext_cols].bfill(axis=1).iloc[:, 0])
 
-        result[col] = value.fillna(0.0)
-
-    result["is_estimated"] = True
-    result["estimation_method"] = method
-    return result.reset_index()
+    hist_col = f"{col}__h1"
+    if hist_col in wide.columns:
+        value = value.where(value.notna(), wide[hist_col])
+    return value.fillna(0.0)

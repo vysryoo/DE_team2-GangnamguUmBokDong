@@ -1,40 +1,12 @@
-"""CLI 진입점으로 과거 데이터를 archive에 한 번 적재한다.
-
-## 실행 방법
+"""과거 데이터를 archive에 한 번 적재하는 수동 실행 CLI다.
 
     cd collector
     uv run --frozen python -m bootstrap --source bike_rental_history \
-        --from 2025-01-01 --to 2025-12-31 --csv-dir ../data \
-        --csv-batch-by-month
-    uv run --frozen python -m bootstrap --source bike_station_realtime \
-        --from 2025-12-01 --to 2025-12-31 --csv-dir ../data
+        --from 2025-01-01 --to 2025-12-31 --csv-dir ../data --csv-batch-by-month
 
-`bike_station_realtime`은 대여소 매핑표를 만들기 위해 `--csv-dir`에서 대여이력 CSV도
-찾는다(`station_join` 참고). 두 CSV를 같은 디렉터리에 두면 커버리지가 가장 높다.
-
-Airflow가 부르지 않는 수동 작업이라 태스크 빌더를 만들지 않는다.
-
-## 재개
-
-이미 archive가 있는 날짜는 건너뛴다. 상태 파일을 두지 않는다 — 날짜 단위로
-원자적이라(한 날짜를 다 만든 뒤 쓴다) 중단 시 그 날짜는 아예 안 써지고 다음 실행이
-다시 만든다. `--force`로 무시한다.
-
-1년치 대여·재고 CSV는 `--csv-batch-by-month`를 사용한다. 파일 내부 10만 행 청크와
-별개로, 이 옵션은 날짜별 Arrow 결과를 한 달 적재 후 해제해 전체 연도가 메모리에
-동시에 남는 것을 막는다. Join 소스의 대여소 매핑은 월 배치 밖에서 한 번만 만든다.
-
-## 종료 코드
-
-실패한 날짜가 하나라도 있으면 non-zero다. 재개가 archive 존재 기반이라 다시 돌리면
-실패한 날짜만 재시도된다.
-
-## 연속 실패 중단
-
-`kind=history_api`에서 날짜가 연속으로 `_MAX_CONSECUTIVE_FAILURES`번 실패하면 남은
-날짜는 시도하지 않고 중단한다. 인증키 오류·쿼터 소진 상황에서 나머지 범위 전체에
-확정적으로 실패할 호출을 계속 날리는 것을 막기 위해서다. 중단 시 요약에
-`aborted=true`가 붙는다. 중간에 성공이 한 번이라도 있으면 카운터가 리셋된다.
+이미 archive가 있는 날짜는 건너뛰고(`--force`로 무시), 실패한 날짜가 있으면 non-zero로
+끝난다. 날짜 단위로 다 만든 뒤 쓰므로 다시 실행하면 실패한 날짜만 재시도된다.
+`bike_station_realtime`은 대여소 매핑표용 대여이력 CSV도 `--csv-dir`에서 찾는다.
 """
 
 from __future__ import annotations
@@ -42,6 +14,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from collections import Counter
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -54,11 +27,8 @@ from logging_setup import configure_batch_logging
 
 logger = logging.getLogger(__name__)
 
-# 연속으로 이만큼 날짜가 실패하면 나머지는 시도하지 않고 중단한다. 인증키 오류나
-# 일일 쿼터 소진처럼 "설정 자체가 잘못됐다"는 신호와, 일시적 네트워크 장애로 몇
-# 개 날짜만 실패하는 것을 가르는 값이다. 3년 범위(약 1,095일)를 통째로 도는 작업이
-# 있으므로 너무 크면 확정적 실패에 수만 번 헛호출하게 되고, 너무 작으면 흔한 일시적
-# 장애에도 작업 전체가 중단된다 — 5 정도가 그 사이의 합리적인 선이다.
+# history_api에서 연속 실패가 이만큼이면 인증키 오류·쿼터 소진으로 보고 남은 날짜를 중단함.
+# 일시적 장애로 몇 날짜만 실패하는 경우와 구분하는 값
 _MAX_CONSECUTIVE_FAILURES = 5
 
 
@@ -104,21 +74,104 @@ def exit_code_for(results: list[runner.DateResult]) -> int:
 def _csv_day_batches(days: list[date], batch_by_month: bool) -> list[list[date]]:
     """CSV 날짜를 전체 한 묶음 또는 달력 월별 묶음으로 반환한다.
 
-    월별 모드는 파일 하나를 읽는 동안 생성한 날짜별 Arrow table이 다음 달 처리 전에
-    해제될 수 있게 한다. 대여소 매핑은 호출부가 배치 밖에서 한 번만 생성하므로 API와
-    대여 이력 스캔을 달마다 반복하지 않는다.
+    월별 모드는 날짜별 Arrow table을 다음 달 처리 전에 해제해 1년치가 메모리에 동시에
+    남지 않게 한다.
     """
     if not days or not batch_by_month:
         return [days]
     batches: list[list[date]] = []
     for day in days:
-        if not batches or (batches[-1][0].year, batches[-1][0].month) != (
-            day.year,
-            day.month,
-        ):
+        if not batches or (batches[-1][0].year, batches[-1][0].month) != (day.year, day.month):
             batches.append([])
         batches[-1].append(day)
     return batches
+
+
+def _csv_dir(args: argparse.Namespace) -> Path:
+    """`--csv-dir`를 검증해 경로로 반환한다."""
+    if not args.csv_dir:
+        raise SystemExit("kind=csv 소스에는 --csv-dir가 필요하다")
+    csv_dir = Path(args.csv_dir)
+    if not csv_dir.exists() or not csv_dir.is_dir():
+        raise SystemExit(f"--csv-dir 경로가 없거나 디렉터리가 아니다: {csv_dir}")
+    if not any(csv_dir.glob("*.csv")):
+        logger.warning(
+            f"stage=bootstrap source={args.source} csv_dir={csv_dir} "
+            "csv 파일을 하나도 찾지 못했다"
+        )
+    return csv_dir
+
+
+def _load_csv_days(args, scfg, bcfg, days: list[date]) -> list[runner.DateResult]:
+    """CSV를 배치마다 한 번만 읽어 날짜별로 적재한다."""
+    csv_dir = _csv_dir(args)
+    # 매핑표는 API를 여러 번 부르므로 월 배치 밖에서 범위 전체에 한 번만 만든다.
+    station_map = station_join.build(csv_dir) if bcfg.join else None
+    station_map_stats = station_map.stats if station_map else None
+    day_batches = _csv_day_batches(days, args.csv_batch_by_month)
+    results: list[runner.DateResult] = []
+    for batch_number, day_batch in enumerate(day_batches, start=1):
+        if args.csv_batch_by_month:
+            logger.info(
+                f"stage=bootstrap_csv source={args.source} batch={batch_number}/"
+                f"{len(day_batches)} month={day_batch[0]:%Y-%m} days={len(day_batch)}"
+            )
+        by_date = csv_source.read_by_date(bcfg, csv_dir, set(day_batch), station_map)
+        for day in day_batch:
+            table = by_date.get(day)
+            results.append(
+                runner.load_date(
+                    scfg,
+                    bcfg,
+                    day,
+                    table.to_pylist() if table is not None else [],
+                    force=args.force,
+                    station_map_stats=station_map_stats,
+                    materialize_empty=args.materialize_empty_archive,
+                )
+            )
+    return results
+
+
+def _load_api_days(args, scfg, bcfg, days: list[date]) -> tuple[list[runner.DateResult], bool]:
+    """날짜별로 API를 조회해 적재하고, 연속 실패가 한도에 닿으면 중단한다."""
+    results: list[runner.DateResult] = []
+    consecutive_failures = 0
+    with httpx.Client(timeout=60.0) as client:
+        for day in days:
+            try:
+                rows = api_source.fetch_by_date(
+                    bcfg, day, client=client, concurrency=args.concurrency
+                )
+            except api_source.FetchFailed as exc:
+                results.append(runner.DateResult(day=day, status="failed", error=str(exc)))
+                consecutive_failures += 1
+                if consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
+                    logger.error(
+                        f"stage=bootstrap source={args.source} "
+                        f"연속 {consecutive_failures}회 실패해 중단한다. "
+                        f"남은 {len(days) - len(results)}개 날짜는 시도하지 않았다"
+                    )
+                    return results, True
+                continue
+            consecutive_failures = 0
+            results.append(runner.load_date(scfg, bcfg, day, rows, force=args.force))
+    return results, False
+
+
+def _summary(source: str, days: list[date], results: list[runner.DateResult], aborted: bool) -> str:
+    """실행 요약 한 줄을 만든다."""
+    tally = Counter(result.status for result in results)
+    statuses = " ".join(f"{status}={count}" for status, count in sorted(tally.items()))
+    overlapped = sum(1 for r in results if r.silver_present)
+    dropped_total = sum(r.dropped or 0 for r in results)
+    out_of_range_total = sum(r.out_of_range for r in results)
+    out_of_range_note = f" out_of_range={out_of_range_total}" if out_of_range_total else ""
+    abort_note = " aborted=true" if aborted else ""
+    return (
+        f"source={source} dates={len(days)} {statuses} "
+        f"silver_overlap={overlapped} dropped={dropped_total}{out_of_range_note}{abort_note}"
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -129,90 +182,11 @@ def main(argv: list[str] | None = None) -> int:
     scfg = config_loader.load(args.source)
     bcfg = bootstrap_config.load(args.source)
     days = resolve_dates(args)
-
-    results: list[runner.DateResult] = []
-    aborted = False
     if bcfg.kind == "csv":
-        if not args.csv_dir:
-            raise SystemExit("kind=csv 소스에는 --csv-dir가 필요하다")
-        csv_dir = Path(args.csv_dir)
-        if not csv_dir.exists() or not csv_dir.is_dir():
-            raise SystemExit(f"--csv-dir 경로가 없거나 디렉터리가 아니다: {csv_dir}")
-        if not any(csv_dir.glob("*.csv")):
-            logger.warning(
-                f"stage=bootstrap source={args.source} csv_dir={csv_dir} "
-                "csv 파일을 하나도 찾지 못했다"
-            )
-        # 매핑표는 API를 여러 번 부르므로 범위 전체에 대해 한 번만 만든다.
-        station_map = station_join.build(csv_dir) if bcfg.join else None
-        station_map_stats = station_map.stats if station_map else None
-        day_batches = _csv_day_batches(days, args.csv_batch_by_month)
-        for batch_number, day_batch in enumerate(day_batches, start=1):
-            if args.csv_batch_by_month:
-                logger.info(
-                    f"stage=bootstrap_csv source={args.source} batch={batch_number}/"
-                    f"{len(day_batches)} month={day_batch[0]:%Y-%m} days={len(day_batch)}"
-                )
-            by_date = csv_source.read_by_date(
-                bcfg, csv_dir, set(day_batch), station_map
-            )
-            for day in day_batch:
-                table = by_date.get(day)
-                rows = table.to_pylist() if table is not None else []
-                empty_options = (
-                    {"materialize_empty": True}
-                    if args.materialize_empty_archive
-                    else {}
-                )
-                results.append(
-                    runner.load_date(
-                        scfg,
-                        bcfg,
-                        day,
-                        rows,
-                        force=args.force,
-                        station_map_stats=station_map_stats,
-                        **empty_options,
-                    )
-                )
+        results, aborted = _load_csv_days(args, scfg, bcfg, days), False
     else:
-        consecutive_failures = 0
-        with httpx.Client(timeout=60.0) as client:
-            for day in days:
-                try:
-                    rows = api_source.fetch_by_date(
-                        bcfg, day, client=client, concurrency=args.concurrency
-                    )
-                except api_source.FetchFailed as exc:
-                    results.append(runner.DateResult(day=day, status="failed", error=str(exc)))
-                    consecutive_failures += 1
-                    if consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
-                        remaining = len(days) - len(results)
-                        logger.error(
-                            f"stage=bootstrap source={args.source} "
-                            f"연속 {consecutive_failures}회 실패해 중단한다. "
-                            f"남은 {remaining}개 날짜는 시도하지 않았다"
-                        )
-                        aborted = True
-                        break
-                    continue
-                consecutive_failures = 0
-                results.append(runner.load_date(scfg, bcfg, day, rows, force=args.force))
-
-    tally: dict[str, int] = {}
-    for result in results:
-        tally[result.status] = tally.get(result.status, 0) + 1
-    summary = " ".join(f"{status}={count}" for status, count in sorted(tally.items()))
-    overlapped = sum(1 for r in results if r.silver_present)
-    dropped_total = sum(r.dropped or 0 for r in results)
-    out_of_range_total = sum(r.out_of_range for r in results)
-    abort_note = " aborted=true" if aborted else ""
-    out_of_range_note = f" out_of_range={out_of_range_total}" if out_of_range_total else ""
-    print(
-        f"source={args.source} dates={len(days)} {summary} "
-        f"silver_overlap={overlapped} dropped={dropped_total}{out_of_range_note}{abort_note}"
-    )
-
+        results, aborted = _load_api_days(args, scfg, bcfg, days)
+    print(_summary(args.source, days, results, aborted))
     return exit_code_for(results)
 
 
