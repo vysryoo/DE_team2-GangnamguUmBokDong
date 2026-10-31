@@ -176,17 +176,7 @@ def build(csv_dir: Path | None, *, client: httpx.Client | None = None) -> Statio
         if owned:
             client.close()
 
-    by_name: dict[str, StationInfo] = {}
-    by_number: dict[str, StationInfo] = {}
-    for row in api_rows:
-        name = str(row.get("stationName") or "")
-        info = _info_from_api(row)
-        if name:
-            by_name[name] = info
-        prefix = _NAME_PREFIX.match(name)
-        if prefix:
-            by_number[_pad(prefix.group(1))] = info
-
+    by_name, by_number = _index_api_rows(api_rows)
     history, conflicts = _read_history_ids(csv_dir) if csv_dir is not None else ({}, [])
     for number, station_id in history.items():
         # API가 이긴다 — 그쪽만 5개 컬럼을 모두 채운다.
@@ -199,10 +189,36 @@ def build(csv_dir: Path | None, *, client: httpx.Client | None = None) -> Statio
         "history_id_conflicts": len(conflicts),
         "history_id_conflict_sample": conflicts[:_MAX_CONFLICT_SAMPLE],
     }
+    station_map = StationMap(by_name=by_name, by_number=by_number, stats=stats)
+    _log_build(station_map, conflicts)
+    return station_map
+
+
+def _index_api_rows(
+    api_rows: list[dict],
+) -> tuple[dict[str, StationInfo], dict[str, StationInfo]]:
+    """API 대여소를 이름과 이름 앞의 대여소번호로 색인한다."""
+    by_name: dict[str, StationInfo] = {}
+    by_number: dict[str, StationInfo] = {}
+    for row in api_rows:
+        name = str(row.get("stationName") or "")
+        info = _info_from_api(row)
+        if name:
+            by_name[name] = info
+        prefix = _NAME_PREFIX.match(name)
+        if prefix:
+            by_number[_pad(prefix.group(1))] = info
+    return by_name, by_number
+
+
+def _log_build(station_map: StationMap, conflicts: list[str]) -> None:
+    """매핑표 출처별 건수와 대여소번호 충돌을 로그로 남긴다."""
+    stats = station_map.stats
     logger.info(
         f"stage=bootstrap_station_join api_stations={stats['api_stations']} "
-        f"history_stations={stats['history_stations']} by_name={len(by_name)} "
-        f"by_number={len(by_number)} history_id_conflicts={stats['history_id_conflicts']}"
+        f"history_stations={stats['history_stations']} by_name={len(station_map.by_name)} "
+        f"by_number={len(station_map.by_number)} "
+        f"history_id_conflicts={stats['history_id_conflicts']}"
     )
     if conflicts:
         logger.warning(
@@ -210,4 +226,3 @@ def build(csv_dir: Path | None, *, client: httpx.Client | None = None) -> Statio
             f"count={len(conflicts)} sample={stats['history_id_conflict_sample']} "
             "— 최신 기간의 id를 채택했다"
         )
-    return StationMap(by_name=by_name, by_number=by_number, stats=stats)
