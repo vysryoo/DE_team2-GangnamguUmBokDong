@@ -38,9 +38,7 @@ def test_monthly_retrain_runs_rental_fully_before_return_starts() -> None:
 
 
 def test_start_stop_mlflow_wrap_the_whole_dag() -> None:
-    """mlflow는 DAG 실행 구간에만 켜져 있어야 한다 — 클러스터 생성 전에 켜고,
-    클러스터 종료 뒤에 끈다. stop_mlflow는 teardown이어야 운영자가 DAG Run을 수동으로
-    실패 처리해도 실행된다."""
+    """mlflow는 클러스터 생성 전에 켜고 종료 뒤에 끄며, stop은 teardown이다."""
     start_mlflow = _DAG.get_task("start_mlflow")
     stop_mlflow = _DAG.get_task("stop_mlflow")
     assert start_mlflow.downstream_task_ids == {"create_cluster", "stop_mlflow"}
@@ -49,20 +47,13 @@ def test_start_stop_mlflow_wrap_the_whole_dag() -> None:
 
 
 def test_monthly_retrain_total_timeout_covers_both_models_sequentially() -> None:
-    """두 모델을 순차 실행하므로 전체 DAG Run 타임아웃은 모델 하나 몫(120시간)의
-    2배(240시간)로 잡아야 한다 — 반납이 대여 완료를 기다리다 총 타임아웃에
-    걸리면 안 되므로."""
+    """두 모델을 순차 실행하므로 전체 timeout은 모델 하나 몫의 2배다."""
     assert _DAG.dagrun_timeout == timedelta(hours=240)
     assert _DAG.dagrun_timeout >= 2 * monthly_dag.MONTHLY_RETRAIN_ORCHESTRATION_TIMEOUT
 
 
 def test_monthly_retrain_terminate_cluster_is_a_real_teardown() -> None:
-    """EMR 클러스터 종료 태스크는 trigger_rule=ALL_DONE만으로는 부족하다 —
-    운영자가 DAG Run 전체를 수동으로 "Mark Failed" 처리하면 Airflow는 아직 실행
-    안 된 일반 태스크를 trigger_rule 평가 없이 그냥 SKIPPED로 강제 전환하고
-    끝내버린다(Airflow 3.3.1 `_set_dag_run_terminal_state()` 실측 확인). 오직
-    `is_teardown=True`인 태스크만 이 강제 skip에서 예외로 남아 실제로 실행될
-    기회를 얻으므로, setup/teardown API로 표시돼 있는지까지 확인해야 한다."""
+    """DAG run을 수동으로 실패 처리하면 일반 태스크는 강제 skip되므로 클러스터 종료는 teardown이어야 한다."""
     terminate_cluster = _DAG.get_task("terminate_cluster")
     create_cluster = _DAG.get_task("create_cluster")
     assert terminate_cluster.is_teardown is True
@@ -72,12 +63,7 @@ def test_monthly_retrain_terminate_cluster_is_a_real_teardown() -> None:
 
 
 def test_monthly_retrain_evaluate_is_not_a_setup() -> None:
-    """`evaluate`가 teardown의 setup에 같이 들어가면 안 된다 — 평가 스텝이
-    EMR 쪽에서 멈추거나 실패해도(RUNNING에서 안 끝남 등) "클러스터 생성은
-    성공했다"는 사실만으로 `terminate_cluster`가 반드시 실행돼야 한다(PR 리뷰
-    지적, 2026-08). evaluate까지 setup에 포함되면 evaluate가 실패하는 순간
-    teardown 조건(ALL_DONE_SETUP_SUCCESS)을 못 만족해 클러스터가 orphan으로
-    남는다."""
+    """evaluate가 setup이면 평가 실패 시 teardown 조건을 못 채워 클러스터가 남는다."""
     for model_name in ("rental", "return"):
         evaluate = _DAG.get_task(f"evaluate_{model_name}")
         assert evaluate.is_setup is False
@@ -125,9 +111,7 @@ def test_create_cluster_pushes_cluster_id(monkeypatch) -> None:
 
 
 def test_champion_profile_name_reads_pointer_then_profile_json(monkeypatch) -> None:
-    """챔피언 포인터의 archive_prefix를 따라가 그 안의 {model}_profile.json에서
-    profile_name을 읽는다 — training.scripts.monthly_retrain_check의 같은 이름
-    함수와 같은 S3 키 형식을 airflow venv에서 boto3만으로 재현한 것."""
+    """챔피언 포인터의 archive_prefix를 따라가 `{model}_profile.json`의 profile_name을 읽는다."""
     reads = {}
 
     def fake_read_s3_json(key):
@@ -150,8 +134,7 @@ def test_champion_profile_name_none_when_no_champion_yet(monkeypatch) -> None:
 
 
 def test_refresh_feature_mart_submits_feature_mart_steps_for_champion_profile(monkeypatch) -> None:
-    """create_cluster가 남긴 cluster_id 위에, 챔피언이 실제로 학습된 프로필로
-    feature mart 스텝(run_pipeline + build_multi_horizon)을 제출해야 한다."""
+    """챔피언 프로필로 run_pipeline과 build_multi_horizon 스텝을 제출한다."""
     mock_ti = MagicMock()
     mock_ti.xcom_pull.return_value = "j-created"
     monkeypatch.setattr(monthly_dag, "_champion_profile_name", lambda model_name: "leaves127")
@@ -173,10 +156,7 @@ def test_refresh_feature_mart_submits_feature_mart_steps_for_champion_profile(mo
 
 
 def test_refresh_feature_mart_waits_for_yarn_nodes_before_spark_steps(monkeypatch) -> None:
-    """클러스터가 막 WAITING이 된 직후 YARN이 AM 등록을 받을 준비가 안 됐을 수
-    있어(실제 EMR 실행에서 재현, 2026-08-25 — 서로 다른 두 클러스터에서 첫
-    스텝의 AM이 등록 타임아웃으로 죽었다), 첫 Spark 스텝 전에 반드시
-    Wait-YARN-Nodes로 대기해야 한다."""
+    """WAITING 직후에는 YARN이 AM 등록을 받지 못할 수 있어 첫 Spark 스텝 전에 노드를 기다린다."""
     mock_ti = MagicMock()
     mock_ti.xcom_pull.return_value = "j-created"
     monkeypatch.setattr(monthly_dag, "_champion_profile_name", lambda model_name: "leaves127")
@@ -244,10 +224,7 @@ def test_refresh_feature_mart_skips_champion_build_when_test_profile_only(monkey
 
 
 def test_refresh_feature_mart_gives_wait_for_yarn_nodes_a_short_timeout(monkeypatch) -> None:
-    """submit_emr_step()의 기본 90분 타임아웃을 그대로 물려받으면, Wait-YARN-Nodes +
-    RunPipeline + BuildMultiHorizon 세 스텝이 각각 90분씩 써서 최악 270분이 되어
-    MONTHLY_FEATURE_REFRESH_TIMEOUT(4시간)을 넘길 수 있다(PR #248 리뷰 지적) —
-    이 대기는 원래 1분 안에 끝나야 하므로 훨씬 짧은 타임아웃을 명시해야 한다."""
+    """YARN 노드 대기는 스텝 기본 timeout 대신 짧은 상한을 써서 피처마트 갱신 전체 timeout을 넘기지 않는다."""
     mock_ti = MagicMock()
     mock_ti.xcom_pull.return_value = "j-created"
     captured_timeouts = {}
@@ -264,11 +241,7 @@ def test_refresh_feature_mart_gives_wait_for_yarn_nodes_a_short_timeout(monkeypa
 
 
 def test_evaluate_uses_same_profile_refresh_feature_mart_just_built(monkeypatch) -> None:
-    """refresh_feature_mart가 챔피언 프로필로 feature mart를 갱신해도, evaluate가
-    ML_PROFILE 없이(=기본 builtin-default 경로로) 읽으면 챔피언 프로필의 w/e/t가
-    기본값과 다를 때 방금 갱신한 데이터를 못 보거나 없는 테이블을 본다(PR #248
-    리뷰 지적) — refresh_feature_mart가 xcom에 남긴 profile을 evaluate가 그대로
-    받아써야 한다."""
+    """evaluate는 refresh_feature_mart가 XCom에 남긴 프로필로 방금 갱신한 피처마트를 읽는다."""
     mock_ti = MagicMock()
     mock_ti.xcom_pull.side_effect = lambda task_ids, key: {
         "cluster_id": "j-created",
@@ -376,10 +349,7 @@ def test_resolve_wrapper_worker_count_boundary_values(core_count, expected_worke
 
 @pytest.mark.parametrize("core_count", [1, 2, 3])
 def test_resolve_wrapper_worker_count_rejects_too_small_core_count(core_count) -> None:
-    """core_count가 예약분(3) 이하면 outer AM/워커/inner AM 최악 배치만으로
-    이미 모든 노드가 차서 inner 워커를 하나도 못 띄운다 — `max(..., 1)`로
-    조용히 1로 내림 처리하면 barrier가 10분 타임아웃나는 것으로만 뒤늦게
-    드러나므로 즉시 실패해야 한다(PR #248 리뷰 지적, 2026-08-26)."""
+    """core 노드가 wrapper 예약분 이하이면 학습 워커가 남지 않으므로 즉시 실패한다."""
     with pytest.raises(ValueError, match="너무 작습니다"):
         monthly_dag._resolve_wrapper_worker_count(core_count)
 
@@ -591,12 +561,7 @@ def test_stop_mlflow_does_not_raise_when_docker_action_fails(monkeypatch) -> Non
 
 
 def test_feature_mart_spark_steps_use_runpy_launcher_not_raw_script_path() -> None:
-    """run_pipeline.py/build_multi_horizon_features.py는 패키지 내부 상대 import를
-    쓴다 — spark-submit에 파일 경로를 그대로 넘기면 `__main__`으로 실행돼
-    "attempted relative import with no known parent package"로 즉시 죽는다(PR
-    리뷰 지적, 2026-08 — 최초 구현은 디버그 클러스터에서만 이 fix를 검증하고 실제
-    코드에는 반영하지 않는 실수를 했다). `python -m`과 동등한 `runpy.run_module()`
-    launcher를 통해서만 제출해야 한다."""
+    """패키지 상대 import를 쓰는 스크립트라 파일 경로 대신 runpy launcher로 제출한다."""
     run_pipeline_step, multi_horizon_step = monthly_dag._feature_mart_spark_steps("some-profile")
 
     for _name, command in (run_pipeline_step, multi_horizon_step):
@@ -619,10 +584,7 @@ def test_feature_mart_spark_steps_use_runpy_launcher_not_raw_script_path() -> No
 
 
 def test_feature_mart_spark_steps_num_executors_scales_with_core_count() -> None:
-    """`--num-executors`가 기본값(피처마트 단계 노드 수)에 하드코딩돼 있으면,
-    재학습 루프처럼 이미 학습용(더 많은) 노드 수로 떠 있는 클러스터 위에서
-    같은 함수를 재사용할 때 나머지 노드가 논다(PR #248 리뷰 지적) — 실제
-    돌 클러스터의 core 노드 수를 받아 그에 맞춰 병렬도를 잡아야 한다."""
+    """`--num-executors`는 실제 클러스터 core 노드 수를 따라간다."""
     default_step, _ = monthly_dag._feature_mart_spark_steps("some-profile")
     scaled_step, _ = monthly_dag._feature_mart_spark_steps("some-profile", core_instance_count=8)
 
@@ -631,14 +593,7 @@ def test_feature_mart_spark_steps_num_executors_scales_with_core_count() -> None
 
 
 def test_yarn_python_module_step_wraps_in_distributed_shell_with_small_am_heap() -> None:
-    """평가/학습 오케스트레이터(`training.scripts.monthly_retrain_check`)를 master
-    노드에 bare bash 스텝으로 직접 올렸다가 master의 EMR 자체 데몬 메모리 압박으로
-    OOM(exitCode 137)이 났다. YARN distributed-shell로 옮겨보니 처음엔 그 예제
-    jar 자체가 "JNI error"로 죽었는데, 나중에 실제 분산학습 워커로 격리 재현해보니
-    Java 17 비호환이 아니라 그냥 기본 100MB AM 힙 부족이었다(둘 다 실제 EMR
-    실행에서 확인, 2026-08-26). `-master_memory`/`-master_vcores`를 명시하면
-    정상 동작한다 — spark-submit으로 우회했던 중간 단계(더미 SparkSession, JVM
-    힙/overhead 계산, dynamic allocation 문제)는 전부 필요 없어졌다."""
+    """master OOM을 피해 YARN distributed-shell로 실행하고, 기본 AM 힙이 부족하므로 명시한다."""
     name, command = monthly_dag._yarn_python_module_step(
         "Evaluate-rental",
         "training.scripts.monthly_retrain_check",
