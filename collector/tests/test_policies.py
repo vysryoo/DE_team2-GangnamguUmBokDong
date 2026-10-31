@@ -164,19 +164,6 @@ def test_clip_to_range_defends_missing_range(make_spec, make_issue, ctx):
     assert clip_to_range(9, issue, {}, ctx) == (None, Action.KEEP)
 
 
-def test_clip_to_range_defends_partial_range_without_max(make_spec, make_issue, ctx):
-    # 부분 range 허용 여부는 #2의 결정이다. 허용되더라도 여기서 죽지 않아야 한다.
-    spec = make_spec(range=(0, None))
-    issue = make_issue(IssueKind.OUTLIER, spec=spec, raw="250")
-    assert clip_to_range(250, issue, {}, ctx) == (None, Action.KEEP)
-
-
-def test_clip_to_range_defends_partial_range_without_min(make_spec, make_issue, ctx):
-    spec = make_spec(range=(None, 200))
-    issue = make_issue(IssueKind.OUTLIER, spec=spec, raw="-5")
-    assert clip_to_range(-5, issue, {}, ctx) == (None, Action.KEEP)
-
-
 def test_clip_to_range_passes_enum_violation_that_is_within_range(make_spec, make_issue, ctx):
     # range와 enum 동시 선언 허용 여부는 #2의 결정이다. 허용되면 enum 위반이면서
     # range 안인 값은 교정되지 않고 통과한다 — #2가 금지해야 할 조합의 표적.

@@ -1,53 +1,37 @@
-"""CLI 진입점 — 인자 파싱 후 pipeline을 호출한다.
+"""collector CLI 진입점.
 
     cd collector
     uv run python main.py --source bike_station_realtime \
-        --window-start 2026-08-12T23:10:00+09:00 [--force] [--backfill]
+        --window-start 2026-08-12T23:10:00+09:00 [--force]
 
-Airflow는 소스별 태스크에서 논리 시각을 KST로 변환해 `--window-start`로 넘긴다.
-일반 재실행은 manifest가 가리키는 기존 Bronze를 재사용한다.
-현재 범용 Backfill DAG는 없으며, `--backfill`과 대상 조회 옵션은 legacy 코드
-호환용으로만 유지한다. 운영 설정은 예전 retry marker를 발견하지 않는다.
-`window_end`는 config의 `schedule.interval`로 계산하며, collector 자체는 스케줄을
-모른다.
+모드:
 
-`--force`와 `--backfill`은 목적이 반대라 함께 줄 수 없다(오류로 막는다).
+| 인자 | 동작 |
+| --- | --- |
+| `--window-start` | window 하나 수집. `--force`면 새 Hot Bronze revision에 전체 재수집 |
+| `--check-due-after-seconds N` | freshness gate 판정 JSON 출력 |
+| `--report-window-stats --window-day [--window-hour]` | 수집 통계 JSON 출력 |
 
-| 플래그 | 의미 | bronze |
-| --- | --- | --- |
-| `--force` | 재개 분기를 무시하고 처음부터 다시 | 새 Hot Bronze revision에 전체 재수집 |
-| `--backfill` | 완결된 window의 누락 조각만 채움 | 기존 조각 유지, 빠진 것만 호출 |
-
-종료 코드는 `SUCCEEDED`·`PARTIAL`·`EMPTY`·`SKIPPED`가 0, `FAILED`가 non-zero다.
-누락이 있어도 source별 허용 게이트를 통과했으면 `PARTIAL`(0)로 downstream task를
-스케줄한다. PARTIAL Silver의 실제 사용 여부는 소비자별 정책이다. 누락 허용치를
-초과하면 `FAILED/fetch_error`가 되며, 이를 포함한 모든 `FAILED`와 처리되지 않은 예외는
-non-zero로 Airflow retry 대상이다.
-
-주의:
-- 스택 트레이스를 그대로 뱉지 않는다. 실패는 manifest에 남기고 정리된 메시지와
-  종료 코드로 전달한다.
-- 인증키를 인자로 받지 않는다. 키는 환경변수(`SEOUL_OPENAPI_KEY`, `KMA_APIHUB_KEY`)
-  에서만 읽는다.
+수집 모드의 종료 코드는 `SUCCEEDED`·`PARTIAL`·`EMPTY`·`SKIPPED`가 0, `FAILED`가
+non-zero다. 인증키는 인자로 받지 않고 환경변수(`SEOUL_OPENAPI_KEY`, `KMA_APIHUB_KEY`)
+에서만 읽는다.
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
-import re
+import json
 import sys
-from datetime import datetime
+from datetime import date, datetime
 
 import adapters  # noqa: F401 (어댑터 레지스트리 로드용)
 import config.loader as config_loader
 import httpx
 import manifest as manifest_module
 import pipeline
-
-# pyrefly: ignore [missing-import]
-import pyarrow as pa
 import storage
+from adapters.kma_apihub import adjust_base_time
 from config.schema import SourceConfig
 from core.kst import KST, parse_kst_datetime
 from core.poi_master import PoiMasterRef, read_poi_master
@@ -56,40 +40,21 @@ from logging_setup import configure_httpx_request_logging, configure_logging
 from manifest import RunStatus
 
 _OK_STATUSES = frozenset({RunStatus.SUCCEEDED, RunStatus.PARTIAL, RunStatus.EMPTY, RunStatus.SKIPPED})
-_POI_CODE_PATTERN = re.compile(r"POI[0-9]{3}\Z")
 
-# httpx 기본값은 모든 단계에 5초다. 서울 열린데이터광장의 1000행 페이지 응답 시간을
-# 실측하면 시점에 따라 0.6~7.2초로 흔들려서, 기본값이면 느린 시점에 페이지마다
-# ReadTimeout으로 5초를 버리고 라운드 재시도(15s·30s 대기)로 넘어간다. 데이터를
-# 잃지는 않지만 fetch 예산(`effective_fetch_budget`)을 헛되게 태운다.
-#
-# read를 30초로 두는 근거는 실측 최댓값(7.2초)의 4배 여유다. connect는 짧게 둔다 —
-# 연결이 안 되는 상황은 기다려서 나아지지 않고, TRANSIENT로 라운드가 재시도한다.
+# 서울 열린데이터광장 1000행 페이지 응답이 실측 0.6~7.2초로 흔들려 httpx 기본값(5초)
+# 이면 느린 시점마다 라운드 재시도로 fetch 예산을 태운다. read는 실측 최댓값의 4배.
 _HTTP_TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=30.0)
-
-
-def _latest_source_uses_config(
-    source_id: str, logical_dttm: datetime, config_version: str
-) -> bool:
-    """가장 최근 authority가 현재 배포 source 설정으로 수집됐는지 확인한다."""
-
-    snapshots = manifest_module.load_source_snapshots(source_id, logical_dttm)
-    return bool(
-        snapshots and snapshots[-1].manifest.config_version == config_version
-    )
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """CLI 인자를 파싱한다.
 
-    `--force`와 `--backfill`은 목적이 반대라 함께 주면 `argparse`가 사용법 메시지를 찍고 `SystemExit`을 일으키게 막는다.
-
-    args:
-        argv: 파싱할 인자 목록. 생략하면 `sys.argv`를 그대로 쓴다.
-    returns:
-        실행 window와 선택한 POI Master ref 필드를 담은 네임스페이스.
-    raises:
-        SystemExit: 필수 인자가 없거나 `--force`와 `--backfill`을 함께 줬을 때.
+    Args:
+        argv: 파싱할 인자 목록. 생략하면 `sys.argv`를 쓴다.
+    Returns:
+        실행 모드와 POI Master ref 필드를 담은 네임스페이스.
+    Raises:
+        SystemExit: 모드에 필요한 인자가 없거나 POI Master 인자 조합이 잘못됐을 때.
     """
     parser = argparse.ArgumentParser(prog="main.py")
     parser.add_argument("--source", required=True, help="소스 id (sources/{source_id}.yaml)")
@@ -99,8 +64,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="재개 분기를 무시하고 새 Hot Bronze revision에 전체 재수집",
     )
-    parser.add_argument("--backfill", action="store_true", help="완결된 window의 누락 조각만 채운다")
-    parser.add_argument("--list-backfill-targets", action="store_true", help="백필 대상을 JSON으로 출력하고 종료")
     parser.add_argument(
         "--report-window-stats",
         action="store_true",
@@ -132,31 +95,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     args = parser.parse_args(argv)
 
-    # Airflow는 static/S3를 같은 command shape으로 호출하고 static ref 필드는 빈
-    # 환경변수로 넘긴다. 빈 문자열을 "ref가 지정됨"으로 오인하지 않도록 여기서
-    # 생략값과 같은 None으로 정규화한다.
+    # Airflow는 static 모드에서도 같은 명령 형태로 빈 ref 값을 넘긴다.
     for field in ("poi_master_manifest_uri", "poi_master_manifest_sha256"):
         value = getattr(args, field)
         if value is not None and not value.strip():
             setattr(args, field, None)
 
     if (
-        not args.list_backfill_targets
-        and args.check_due_after_seconds is None
+        args.check_due_after_seconds is None
         and not args.report_window_stats
         and not args.window_start
     ):
         parser.error(
             "the following arguments are required: --window-start "
-            "(unless --list-backfill-targets/--check-due-after-seconds/"
-            "--report-window-stats is used)"
+            "(unless --check-due-after-seconds/--report-window-stats is used)"
         )
 
     if args.report_window_stats and not args.window_day:
         parser.error("--report-window-stats에는 --window-day가 필요하다")
-
-    if args.force and args.backfill:
-        parser.error("--force와 --backfill은 함께 줄 수 없다")
 
     has_manifest_ref = (
         args.poi_master_manifest_uri is not None
@@ -177,68 +133,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
-def _validated_master_poi_codes(table: pa.Table) -> tuple[str, ...]:
-    """POI Master의 AREA_CD를 검증하고 코드 오름차순의 불변 튜플로 반환한다.
+def _config_with_poi_master(config: SourceConfig, ref: PoiMasterRef) -> SourceConfig:
+    """Exact S3 POI Master의 코드 목록을 실행 설정에 고정한다.
 
-    args:
-        table: exact POI Master manifest가 가리키는 Parquet 테이블
-    returns:
-        중복 없이 정렬된 POI 코드 튜플
-    raises:
-        ValueError: 테이블 타입·컬럼·코드 형식·중복 또는 빈 목록이 잘못됐을 때
-    """
-    if type(table) is not pa.Table:
-        raise ValueError("POI Master reader는 pyarrow.Table을 반환해야 합니다")
-    if table.column_names != ["AREA_CD"]:
-        raise ValueError(
-            "POI Master 코드 조회 결과는 AREA_CD 컬럼 하나여야 합니다: "
-            f"columns={table.column_names}"
-        )
+    Master manifest SHA를 YAML 설정 hash와 함께 다시 hash해 source snapshot의
+    `config_version`에 호출 목록의 외부 의존성을 반영한다. AREA_CD 형식·고유성·정렬은
+    `read_poi_master`가 검증한다.
 
-    raw_codes = table.column("AREA_CD").to_pylist()
-    if not raw_codes:
-        raise ValueError("POI Master의 AREA_CD 목록이 비어 있습니다")
-    if any(
-        type(code) is not str or _POI_CODE_PATTERN.fullmatch(code) is None
-        for code in raw_codes
-    ):
-        raise ValueError("POI Master AREA_CD는 POI와 ASCII 숫자 3자리 형식이어야 합니다")
-    if len(set(raw_codes)) != len(raw_codes):
-        raise ValueError("POI Master AREA_CD에 중복 코드가 있습니다")
-    return tuple(sorted(raw_codes))
-
-
-def _config_with_poi_master(
-    config: SourceConfig,
-    ref: PoiMasterRef,
-) -> SourceConfig:
-    """Exact S3 POI Master를 한 번 읽어 Collector 실행 설정에 고정한다.
-
-    Master manifest SHA를 YAML 설정 hash와 함께 다시 hash하여 source snapshot의
-    ``config_version``에도 호출 목록의 외부 의존성이 반영되게 한다.
-
-    args:
-        config: YAML에서 읽은 frozen SourceConfig
-        ref: Airflow가 이번 tick에 고정한 exact S3 POI Master 참조
-    returns:
-        정렬된 ``poi_codes``와 합성 config version이 주입된 새 SourceConfig
+    Args:
+        config: YAML에서 읽은 SourceConfig.
+        ref: Airflow가 이번 tick에 고정한 exact S3 POI Master 참조.
+    Returns:
+        `poi_codes`와 합성 config version이 주입된 새 SourceConfig.
     """
     table = read_poi_master(ref, columns=["AREA_CD"])
-    poi_codes = _validated_master_poi_codes(table)
-    manifest_sha256 = ref.manifest_sha256
-    if manifest_sha256 is None:
-        raise ValueError("s3 POI Master ref에는 manifest SHA-256이 필요합니다")
-
+    poi_codes = tuple(table.column("AREA_CD").to_pylist())
     version_material = (
         f"collector_config={config.config_version}\n"
-        f"poi_master_manifest_sha256={manifest_sha256}\n"
+        f"poi_master_manifest_sha256={ref.manifest_sha256}\n"
     ).encode("ascii")
-    config_version = f"sha256:{hashlib.sha256(version_material).hexdigest()}"
-    adapter_params = {**config.adapter_params, "poi_codes": poi_codes}
     return config.model_copy(
         update={
-            "adapter_params": adapter_params,
-            "config_version": config_version,
+            "adapter_params": {**config.adapter_params, "poi_codes": poi_codes},
+            "config_version": f"sha256:{hashlib.sha256(version_material).hexdigest()}",
         }
     )
 
@@ -246,109 +163,72 @@ def _config_with_poi_master(
 def exit_code_for(status: RunStatus) -> int:
     """manifest의 최종 status를 프로세스 종료 코드로 바꾼다.
 
-    `SUCCEEDED` · `PARTIAL` · `EMPTY` · `SKIPPED`는 0, `FAILED`는 non-zero다.
-    누락을 허용하지 않는 소스는 pipeline 완결도 게이트에서 `FAILED`가 되므로
-    이 매핑을 바꾸지 않아도 Airflow retry가 동작한다.
-
-    args:
+    Args:
         status: pipeline이 반환한 manifest의 최종 status.
-    returns:
-        Airflow 태스크 성공/실패를 가르는 프로세스 종료 코드.
+    Returns:
+        `SUCCEEDED`·`PARTIAL`·`EMPTY`·`SKIPPED`면 0, 그 외는 1.
     """
     return 0 if status in _OK_STATUSES else 1
 
 
-def main(argv: list[str] | None = None) -> int:
-    """인자를 파싱해 window 하나를 수집하고 그 결과를 종료 코드로 반환한다.
+def _report_window_stats(args: argparse.Namespace) -> None:
+    """KST 날짜(및 시)의 window manifest 통계를 JSON으로 출력한다."""
+    day = date.fromisoformat(args.window_day)
+    manifests = manifest_module.load_window_manifests(args.source, day, args.window_hour)
+    summary = manifest_module.summarize_window(manifests)
+    summary.update({"source_id": args.source, "day": args.window_day, "hour": args.window_hour})
+    print(json.dumps(summary))
 
-    처리 순서는 인자 파싱 → 로깅 초기화 → config 로드 → pipeline 실행 → 종료
-    코드 반환이다. 로깅 초기화를 config 로드보다 먼저 하는 이유는, 
-    이후 pipeline이 남기는 모든 로그에 고정 필드(source_id·window·attempt)가
-    붙게 하기 위해서다 — 순서를 바꾸면 pipeline이 로드 직후에 남기는 초반 로그에는 고정 필드가 빠진다.
 
-    args:
-        argv: `parse_args`에 그대로 전달할 인자 목록.
-    returns:
-        Airflow가 태스크 성공/실패를 판단할 프로세스 종료 코드.
-    """
-    args = parse_args(argv)
+def _is_due(
+    config: SourceConfig, last: datetime | None, now: datetime, due_after_seconds: int
+) -> bool:
+    """마지막 authority 이후 새 수집이 필요한지 판정한다."""
+    if last is None:
+        return True
 
-    if args.list_backfill_targets:
-        import json
-        config = config_loader.load(args.source)
-        targets = pipeline.get_backfill_targets(config)
-        print(json.dumps(targets))
-        return 0
+    # 실행 시각이 아니라 마지막 성공이 담당한 슬롯으로 비교해야 한 번 늦은 성공의 지연이
+    # 다음 판정에 누적되지 않는다. 초단기실황·예보는 API 발표 그리드(`time_rule`)와 실제
+    # 갱신 주기가 달라 `freshness_rule`을 따로 둔다.
+    rule = config.adapter_params.get("freshness_rule") or config.adapter_params.get("time_rule")
+    if rule:
+        time_based_due = adjust_base_time(now, rule) > adjust_base_time(last, rule)
+    else:
+        time_based_due = (now - last).total_seconds() >= due_after_seconds
+    # 설정이 바뀌어 배포됐으면 같은 슬롯이라도 새 설정으로 다시 수집한다.
+    return time_based_due or not _latest_source_uses_config(
+        config.source_id, last, config.config_version
+    )
 
-    if args.report_window_stats:
-        import json
-        from datetime import date as date_cls
 
-        day = date_cls.fromisoformat(args.window_day)
-        manifests = manifest_module.load_window_manifests(args.source, day, args.window_hour)
-        summary = manifest_module.summarize_window(manifests)
-        summary.update({
-            "source_id": args.source,
-            "day": args.window_day,
-            "hour": args.window_hour,
-        })
-        print(json.dumps(summary))
-        return 0
+def _latest_source_uses_config(
+    source_id: str, logical_dttm: datetime, config_version: str
+) -> bool:
+    """가장 최근 authority가 현재 배포 source 설정으로 수집됐는지 확인한다."""
+    snapshots = manifest_module.load_source_snapshots(source_id, logical_dttm)
+    return bool(snapshots and snapshots[-1].manifest.config_version == config_version)
 
-    if args.check_due_after_seconds is not None:
-        import json
 
-        config = config_loader.load(args.source)
-        now = datetime.now(KST)
-        last = storage.latest_source_snapshot_logical_dttm(args.source, as_of=now)
-        elapsed_seconds = None if last is None else (now - last).total_seconds()
-        time_rule = config.adapter_params.get("time_rule")
-        # freshness 판단은 fetch용 time_rule(API가 허용하는 발표 그리드)이 아니라
-        # 이 소스가 실제로 갱신되는 폴링 그리드를 봐야 한다 — 단기예보(vilage_fcst,
-        # 3시간)는 둘이 같지만, 초단기실황/예보는 API 파라미터 그리드(hourly/
-        # half_hourly, 시간당 1슬롯)와 실제 갱신 주기(10분/30분)가 다르다. 이
-        # 둘을 혼동해서 hourly/half_hourly를 freshness에 그대로 썼다가 실제
-        # 운영에서 확인(2026-08-26): 시간당 6번(10분 간격) 잘 수집되던 게 시간당
-        # 1번으로 뚝 떨어졌다 — 그래서 `freshness_rule`을 별도 필드로 분리해
-        # ten_minutely/thirty_minutely 같은 순수 폴링 그리드를 쓰게 한다
-        # (`adapters.kma_apihub` 모듈 docstring 표 참고).
-        freshness_rule = config.adapter_params.get("freshness_rule") or time_rule
+def _check_due(args: argparse.Namespace) -> None:
+    """freshness gate 판정 결과를 JSON으로 출력한다."""
+    config = config_loader.load(args.source)
+    now = datetime.now(KST)
+    last = storage.latest_source_snapshot_logical_dttm(args.source, as_of=now)
+    print(json.dumps({
+        "source_id": args.source,
+        "due": _is_due(config, last, now, args.check_due_after_seconds),
+        "last_logical_dttm": None if last is None else last.isoformat(),
+        "elapsed_seconds": None if last is None else (now - last).total_seconds(),
+    }))
 
-        if last is None:
-            time_based_due = True
-        elif freshness_rule:
-            # "마지막 성공이 wall-clock으로 언제 실행됐는지"가 아니라 "그 실행이
-            # 실제로 담당했던 그리드 슬롯이 무엇인지"로 판단해야, 한 번이라도
-            # 늦게 성공할 때마다 그 지연이 다음 판단 기준에 그대로 누적돼 실제
-            # 슬롯과 점점 어긋나는 문제를 막는다 — 실제 운영에서 확인
-            # (2026-08-26, weather_short_term_forecast manifest logical_dttm이
-            # 09:00→12:00→15:00→16:00→19:00→22:00→01:00→04:00→07:00(KST)처럼
-            # 3시간 간격의 wall-clock 성공 시각만 계속 이어져서, 08:00 발표분이
-            # 10:00이 돼서야 잡혔다).
-            from adapters.kma_apihub import adjust_base_time
 
-            time_based_due = adjust_base_time(now, freshness_rule) > adjust_base_time(
-                last, freshness_rule
-            )
-        else:
-            time_based_due = elapsed_seconds >= args.check_due_after_seconds
-
-        due = time_based_due or not _latest_source_uses_config(
-            args.source, last, config.config_version
-        )
-        print(json.dumps({
-            "source_id": args.source,
-            "due": due,
-            "last_logical_dttm": None if last is None else last.isoformat(),
-            "elapsed_seconds": elapsed_seconds,
-        }))
-        return 0
-
+def _collect(args: argparse.Namespace) -> int:
+    """window 하나를 수집하고 종료 코드를 반환한다."""
     window_start = parse_kst_datetime(args.window_start)
-
+    # config 로드보다 먼저 설정해야 이후 모든 로그에 고정 필드가 붙는다.
     configure_logging(args.source, window_start, attempt=1)
     config = config_loader.load(args.source)
-    configure_httpx_request_logging(getattr(config, "adapter", ""))
+    configure_httpx_request_logging(config.adapter)
     if args.poi_master_mode == "s3":
         ref = PoiMasterRef(
             mode="s3",
@@ -357,14 +237,29 @@ def main(argv: list[str] | None = None) -> int:
         )
         config = _config_with_poi_master(config, ref)
 
-    # httpx.Client를 여기서 만들어 실행 하나에 재사용한다
-    # 어댑터는 연결을 모르고 `client` 인자로 주입받기만 한다
     with httpx.Client(timeout=_HTTP_TIMEOUT) as client:
         result = pipeline.execute_window(
-            config, window_start, client=client, force=args.force, backfill=args.backfill,
+            config, window_start, client=client, force=args.force
         )
-
     return exit_code_for(result.status)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """인자로 고른 모드를 실행하고 종료 코드를 반환한다.
+
+    Args:
+        argv: `parse_args`에 그대로 전달할 인자 목록.
+    Returns:
+        Airflow가 태스크 성공/실패를 판단할 프로세스 종료 코드.
+    """
+    args = parse_args(argv)
+    if args.report_window_stats:
+        _report_window_stats(args)
+        return 0
+    if args.check_due_after_seconds is not None:
+        _check_due(args)
+        return 0
+    return _collect(args)
 
 
 if __name__ == "__main__":

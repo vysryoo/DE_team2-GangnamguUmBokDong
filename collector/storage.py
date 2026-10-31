@@ -22,7 +22,6 @@ from core.gold_publication.storage import S3ImmutableObjectStore
 from core.kst import KST
 from core.s3 import (
     S3Object,
-    delete_object,
     delete_objects,
     get_object_bytes,
     list_keys,
@@ -46,14 +45,23 @@ class ImmutableSilverArtifact:
     row_count: int
 
 
-def _bronze_prefix(
-    source_id: str, window_start: datetime, revision: int | None = None
-) -> str:
-    """Bronze 조각들이 모이는 legacy 또는 immutable Hot prefix를 만든다."""
-    window = (
+def _bronze_window(source_id: str, window_start: datetime) -> str:
+    """Bronze prefix 중 source·window 부분을 만든다."""
+    return (
         f"{source_id}/dt={window_start:%Y-%m-%d}/hh={window_start:%H}/"
         f"{window_start:%H%M}/"
     )
+
+
+def bronze_prefix(
+    source_id: str, window_start: datetime, revision: int | None = None
+) -> str:
+    """Bronze 조각들이 모이는 prefix를 만든다.
+
+    revision이 None이면 Hot revision 도입 전 legacy prefix다. 기존 manifest와 Cold
+    Bronze 복원 경로가 아직 이 형태를 읽는다.
+    """
+    window = _bronze_window(source_id, window_start)
     if revision is None:
         return f"bronze/{window}"
     if revision < 0:
@@ -61,19 +69,9 @@ def _bronze_prefix(
     return f"bronze/hot/{window}revision={revision:010d}/"
 
 
-def bronze_prefix(
-    source_id: str, window_start: datetime, revision: int | None = None
-) -> str:
-    """Manifest에 기록할 canonical Bronze prefix를 반환한다."""
-    return _bronze_prefix(source_id, window_start, revision)
-
-
 def next_bronze_revision(source_id: str, window_start: datetime) -> int:
     """Manifest 저장 전 중단된 orphan까지 피해 다음 immutable revision을 고른다."""
-    window_prefix = (
-        f"bronze/hot/{source_id}/dt={window_start:%Y-%m-%d}/"
-        f"hh={window_start:%H}/{window_start:%H%M}/"
-    )
+    window_prefix = f"bronze/hot/{_bronze_window(source_id, window_start)}"
     revisions = []
     for key in list_keys(window_prefix):
         matched = re.match(rf"{re.escape(window_prefix)}revision=(\d{{10}})/", key)
@@ -90,7 +88,7 @@ def _bronze_part_key(
 ) -> str:
     """bronze 조각 하나의 전체 키를 만든다."""
     return (
-        f"{_bronze_prefix(source_id, window_start, revision)}"
+        f"{bronze_prefix(source_id, window_start, revision)}"
         f"part={chunk_key}.json.gz"
     )
 
@@ -146,16 +144,6 @@ def read_bronze(
             )
         )
     return [restored[part] for part in parts if part in restored]
-
-
-def clear_bronze(
-    source_id: str, window_start: datetime, revision: int | None = None
-) -> None:
-    """해당 윈도우의 bronze 조각을 모두 삭제한다.
-    수집 파이프라인이 에러로 뻗었을 때, 쓰레기 데이터가 남지 않도록 임시 조각들을 지워주는 역할."""
-    prefix = _bronze_prefix(source_id, window_start, revision)
-    keys = list_keys(prefix)
-    delete_objects(keys)
 
 
 def _layer_key(layer: str, source_id: str, window_start: datetime, ext: str) -> str:
@@ -402,11 +390,6 @@ def list_source_snapshot_manifest_payloads(
     return result
 
 
-def _retry_marker_key(source_id: str, window_start: datetime) -> str:
-    """해당 윈도우의 retry marker 객체 키를 만든다."""
-    return f"_retry_queue/{source_id}/{window_start.isoformat()}.json"
-
-
 def write_manifest(source_id: str, window_start: datetime, data: dict) -> None:
     """해당 윈도우의 manifest를 json으로 저장한다."""
     write_json(layout.window_manifest_key(source_id, window_start), data)
@@ -437,26 +420,3 @@ def list_window_manifest_payloads(
         if data:
             payloads.append(data)
     return payloads
-
-
-def write_retry_marker(source_id: str, window_start: datetime, data: dict) -> None:
-    """해당 윈도우의 retry marker를 JSON으로 저장한다."""
-    key = _retry_marker_key(source_id, window_start)
-    write_json(key, data)
-
-
-def list_retry_markers(source_id: str) -> list[dict]:
-    """해당 소스에 쌓인 retry marker를 모두 읽어 반환한다."""
-    prefix = f"_retry_queue/{source_id}/"
-    markers = []
-    for key in list_keys(prefix):
-        data = read_json(key)
-        if data:
-            markers.append(data)
-    return markers
-
-
-def delete_retry_marker(source_id: str, window_start: datetime) -> None:
-    """해당 윈도우의 retry marker를 삭제한다."""
-    key = _retry_marker_key(source_id, window_start)
-    delete_object(key)

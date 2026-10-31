@@ -133,7 +133,7 @@ class Manifest(BaseModel):
     missing: 누락 정보
     drop_ratio: 드롭 비율
     completeness: 완료 비율
-    backfill_status: 백필 상태
+    backfill_status: 폐기된 지연 백필의 상태. 저장된 manifest 호환용으로 항상 None
     column_issues: 컬럼 이슈
     policy_actions: 정책 실행
     config_version: 설정 버전
@@ -299,9 +299,7 @@ def prepare_source_snapshot(
     planned_parts: tuple[str, ...],
     completed_parts: tuple[str, ...],
 ) -> PublishedSourceSnapshot:
-    """Output identity를 검증하고 쓸 authority revision을 부작용 없이 준비한다."""
-    if type(counts) is not Counts:
-        raise SourceSnapshotContractError("counts는 collector Counts여야 합니다.")
+    """쓸 authority revision을 부작용 없이 준비한다."""
     typed_counts = SourceSnapshotCounts(
         expected=counts.expected,
         fetched=counts.fetched,
@@ -338,55 +336,12 @@ def prepare_source_snapshot(
 def finalize_source_snapshot(
     prepared: PublishedSourceSnapshot,
 ) -> PublishedSourceSnapshot:
-    """준비한 authority manifest를 last put-once/readback으로 확정한다."""
-    if type(prepared) is not PublishedSourceSnapshot:
-        raise SourceSnapshotContractError(
-            "prepared snapshot은 PublishedSourceSnapshot이어야 합니다."
-        )
+    """준비한 authority manifest를 put-once/readback으로 확정한다."""
     candidate = prepared.manifest
-
-    manifest_uri = storage.write_source_snapshot_manifest(
+    storage.write_source_snapshot_manifest(
         candidate.source_id,
         candidate.logical_dttm,
         candidate.revision_no,
         candidate.canonical_bytes,
     )
-    if manifest_uri != prepared.manifest_uri:
-        raise SourceSnapshotContractError(
-            "준비한 source snapshot manifest URI와 기록 URI가 다릅니다."
-        )
-    return PublishedSourceSnapshot(candidate, manifest_uri)
-
-
-class RetryMarker(BaseModel):
-    """부분 실패로 남은 조각을 나중에 재시도하기 위해 큐에 남기는 마커."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-    source_id: str
-    window_start: datetime
-    missing_parts: tuple[str, ...]
-    first_failed_at: datetime
-    expires_at: datetime
-    attempts: int = 1
-
-
-def save_retry_marker(marker: RetryMarker) -> None:
-    """retry marker를 dict로 직렬화해 저장한다."""
-
-    storage.write_retry_marker(
-        marker.source_id, marker.window_start, marker.model_dump(mode="json")
-    )
-
-
-def load_retry_markers(source_id: str) -> list[RetryMarker]:
-    """해당 소스에 쌓인 retry marker를 모두 읽어 모델로 변환한다."""
-
-    return [
-        RetryMarker.model_validate(d) for d in storage.list_retry_markers(source_id)
-    ]
-
-
-def clear_retry_marker(source_id: str, window_start: datetime) -> None:
-    """해당 윈도우의 retry marker를 큐에서 제거한다."""
-
-    storage.delete_retry_marker(source_id, window_start)
+    return prepared

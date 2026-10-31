@@ -1,4 +1,4 @@
-"""데이터 수집 설정 파일의 명세를 정의하고, Pydantic을 활용해 사용자의 잘못된 입력을 차단하는 안전장치."""
+"""`sources/*.yaml` 수집 설정의 Pydantic 스키마."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ _DURATION_RE = re.compile(r"(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?")
 
 
 def _parse_duration(value: object) -> timedelta:
-    """YAML 파일에서 문자열로 입력한 값을 파이썬이 이해할 수 있는 시간 간격 객체로 변환한다."""
+    """`1d12h`, `5m` 같은 duration 문자열을 timedelta로 변환한다."""
 
     if isinstance(value, timedelta):
         return value
@@ -22,22 +22,19 @@ def _parse_duration(value: object) -> timedelta:
         raise ValueError(f"duration은 비어있지 않은 문자열이어야 합니다: {value!r}")
 
     match = _DURATION_RE.fullmatch(value)
-    # 정규식의 모든 단위가 ?로 생략 가능하기 때문에 단위 값이 하나도 없는 경우를 확인한다.
+    # 모든 단위가 생략 가능해 빈 매치도 fullmatch를 통과한다.
     if match is None or not any(match.groups()):
         raise ValueError(f"duration 형식이 틀렸습니다.: {value!r}")
     days, hours, minutes, seconds = (int(g) if g else 0 for g in match.groups())
     return timedelta(days=days, hours=hours, minutes=minutes, seconds=seconds)
 
 
-# Annotated는 기본 타입에 추가적인 메타데이터나 동작을 붙일 때 사용한다.
-# BeforeValidator는 Pydantic이 값을 검증하기 전에 _parse_duration 함수를 실행하여 값을 변환한다.
 Duration = Annotated[timedelta, BeforeValidator(_parse_duration)]
 
 
 class Range(BaseModel):
     """컬럼의 정상 범위이다. 한쪽 경계만 선언한 열린 범위도 허용한다."""
 
-    # Pydantic 모델 configuration
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     min: float = -math.inf
@@ -59,15 +56,9 @@ class Range(BaseModel):
 class ColumnSpec(BaseModel):
     """컬럼 하나의 스펙. range와 enum은 배타적으로만 사용할 수 있다."""
 
-    # Pydantic 모델 configuration
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    # "precip"은 기상청 강수량 범주 표기("강수없음", "30.0~50.0mm" 등)를 mm 실수로
-    # 바꾸는 전용 캐스터다. 규칙은 `core.precip`에 있고 loader와 공유한다.
-    # "snow"는 적설 표기("적설없음", "1.0~4.9cm" 등)를 cm 실수로 바꾼다 — 형태는
-    # 같지만 단위가 달라 서로의 표기를 받지 않는다(`core._amount` 참고).
-    # "masked_float"는 생활인구의 비식별 마스킹(`*`)을 결측으로 판정시킨다
-    # (`core.masked` 참고).
+    # precip·snow·masked_float 캐스터는 `validation.engine._CASTERS` 참고.
     types: tuple[
         Literal["str", "int", "float", "bool", "precip", "snow", "masked_float"], ...
     ] = Field(min_length=1)
@@ -89,7 +80,6 @@ class ColumnSpec(BaseModel):
 class Schedule(BaseModel):
     """수집 주기."""
 
-    # Pydantic 모델 configuration
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     interval: Duration
@@ -110,11 +100,8 @@ class Compaction(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    # 윈도우마다 같은 구간을 다시 받는 소스에서 켠다. path_suffix가 날짜 단위인데
-    # 주기가 그보다 짧으면 윈도우끼리 같은 기록을 중복 수집한다(bike_rental_history).
-    #
-    # 스냅샷 소스에는 켜면 안 된다 — 재고가 안 변하면 연속 윈도우가 같은 값을 내는
-    # 것이 정상인데, 그걸 지우면 시계열이 무너진다.
+    # window마다 같은 구간을 다시 받는 소스(bike_rental_history)에서만 켠다. 스냅샷
+    # 소스는 연속 window가 같은 값을 내는 것이 정상이라 지우면 시계열이 무너진다.
     dedup: bool = False
 
 
@@ -127,81 +114,66 @@ class Quality(BaseModel):
     max_missing_ratio: float = Field(default=0.0, ge=0, le=1)
     allow_empty: bool = False
 
-    # 소스가 알려준 전체 건수보다 실제 받은 행이 많을 때 용인할 비율.
-    #
-    # 진행 중인 window를 조회하면 API가 같은 본문 안에서 list_total_count보다 많은
-    # row를 주는 일이 있다(실측 2026-08-23: 대여이력 rows=989 expected=988, 4시간에
-    # 5회). 카운트 계산과 직렬화 사이에 레코드가 들어온 경우이고, 그 초과분은 누락이
-    # 아니라 실제 데이터다. 이걸 실패로 확정하면 window 하나가 통째로 버려지고 그
-    # tick의 서빙 게시까지 함께 죽는다.
-    #
-    # 그래서 기본값을 0.1로 둔다 — 막아야 할 사고(페이지 중복 병합)는 최소 +100%라
-    # 이 값으로도 계속 걸린다. 대신 10% 안쪽의 초과는 어떤 소스에서든 통과하므로,
-    # snapshot 성격 소스에서 옛 payload와 새 total이 섞인 상태가 그 범위에 들면
-    # 잡아내지 못한다는 것을 감수한다.
+    # 소스가 알려준 전체 건수보다 실제 받은 행이 많을 때 용인할 비율. 진행 중인
+    # window는 카운트 계산과 직렬화 사이에 레코드가 들어와 total을 넘을 수 있다
+    # (대여이력 rows=989 expected=988). 막아야 할 페이지 중복 병합은 최소 +100%라
+    # 0.1로도 걸린다. 10% 안쪽의 snapshot 혼합은 놓치는 것을 감수한다.
     max_overfetch_ratio: float = Field(default=0.1, ge=0, le=1)
 
 
 class Fetch(BaseModel):
-    """API 호출 예산을 설정하는 모델."""
+    """window 하나의 fetch 시간 예산. 생략하면 `SourceConfig.effective_fetch_budget` 기본값."""
 
-    # Pydantic 모델 configuration
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    # API 호출에 사용할 수 있는 최대 시간
-    # None으로 두어도, SourceConfig 모델에서 자동 설정됨.
     budget: Duration | None = None
 
+
 class Backfill(BaseModel):
-    """누락된 과거 데이터를 나중에 채워넣는 백필 작업에 대한 설정을 담당."""
+    """폐기된 지연 백필 설정.
+
+    collector 수집 경로는 더 이상 읽지 않는다. `compaction`의 archive 복구 범위 계산만
+    참조한다.
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    # 백필 기능을 켤지 끌지 결정하는 스위치
     enabled: bool = False
-
-    # 과거 며칠 전의 데이터까지만 재수집할 것인지 설정
-    # None으로 두어도, SourceConfig 모델에서 schedule.interval로 자동 설정됨.
     max_age: Duration | None = None
 
     @model_validator(mode="after")
     def _max_age_required_when_enabled(self) -> Backfill:
         """enabled=true인데 max_age가 없는 조합을 막는다."""
-
-        # 무한정 과거로 거슬러 올라가며 재수집을 시도하여 과부하를 일으킬 가능성을 막기 위함
         if self.enabled and self.max_age is None:
             raise ValueError("backfill.enabled=true면 max_age가 필수다")
         return self
 
 
 class Policies(BaseModel):
-    """컬럼 정책과 행 정책을 정의하는 모델"""
+    """컬럼 정책 4분면 기본값과 선택적 행 정책."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    # 컬럼 정책 (필수)
     required_missing: str
     required_outlier: str
     optional_missing: str
     optional_outlier: str
-
-    # 행 정책 (선택)
     row: str | None = None
     row_params: dict[str, Any] | None = None
 
 
 class SourceConfig(BaseModel):
-    """모든 설정 모델들을 하나로 조립하는 최종 완성본.
+    """소스 하나의 수집 설정.
 
     source_id: 소스 ID
     description: 소스에 대한 설명
     adapter: 어댑터 이름
-    adapter_params: 어댑터 파라미터 (어댑터가 작동할 때 필요한 추가옵션들, 기본값은 {})
+    adapter_params: 어댑터 파라미터
     schedule: 주기
     storage: 저장 방식
     quality: 품질 기준
-    fetch: API 호출에 사용할 수 있는 최대 시간
-    backfill: 백필
+    fetch: fetch 시간 예산
+    backfill: 폐기된 지연 백필 설정(`Backfill` 참고)
     compaction: 하루치 압축 옵션
     policies: 컬럼 정책과 행 정책
     columns: 데이터 스키마(key=컬럼명, value=컬럼 스펙)
@@ -209,7 +181,6 @@ class SourceConfig(BaseModel):
     config_version: 설정 버전
     """
 
-    # Pydantic 모델 configuration
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     source_id: str

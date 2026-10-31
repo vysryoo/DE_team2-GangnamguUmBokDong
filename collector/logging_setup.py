@@ -1,21 +1,8 @@
-"""구조화 로그 설정 - 모든 로그에 source_id·window·attempt를 고정 필드로 붙인다.
+"""구조화 로그 설정. 모든 로그에 source_id·window·attempt를 고정 필드로 붙인다.
 
-행 상세는 quarantine 파일이 담당하므로, 조각·라운드 단위로는 로그를 남기지 않는다.
-정상 배치의 출력은 다음 3줄이 전부다.
-
-    INFO  source_id=bike_station_realtime window=2026-08-12T14:10Z
-          stage=bronze_written parts=3/3 rounds=1 rows=2765 bytes=482113 ms=1203
-    WARN  source_id=… stage=validated status=PARTIAL kept=2740 repaired=31
-          dropped=25 drop_ratio=0.009 completeness=0.991
-    INFO  source_id=… stage=completed revision=1 key=s3://…/1410.parquet
-
-누락·폐기가 있으면 해당 단계 로그가 WARN·ERROR로 바뀌고 원인(`missing`,
-`failure_reason`)이 붙는다. 수집 게이트(`fetch_error`)와 폐기 게이트
-(`quality_gate`)는 사유가 다르므로, 로그만 보고도 재시도할 문제인지 config를
-고쳐야 할 문제인지 구분된다. 백필로 silver가 갱신되면 `revision` 변화가 남아
-하류 재처리를 추적하는 유일한 기록이 된다.
-
-주의: boto3·httpx의 기본 로거가 시끄러우면 레벨을 따로 낮춘다.
+행 상세는 quarantine 파일이 담당하므로 조각·라운드 단위로는 로그를 남기지 않는다.
+정상 배치는 단계 경계(`bronze_written`, `validated`, `completed`)마다 한 줄씩 남기고,
+누락·폐기가 있으면 해당 단계가 WARN·ERROR로 바뀌며 `failure_reason`이 붙는다.
 """
 
 from __future__ import annotations
@@ -60,7 +47,7 @@ class _ContextFilter(logging.Filter):
 
 
 class _SourceOnlyFilter(logging.Filter):
-    """source_id만 주입한다. window·attempt가 없는 배치 작업용."""
+    """source_id만 주입한다. window·attempt가 없는 배치 작업용이다."""
 
     def __init__(self, source_id: str):
         super().__init__()

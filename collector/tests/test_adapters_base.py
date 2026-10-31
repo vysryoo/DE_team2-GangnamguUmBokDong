@@ -14,11 +14,9 @@ from adapters.base import (
     UnknownAdapterError,
     Window,
     adapter,
-    adapter_names,
     classify_http_status,
     fetch_with_rounds,
     get_adapter,
-    is_adapter_registered,
 )
 from core.kst import KST
 
@@ -144,29 +142,6 @@ def test_unknown_adapter_message_lists_registered_names(clean_adapter_registry):
     message = str(excinfo.value)
     assert "t_typo" in message
     assert "t_registered" in message
-
-
-def test_is_adapter_registered_does_not_instantiate(clean_adapter_registry):
-    @adapter("t_boom")
-    class Boom:
-        def __init__(self):
-            raise AssertionError("등록 확인이 인스턴스를 만들면 안 된다")
-
-    assert is_adapter_registered("t_boom") is True
-    assert is_adapter_registered("t_absent") is False
-
-
-def test_adapter_names_are_sorted(clean_adapter_registry):
-    @adapter("t_b")
-    class B:
-        pass
-
-    @adapter("t_a")
-    class A:
-        pass
-
-    names = adapter_names()
-    assert names.index("t_a") < names.index("t_b")
 
 
 def test_classify_http_status_treats_2xx_as_success():

@@ -1,8 +1,7 @@
-"""sources/{source_id}.yaml을 읽어 검증까지 마친 SourceConfig로 만드는 곳.
+"""`sources/{source_id}.yaml`을 읽어 검증한 SourceConfig로 만든다.
 
-파일을 읽고, Pydantic으로 타입을 검사하고, 정책 이름이 실제 등록된 것인지 확인한 뒤 문제가 없으면 SourceConfig를 반환한다.
-여기서 오류를 다 걸러내야 네트워크를 타기 전에 잘못된 설정을 잡을 수 있다.
-통과한 설정에는 원본 YAML의 SHA-256 해시를 `config_version`으로 붙여, 나중에 어떤 설정으로 수집했는지 추적할 수 있게 한다.
+네트워크를 타기 전에 잘못된 설정을 잡도록 스키마 밖의 논리 검증(정책 이름, adapter
+파라미터, 자연키)도 여기서 끝낸다.
 """
 
 from __future__ import annotations
@@ -24,22 +23,25 @@ from config.schema import SourceConfig
 
 
 class ConfigError(ValueError):
-    """논리적 설정 오류를 알려주는 Error"""
+    """스키마는 통과했지만 논리적으로 잘못된 설정."""
 
 
 def load(source_id: str, base_dir: Path = Path("sources")) -> SourceConfig:
-    """소스 ID를 받아 YAML을 읽고 Pydantic으로 검증하여 최종 소스 설정 객체를 반환한다."""
+    """`sources/{source_id}.yaml`을 읽어 검증한 SourceConfig를 반환한다.
+
+    Args:
+        source_id: 소스 ID. 파일명과 YAML 안의 `source_id`가 같아야 함
+        base_dir: YAML 디렉터리
+    Returns:
+        원본 YAML bytes의 SHA-256을 `config_version`에 담은 SourceConfig
+    Raises:
+        pydantic.ValidationError: 스키마 위반
+        ConfigError: 정책 이름, adapter 파라미터 등 논리적 설정 오류
+    """
 
     raw_bytes = (base_dir / f"{source_id}.yaml").read_bytes()
-
-    # 읽어온 원문 바이트에 대해서 SHA-256 해시를 떠서 config_version으로 기록한다.
-    # 나중에 정확히 어떤 설정 상태일 때 수집된 데이터인지 추적하기 위함
     config_version = f"sha256:{hashlib.sha256(raw_bytes).hexdigest()}"
-
-    raw = yaml.safe_load(raw_bytes)
-
-    # 만약 여기서 필수값이 빠졌거나 타입이 틀렸으면 ValidationError가 발생한다.
-    config = SourceConfig.model_validate(raw)
+    config = SourceConfig.model_validate(yaml.safe_load(raw_bytes))
 
     errors: list[str] = []
     if config.source_id != source_id:
@@ -56,8 +58,13 @@ def load(source_id: str, base_dir: Path = Path("sources")) -> SourceConfig:
     return config.model_copy(update={"config_version": config_version})
 
 
+def _is_int(value: object) -> bool:
+    """bool을 제외한 정수인지 판별한다."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 def _check_adapter_params(config: SourceConfig) -> list[str]:
-    """네트워크나 기존 bronze를 건드리기 전에 adapter별 계획 설정을 검증한다."""
+    """네트워크나 기존 bronze를 건드리기 전에 서울 API adapter 설정을 검증한다."""
     params = config.adapter_params
     if config.adapter != "seoul_openapi":
         return []
@@ -70,14 +77,13 @@ def _check_adapter_params(config: SourceConfig) -> list[str]:
                 f"adapter_params.{required}: 비어있지 않은 문자열이 필수입니다."
             )
     page_size = params.get("page_size")
-    if not isinstance(page_size, int) or isinstance(page_size, bool) or page_size < 1:
+    if not _is_int(page_size) or page_size < 1:
         errors.append("adapter_params.page_size: 1 이상의 정수여야 합니다.")
 
     pagination = params.get("pagination", "total")
-    if pagination not in {"total", "probe", "probe_until_empty"}:
+    if pagination not in {"total", "probe_until_empty"}:
         errors.append(
-            "adapter_params.pagination: 'total', 'probe' 또는 "
-            "'probe_until_empty'여야 합니다."
+            "adapter_params.pagination: 'total' 또는 'probe_until_empty'여야 합니다."
         )
 
     for option in ("root_key_literal", "flatten_forecast"):
@@ -85,84 +91,15 @@ def _check_adapter_params(config: SourceConfig) -> list[str]:
             errors.append(f"adapter_params.{option}: boolean이어야 합니다.")
 
     if params.get("service") == "citydata_ppltn":
-        if pagination != "total":
-            errors.append(
-                "adapter_params.pagination: citydata_ppltn에는 probe를 사용할 수 없습니다."
-            )
-        if params.get("root_key_literal") is not True:
-            errors.append(
-                "adapter_params.root_key_literal: citydata_ppltn에는 true가 필수입니다."
-            )
-        if params.get("flatten_forecast") is not True:
-            errors.append(
-                "adapter_params.flatten_forecast: citydata_ppltn에는 true가 필수입니다."
-            )
+        return errors + _check_population_params(params, pagination)
 
-        poi_start = params.get("poi_start", 1)
-        poi_end = params.get("poi_end")
-        if not isinstance(poi_start, int) or isinstance(poi_start, bool):
-            errors.append("adapter_params.poi_start: 1 이상의 정수여야 합니다.")
-        if not isinstance(poi_end, int) or isinstance(poi_end, bool):
-            errors.append("adapter_params.poi_end: 필수이며 정수여야 합니다.")
-        if (
-            isinstance(poi_start, int)
-            and not isinstance(poi_start, bool)
-            and isinstance(poi_end, int)
-            and not isinstance(poi_end, bool)
-            and (poi_start < 1 or poi_end < poi_start)
-        ):
-            errors.append(
-                "adapter_params.poi_start/poi_end: 1 <= poi_start <= poi_end여야 합니다."
-            )
-
-        poi_exclude = params.get("poi_exclude", [])
-        if not isinstance(poi_exclude, list):
-            errors.append("adapter_params.poi_exclude: 정수 목록이어야 합니다.")
-        else:
-            valid_excludes = [
-                value
-                for value in poi_exclude
-                if isinstance(value, int) and not isinstance(value, bool)
-            ]
-            if len(valid_excludes) != len(poi_exclude):
-                errors.append(
-                    "adapter_params.poi_exclude: 모든 값이 정수여야 합니다."
-                )
-            if len(set(valid_excludes)) != len(valid_excludes):
-                errors.append(
-                    "adapter_params.poi_exclude: 중복 번호를 선언할 수 없습니다."
-                )
-            if (
-                isinstance(poi_start, int)
-                and not isinstance(poi_start, bool)
-                and isinstance(poi_end, int)
-                and not isinstance(poi_end, bool)
-                and poi_start <= poi_end
-            ):
-                if any(
-                    value < poi_start or value > poi_end
-                    for value in valid_excludes
-                ):
-                    errors.append(
-                        "adapter_params.poi_exclude: POI 범위 안의 번호만 허용됩니다."
-                    )
-                if len(set(valid_excludes)) >= poi_end - poi_start + 1:
-                    errors.append(
-                        "adapter_params.poi_exclude: 모든 POI를 제외할 수 없습니다."
-                    )
-        return errors
-
-    if pagination in {"probe", "probe_until_empty"}:
+    if pagination == "probe_until_empty":
         if config.natural_key is None:
             errors.append(
                 "adapter_params.pagination: probe pagination에는 natural_key가 필수입니다."
             )
         max_probe_pages = params.get("max_probe_pages")
-        if (
-            not isinstance(max_probe_pages, int)
-            or isinstance(max_probe_pages, bool)
-            or max_probe_pages < 1
-        ):
+        if not _is_int(max_probe_pages) or max_probe_pages < 1:
             errors.append(
                 "adapter_params.max_probe_pages: probe pagination이면 "
                 "1 이상의 정수가 필수입니다."
@@ -171,6 +108,46 @@ def _check_adapter_params(config: SourceConfig) -> list[str]:
         errors.append(
             "adapter_params.max_probe_pages: probe pagination에서만 사용할 수 있습니다."
         )
+    return errors
+
+
+def _check_population_params(params: dict, pagination: str) -> list[str]:
+    """실시간 인구(citydata_ppltn)의 응답 형태와 POI 범위 설정을 검증한다."""
+    errors: list[str] = []
+    if pagination != "total":
+        errors.append(
+            "adapter_params.pagination: citydata_ppltn에는 probe를 사용할 수 없습니다."
+        )
+    for option in ("root_key_literal", "flatten_forecast"):
+        if params.get(option) is not True:
+            errors.append(f"adapter_params.{option}: citydata_ppltn에는 true가 필수입니다.")
+
+    poi_start = params.get("poi_start", 1)
+    poi_end = params.get("poi_end")
+    if not _is_int(poi_start):
+        errors.append("adapter_params.poi_start: 1 이상의 정수여야 합니다.")
+    if not _is_int(poi_end):
+        errors.append("adapter_params.poi_end: 필수이며 정수여야 합니다.")
+    valid_range = _is_int(poi_start) and _is_int(poi_end) and 1 <= poi_start <= poi_end
+    if _is_int(poi_start) and _is_int(poi_end) and not valid_range:
+        errors.append(
+            "adapter_params.poi_start/poi_end: 1 <= poi_start <= poi_end여야 합니다."
+        )
+
+    poi_exclude = params.get("poi_exclude", [])
+    if not isinstance(poi_exclude, list):
+        errors.append("adapter_params.poi_exclude: 정수 목록이어야 합니다.")
+        return errors
+    excludes = [value for value in poi_exclude if _is_int(value)]
+    if len(excludes) != len(poi_exclude):
+        errors.append("adapter_params.poi_exclude: 모든 값이 정수여야 합니다.")
+    if len(set(excludes)) != len(excludes):
+        errors.append("adapter_params.poi_exclude: 중복 번호를 선언할 수 없습니다.")
+    if valid_range:
+        if any(value < poi_start or value > poi_end for value in excludes):
+            errors.append("adapter_params.poi_exclude: POI 범위 안의 번호만 허용됩니다.")
+        if len(set(excludes)) >= poi_end - poi_start + 1:
+            errors.append("adapter_params.poi_exclude: 모든 POI를 제외할 수 없습니다.")
     return errors
 
 
@@ -196,10 +173,8 @@ def _check_natural_key(config: SourceConfig) -> list[str]:
 
 
 def _check_policy_names(config: SourceConfig) -> list[str]:
-    """기본 컬럼 정책, 개별 컬럼 오버라이드 정책, 행 정책 검사"""
+    """기본 컬럼 정책, 개별 컬럼 오버라이드 정책, 행 정책 이름이 등록됐는지 확인한다."""
     errors: list[str] = []
-
-    # 기본 컬럼 정책
     quadrants = {
         "policies.required_missing": config.policies.required_missing,
         "policies.required_outlier": config.policies.required_outlier,
@@ -236,7 +211,7 @@ def _unregistered_message(location: str, name: str, registered: tuple[str, ...])
 
 
 def _check_row_params(config: SourceConfig) -> list[str]:
-    """행 정책을 사용할 때 넘겨주는 추가 설정값들이 정상적인지 검증하는 역할"""
+    """행 정책의 `row_params`가 그 정책의 params 모델에 맞는지 확인한다."""
 
     row_name = config.policies.row
     if row_name is None or not is_row_policy_registered(row_name):

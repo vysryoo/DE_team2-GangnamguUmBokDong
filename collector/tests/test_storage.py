@@ -14,10 +14,7 @@ from core.gold_publication.errors import (
     ObjectCollisionError,
 )
 from storage import (
-    clear_bronze,
-    delete_retry_marker,
     latest_source_snapshot_logical_dttm,
-    list_retry_markers,
     list_source_snapshot_windows,
     list_window_manifest_payloads,
     next_bronze_revision,
@@ -28,7 +25,6 @@ from storage import (
     write_immutable_silver,
     write_manifest,
     write_quarantine,
-    write_retry_marker,
     write_source_snapshot_manifest,
 )
 from core.kst import KST
@@ -111,36 +107,6 @@ class TestBronzeRoundTrip:
         )
 
         assert next_bronze_revision("test_source", WINDOW_START) == 4
-
-
-class TestClearBronze:
-    def test_removes_all_parts_for_that_window(self):
-        write_bronze_part("test_source", WINDOW_START, "page-001", b"a")
-        write_bronze_part("test_source", WINDOW_START, "page-002", b"b")
-        write_bronze_part("test_source", WINDOW_START, "page-003", b"c")
-
-        clear_bronze("test_source", WINDOW_START)
-
-        listed = _s3().list_objects_v2(
-            Bucket=TEST_BUCKET, Prefix="bronze/test_source/dt=2026-08-12/hh=14/1410/"
-        )
-        assert listed.get("KeyCount", 0) == 0
-
-    def test_rerun_with_fewer_parts_leaves_no_ghosts(self):
-        write_bronze_part("test_source", WINDOW_START, "page-001", b"a")
-        write_bronze_part("test_source", WINDOW_START, "page-002", b"b")
-        write_bronze_part("test_source", WINDOW_START, "page-003", b"c")
-
-        clear_bronze("test_source", WINDOW_START)
-        write_bronze_part("test_source", WINDOW_START, "page-001", b"a2")
-
-        listed = _s3().list_objects_v2(
-            Bucket=TEST_BUCKET, Prefix="bronze/test_source/dt=2026-08-12/hh=14/1410/"
-        )
-        assert listed["KeyCount"] == 1
-
-    def test_clear_on_empty_prefix_does_not_raise(self):
-        clear_bronze("nonexistent_source", WINDOW_START)
 
 
 class TestWriteImmutableSilver:
@@ -359,33 +325,3 @@ class TestLatestSourceSnapshotLogicalDttm:
         assert result is None
 
 
-class TestRetryMarkerRawIO:
-    def test_write_then_list(self):
-        write_retry_marker(
-            "test_source", WINDOW_START, {"source_id": "test_source", "attempts": 1}
-        )
-
-        result = list_retry_markers("test_source")
-
-        assert result == [{"source_id": "test_source", "attempts": 1}]
-
-    def test_list_only_returns_matching_source(self):
-        write_retry_marker("source_a", WINDOW_START, {"source_id": "source_a"})
-        write_retry_marker("source_b", WINDOW_START, {"source_id": "source_b"})
-
-        result = list_retry_markers("source_a")
-
-        assert result == [{"source_id": "source_a"}]
-
-    def test_list_with_no_markers_returns_empty(self):
-        assert list_retry_markers("no_markers_here") == []
-
-    def test_delete_removes_marker(self):
-        write_retry_marker("test_source", WINDOW_START, {"source_id": "test_source"})
-
-        delete_retry_marker("test_source", WINDOW_START)
-
-        assert list_retry_markers("test_source") == []
-
-    def test_delete_nonexistent_does_not_raise(self):
-        delete_retry_marker("never_written", WINDOW_START)

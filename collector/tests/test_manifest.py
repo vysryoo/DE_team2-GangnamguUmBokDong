@@ -1,4 +1,4 @@
-"""manifest.py의 상태 어휘와 Manifest·RetryMarker 모델을 검증한다."""
+"""manifest.py의 상태 어휘와 Manifest 모델을 검증한다."""
 
 from datetime import date, datetime
 
@@ -11,15 +11,11 @@ from manifest import (
     FailureReason,
     Manifest,
     Missing,
-    RetryMarker,
     RunStatus,
     Stage,
     StageField,
-    clear_retry_marker,
     load,
-    load_retry_markers,
     save,
-    save_retry_marker,
 )
 from pydantic import BaseModel, ValidationError
 from core.kst import KST
@@ -276,44 +272,3 @@ class TestSummarizeWindow:
         assert summary["repaired_count"] == 1
 
 
-class TestRetryMarker:
-    def test_save_then_load_round_trip(self):
-        marker = RetryMarker(
-            source_id="test_source",
-            window_start=WINDOW_START,
-            missing_parts=["page-002"],
-            first_failed_at=WINDOW_START,
-            expires_at=WINDOW_END,
-        )
-
-        save_retry_marker(marker)
-        loaded = load_retry_markers("test_source")
-
-        assert loaded == [marker]
-
-    def test_default_attempts_is_one(self):
-        marker = RetryMarker(
-            source_id="test_source",
-            window_start=WINDOW_START,
-            missing_parts=["page-002"],
-            first_failed_at=WINDOW_START,
-            expires_at=WINDOW_END,
-        )
-        assert marker.attempts == 1
-
-    def test_clear_removes_marker(self):
-        marker = RetryMarker(
-            source_id="test_source",
-            window_start=WINDOW_START,
-            missing_parts=["page-002"],
-            first_failed_at=WINDOW_START,
-            expires_at=WINDOW_END,
-        )
-        save_retry_marker(marker)
-
-        clear_retry_marker("test_source", WINDOW_START)
-
-        assert load_retry_markers("test_source") == []
-
-    def test_load_with_no_markers_returns_empty_list(self):
-        assert load_retry_markers("no_markers_here") == []

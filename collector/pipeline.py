@@ -1,47 +1,19 @@
-"""데이터 수집 파이프라인.
+"""window 하나를 수집해 Bronze·Silver·manifest로 남기는 파이프라인.
 
-실행 순서는 config 로드, manifest 로드, 재개 분기, (라운드를 돌며 조각마다 fetch
-후 bronze 즉시 저장), 완결도 게이트, normalize, 검증·정책 적용, silver·quarantine
-저장, manifest 마감(legacy 설정이면 retry marker 동기화) 순이다. 단계를 넘어갈
-때마다 manifest의 `stage`를 갱신해, 중간에 죽어도 다음 실행이 어디서부터 재개할지
-알 수 있게 한다.
+실행 순서는 manifest 로드, 재개 분기, fetch(조각마다 Bronze 즉시 저장), 완결도
+게이트, normalize, 검증, Silver·quarantine 저장, manifest 마감이다. 단계를 넘어갈
+때마다 manifest의 `stage`를 갱신해 다음 실행이 어디서부터 재개할지 알 수 있게 한다.
 
 재개 분기:
 
 | 조건 | 동작 |
 | --- | --- |
-| `stage=completed` (일반 실행) | authority 검증 후 `SKIPPED` 반환 |
-| `stage>=bronze_written` (일반 재실행) | 기존 revision의 bronze 로드(fetch 건너뜀) |
-| 누락 존재 & legacy `--backfill` | 기존 성공 조각 + 새 누락 조각을 새 Hot revision에 저장 |
+| `stage=completed` (`--force` 아님) | authority 검증 후 `SKIPPED` 반환 |
+| `stage>=bronze_written` (`--force` 아님) | 기존 revision의 Bronze 재사용(fetch 건너뜀) |
 | 그 외 (또는 `--force`) | 새 immutable Hot revision에 전체 fetch |
 
-bronze 재사용이 재개의 핵심인 이유: 실시간 API(5분 주기)는 몇 분만 지나도 그 시점
-데이터를 영영 받을 수 없다. 저장 실패 후 fetch부터 다시 하면 지금 시점의 다른
-데이터로 덮어쓰게 된다.
-
-    1회차: bronze ✓ → 정제 ✓ → silver ✗   stage=validated, status=FAILED
-    2회차: fetch 건너뜀(bronze 재사용) → 정제 ✓ → silver ✓   stage=completed, SUCCEEDED
-
-그 외 알아둘 점:
-- 조각 저장은 pipeline의 책임이다. 어댑터는 `yield`만 하고 저장소를 모른다.
-- `stage`는 fetch를 마친 뒤(라운드 소진 또는 예산 종료 시점)에만 올린다. 조각이
-  다 모였는지는 `stage`가 아니라 `completeness`·`missing`이 따로 표현하므로,
-  `stage=completed`이면서 불완전한 window도 있을 수 있다.
-- 수집 실행마다 별도 Hot revision을 쓰므로 조각 수가 달라져도 이전 revision의
-  유령 조각이 섞이지 않는다. manifest가 가리키는 revision과 `parts`만 읽는다.
-- `normalize`는 bronze 재사용 여부와 무관하게 항상 수행한다. 네트워크를 타지
-  않는 순수 변환이라 비용이 없다.
-- 검증은 window 전체가 모인 뒤 배치로 하므로 조각을 메모리에서 놓지 않는다(ADR 0003).
-
-조각 실패 처리: 조각 하나가 실패해도 window 전체를 버리지 않는다. 라운드 루프는
-`adapters/base`가 돌리고, pipeline은 성공 조각 저장 콜백과 종료 후 판정만 맡는다.
-
-    fetch 종료(라운드 소진 또는 예산 초과), 성공 조각으로 missing_ratio 계산,
-      max_missing_ratio 이내면 normalize → 검증 → drop_ratio 판정 → silver,
-      초과하면 silver 없이 FAILED(failure_reason=fetch_error)
-
-`FATAL`(인증 오류)만 예외다. 같은 실행의 추가 round를 돌지 않고 즉시
-`fetch_error`로 끝낸다.
+실시간 API는 몇 분만 지나도 그 시점 데이터를 다시 받을 수 없으므로, 저장 실패 뒤
+재실행은 반드시 기존 Bronze를 재사용한다.
 
 status 결정 규칙:
 
@@ -57,39 +29,22 @@ status 결정 규칙:
 | S3 쓰기 실패 | `FAILED` | `storage_error` |
 | 정책이 `FAIL_BATCH` 반환 | `FAILED` | `quality_gate` |
 
-게이트에 걸리면 silver를 쓰지 않는다(`artifacts.silver`는 null) — FAILED window에
-silver가 있으면 하류가 manifest 확인 없이 읽을 위험이 있다. quarantine은 실패
-원인 분석에 필요해 이 경우에도 쓰지만, 폐기 행이 0건이면 만들지 않는다. 두
-게이트는 독립이고 `drop_ratio`의 분모는 `fetched`다. `quality_gate` 실패는 같은
-bronze·config로 재시도해도 결과가 같아 config를 고쳐야 하고, `fetch_error`는 수집
-누락을 뜻한다 — 그래서 `failure_reason`으로 둘을 구분해 남긴다.
+게이트에 걸리면 Silver를 쓰지 않는다(`artifacts.silver`는 null). 하류가 manifest
+확인 없이 FAILED window의 Silver를 읽지 않게 하기 위해서다. quarantine은 실패 원인
+분석용이라 이 경우에도 쓰되, 폐기 행이 0건이면 만들지 않는다.
 
-legacy 백필 호환: 예전 설정처럼 `backfill.enabled`이면 `_retry_queue` 마커와
-`--backfill` 동작을 유지한다. 현재 운영 source 설정은 이 지연 백필을 켜지 않으므로
-기존 marker도 발견하지 않는다.
+`stage`의 최종 정지점:
+- `fetch_error`·`FATAL` — `BRONZE_WRITTEN`. 다음 실행이 기존 Bronze를 재사용한다.
+- `storage_error`·`quality_gate` — `VALIDATED`. `quality_gate`를 `COMPLETED`로 올리면
+  다음 실행이 곧장 `SKIPPED`(종료 코드 0)로 빠져 실패가 성공처럼 보인다.
+- `SUCCEEDED`·`PARTIAL`·`EMPTY` — `COMPLETED`.
 
-`stage`의 최종 정지점은 실패 종류별로 다르다.
-- `fetch_error`·`FATAL` — fetch 단계에서 끝났으므로 `BRONZE_WRITTEN`. 다음
-  실행은 manifest가 가리키는 기존 Bronze를 재사용한다.
-- `storage_error`·`quality_gate` — normalize·검증까지는 끝났으므로 `VALIDATED`.
-  `quality_gate`는 재시도해도 결과가 같지만 `COMPLETED`로 올리지 않는다.
-  그러면 다음 실행이 `missing.parts`가 빈 채로 곧장 `SKIPPED`(종료 코드 0)로
-  빠져 실패가 조용히 성공처럼 보이기 때문이다.
-- `SUCCEEDED`·`PARTIAL`·`EMPTY` — 더 할 일이 없으므로 `COMPLETED`.
+예외 처리 경계: quarantine·Silver 쓰기 예외와 `BatchValidationFailed`, authority
+manifest 확정 실패만 `FAILED` manifest로 바꾼다. 그 외 예외(예: `manifest.save`
+실패)는 결과를 남길 방법이 없으므로 그대로 올린다.
 
-예외 처리 경계: `write_silver`·`write_quarantine`·`write_bronze_part`의 예외와
-`validate_batch`의 `BatchValidationFailed`만 여기서 잡아 `FAILED` manifest로
-바꾼다. 그 외 예외(예: `manifest.save` 자체의 실패)는 삼키지 않고 그대로 올린다.
-실행 결과를 남길 방법이 없는 예외까지 잡으면 원인을 추적할 수 없기 때문이다.
-
-주의:
-- `attempt`는 mutable 진단 실행 횟수다. `revision`은 authoritative source content의
-  correction ordinal이며 최초 성공은 0, exact replay는 유지, changed content만 증가한다.
-- 각 단계 경계에서 로그 한 줄씩만 남긴다. 조각마다, 라운드마다 남기지 않는다.
-- 부분 성공의 종료 코드는 0이다. source별 누락 허용치 이내면 `PARTIAL`로 downstream
-  task를 스케줄하고, PARTIAL Silver를 실제 입력으로 사용할지는 각 소비자가 명시적으로
-  결정한다. 누락 허용치 초과를 포함한 모든 `FAILED`와 처리되지 않은 예외는 non-zero로
-  Airflow retry 대상이다.
+`attempt`는 mutable 진단 실행 횟수이고, `revision`은 authority content의 correction
+ordinal이다(최초 성공 0, exact replay 유지, 바뀐 content만 증가).
 """
 
 from __future__ import annotations
@@ -97,6 +52,7 @@ from __future__ import annotations
 import logging
 import math
 import time
+from dataclasses import dataclass
 from datetime import datetime
 
 import pyarrow as pa
@@ -115,25 +71,43 @@ from manifest import (
     FailureReason,
     Manifest,
     Missing,
-    RetryMarker,
     RunStatus,
     Stage,
 )
-from validation.engine import BatchValidationFailed, validate_batch
+from validation.engine import BatchOutcome, BatchValidationFailed, validate_batch
 from validation.types import RunContext
-
-_HTTP_TIMEOUT_SECONDS = 10.0
 
 logger = logging.getLogger(__name__)
 
 
-class ForceAndBackfillError(ValueError):
-    """`--force`와 `--backfill`은 목적이 반대라 동시에 줄 수 없다."""
+@dataclass(frozen=True, slots=True)
+class _WindowRun:
+    """fetch(또는 Bronze 재사용)를 마친 실행 하나의 상태."""
+
+    config: SourceConfig
+    window: Window
+    started_at: datetime
+    attempt: int
+    revision: int
+    bronze: BronzeArtifacts
+    chunks: dict[str, bytes]
+    missing_keys: dict[str, FetchErrorKind]
+    expected_total: int | None
+    planned_parts: tuple[str, ...]
 
 
-def _sorted_chunks(chunks: dict[str, bytes]) -> list[bytes]:
-    """조각을 키의 사전순으로 정렬해 값 목록만 반환한다."""
-    return [chunks[key] for key in sorted(chunks)]
+@dataclass(frozen=True, slots=True)
+class _Completeness:
+    """완결도 게이트를 통과한 뒤 확정한 cardinality와 누락 정보."""
+
+    expected_total: int | None
+    ratio: float
+    missing: Missing
+
+
+def _now() -> datetime:
+    """manifest의 started_at·ended_at에 쓸 KST 현재 시각을 반환한다."""
+    return datetime.now(KST)
 
 
 def _missing_ratio(
@@ -144,17 +118,7 @@ def _missing_ratio(
 ) -> float:
     """성공 조각만으로 누락 비율을 계산한다.
 
-    `expected_total`을 아는 소스(서울, 행 기준)는 실제 받은 행 수를 `normalize`로 세어 `1 - fetched_rows/expected_total`로 계산한다.
-    모르는 소스(기상청, 조각 기준)는 `누락 조각 수 / 계획된 조각 수`로 계산한다.
-    행을 세는 방식을 쓰는 이유는 어댑터마다 다른 조각 키 형식을 pipeline이 몰라도 되게하기 위해서다.
-
-    args:
-        missing_count: 라운드를 다 써도 못 받은 조각 수.
-        expected_total: 소스가 알려준 전체 행 수. 모르면 None.
-        fetched_rows: 성공한 조각을 normalize했을 때 나온 행 수.
-        collected_count: 성공한 조각 수.
-    returns:
-        0.0(누락 없음) ~ 1.0(전부 누락) 사이의 비율.
+    `expected_total`을 아는 소스(서울)는 행 기준, 모르는 소스(기상청)는 조각 기준이다.
     """
     if expected_total is not None:
         return max(0.0, 1 - (fetched_rows / expected_total)) if expected_total else 0.0
@@ -174,290 +138,170 @@ def _build_missing(
     return Missing(parts=parts, rows=None, basis="parts")
 
 
-def _sync_retry_marker(
-    config, window_start: datetime, missing: Missing, first_failed_at: datetime
-) -> str | None:
-    """이번 실행이 남긴 누락에 맞춰 `_retry_queue` 마커를 쓰거나·갱신하거나·지운다.
-
-    누락 조각이 남아 있으면 마커를 쓴다. 이미 마커가 있으면 `first_failed_at`은
-    그대로 두고(나이는 처음 실패한 시점부터 잰다) `missing_parts`만 최신값으로
-    바꾸고 `attempts`를 늘린다. 누락이 없어졌으면(이번에 다 채웠거나 애초에
-    없었으면) 기존 마커를 지운다. `backfill.enabled`가 아닌 소스는 채울 방법이
-    없는 마커를 쌓지 않도록 아예 건드리지 않는다. 이 경로는 기존 설정과 수동
-    도구의 호환용이며, 여기서는 `expires_at`만 계산해 남긴다.
-
-    args:
-        config: `backfill` 설정을 담은 소스 설정.
-        window_start: 이번 실행이 처리한 window의 시작 시각.
-        missing: 이번 실행이 최종적으로 도달한 누락 정보.
-        first_failed_at: 이번 실행을 첫 실패로 볼 때 쓸 시각. 기존 마커가 있으면
-            무시되고 그 마커의 값이 유지된다.
-    returns:
-        마커가 존재하게 됐으면 `"pending"`, 지워졌거나 애초에 필요 없었으면 `None`.
-        manifest의 `backfill_status` 필드에 그대로 쓰인다.
-    """
-    if config.backfill is None or not config.backfill.enabled:
-        return None
-
-    existing = next(
-        (
-            m
-            for m in manifest_module.load_retry_markers(config.source_id)
-            if m.window_start == window_start
-        ),
-        None,
-    )
-
-    if not missing.parts:
-        if existing is not None:
-            manifest_module.clear_retry_marker(config.source_id, window_start)
-        return None
-
-    first_failed = existing.first_failed_at if existing is not None else first_failed_at
-    manifest_module.save_retry_marker(
-        RetryMarker(
-            source_id=config.source_id,
-            window_start=window_start,
-            missing_parts=missing.parts,
-            first_failed_at=first_failed,
-            expires_at=first_failed + config.backfill.max_age,
-            attempts=(existing.attempts + 1) if existing is not None else 1,
-        )
-    )
-    return "pending"
+def _effective_plan(
+    planned_parts: frozenset[str] | None,
+    completed: tuple[str, ...],
+    missing: tuple[str, ...] = (),
+) -> tuple[str, ...]:
+    """adapter 계획이 없으면 관측한 전체 part 집합을 계획으로 쓴다."""
+    if planned_parts is None:
+        return tuple(sorted(frozenset(completed) | frozenset(missing)))
+    return tuple(sorted(planned_parts))
 
 
-def _now() -> datetime:
-    """KST aware 현재 시각. manifest의 started_at·ended_at에 쓴다."""
-    return datetime.now(KST)
-
-
-def get_backfill_targets(config: SourceConfig) -> list[dict[str, str]]:
-    """legacy 백필 실행 도구에 반환할 백필 대상 목록을 조회한다.
-
-    만료된 마커나 백필이 비활성화된 소스는 거르고, 실행에 필요한 최소한의
-    정보(source_id, window_start)만 JSON 반환용 dict로 추려 반환한다.
-    """
-    if config.backfill is None or not config.backfill.enabled:
-        return []
-
-    now = _now()
-    targets = []
-
-    for marker in manifest_module.load_retry_markers(config.source_id):
-        # 만료된 마커는 걸러낸다 (저장소 보존 주기에 의해 나중에 정리됨)
-        if now > marker.expires_at:
-            continue
-
-        targets.append(
-            {
-                "source_id": marker.source_id,
-                "window_start": marker.window_start.isoformat(),
-            }
-        )
-
-    # 과거 시간부터 채우도록 정렬
-    targets.sort(key=lambda x: x["window_start"])
-    return targets
+def _is_probe(config: SourceConfig) -> bool:
+    """빈 종료 페이지까지 탐색하는 서울 API 소스인지 판별한다."""
+    return config.adapter_params.get("pagination") == "probe_until_empty"
 
 
 def execute_window(
-    config,
+    config: SourceConfig,
     window_start: datetime,
     *,
     client,
     force: bool = False,
-    backfill: bool = False,
     sleep_fn=time.sleep,
 ) -> Manifest:
     """window 하나를 재개 분기에 따라 처리하고 최종 manifest를 반환한다.
 
-    fetch(또는 bronze 재사용) → 완결도 게이트 → normalize → 검증 → 폐기 게이트 →
-    immutable Silver·quarantine 저장 → mutable 진단 manifest → authority manifest
-    last-write 순으로 진행한다.
-    실패하더라도 예외를 올리지 않고 FAILED manifest를 만들어 반환한다
-    호출자(CLI)가 `status`만 보고 종료 코드를 정할 수 있게 하기 위해서다.
+    실패해도 예외를 올리지 않고 FAILED manifest를 반환해, 호출자(CLI)가 `status`만
+    보고 종료 코드를 정하게 한다.
 
-    args:
+    Args:
         config: 소스 설정.
         window_start: 수집 대상 window의 시작 시각.
         client: 어댑터에 주입할 httpx 클라이언트.
-        force: 재개 분기를 모두 무시하고 처음부터 다시 수집한다.
-        backfill: 완결된 window의 누락 조각만 채운다. `force`와 동시에 줄 수 없다.
+        force: 재개 분기를 무시하고 새 Hot revision에 전체 재수집한다.
         sleep_fn: 라운드 간 대기 함수.
-    returns:
+    Returns:
         이번 실행이 도달한 최종 manifest.
-    raises:
-        ForceAndBackfillError: `force`와 `backfill`을 동시에 줄 때.
     """
-    if force and backfill:
-        raise ForceAndBackfillError("--force와 --backfill은 함께 줄 수 없다")
-
-    window_end = window_start + config.schedule.interval
-    started_at = _now()
-    existing = manifest_module.load(config.source_id, window_start)
-    adapter_cls = get_adapter(config.adapter)
-    window = Window(window_start=window_start, window_end=window_end)
-    planned_parts = (
-        adapter_cls.planned_parts(config, window)
-        if hasattr(adapter_cls, "planned_parts")
-        else None
+    window = Window(
+        window_start=window_start, window_end=window_start + config.schedule.interval
     )
-    def _effective_plan(
-        completed: tuple[str, ...],
-        missing: tuple[str, ...] = (),
-    ) -> tuple[str, ...]:
-        """Adapter plan 또는 관측한 전체 part 집합을 정렬된 tuple로 반환한다."""
-        return tuple(
-            sorted(
-                planned_parts
-                if planned_parts is not None
-                else frozenset(completed) | frozenset(missing)
-            )
-        )
+    adapter_cls = get_adapter(config.adapter)
+    planned_parts = adapter_cls.planned_parts(config, window)
+    existing = manifest_module.load(config.source_id, window_start)
 
-    def _verify_completed_authority(value: Manifest) -> Manifest:
-        """완료 진단 manifest가 이미 확정된 authority와 같은지 검증한다."""
-        if value.status not in {RunStatus.SUCCEEDED, RunStatus.EMPTY}:
-            return value
-
-        authority_status = (
-            SourceSnapshotStatus.SUCCEEDED
-            if value.status is RunStatus.SUCCEEDED
-            else SourceSnapshotStatus.EMPTY
-        )
-        silver = None
-        if authority_status is SourceSnapshotStatus.SUCCEEDED:
-            if value.artifacts.silver is None:
-                raise RuntimeError("완료 SUCCEEDED manifest에 Silver key가 없습니다.")
-            try:
-                silver = storage.read_immutable_silver_artifact(
-                    value.artifacts.silver,
-                    row_count=value.counts.kept,
-                )
-            except ValueError:
-                # 전환 전 mutable Silver는 authority로 승격하지 않는다. Gold downstream은
-                # source snapshot manifest만 읽으므로 기존 진단 run은 계속 SKIPPED다.
-                return value
-
-        snapshots = manifest_module.load_source_snapshots(
-            config.source_id, window_start
-        )
-        if not snapshots:
-            raise RuntimeError(
-                "content-addressed 완료 run에 source authority manifest가 없습니다."
-            )
-        prepared = manifest_module.prepare_source_snapshot(
-            source_id=config.source_id,
-            logical_dttm=window_start,
-            status=authority_status,
-            config_version=value.config_version,
-            silver=silver,
-            counts=value.counts,
-            planned_parts=_effective_plan(value.artifacts.bronze.parts),
-            completed_parts=value.artifacts.bronze.parts,
-        )
-        if prepared.manifest != snapshots[-1].manifest:
-            raise RuntimeError(
-                "mutable 진단 manifest가 확정된 source authority와 다릅니다."
-            )
-        manifest_module.finalize_source_snapshot(prepared)
-        return value
-
-    if (
-        existing
-        and existing.stage == Stage.COMPLETED
-        and not force
-        and not (backfill and existing.missing.parts)
-    ):
-        # 분기 1: 이미 완결됐고 채울 누락도 없으면(또는 backfill이 아니면) 아무것도
-        # 하지 않는다. immutable output과 이미 확정된 authority manifest는 exact
-        # replay로 다시 검증하되 mutable 진단 파일에서 새 authority를 만들지는 않는다.
-        existing = _verify_completed_authority(existing)
+    if existing and existing.stage == Stage.COMPLETED and not force:
+        _verify_completed_authority(config, window_start, existing, planned_parts)
         logger.info("stage=completed status=skipped")
         return existing.model_copy(update={"status": RunStatus.SKIPPED})
 
-    if (
-        existing
-        and backfill
-        and existing.missing.parts
-        and existing.stage.value >= Stage.BRONZE_WRITTEN.value
-        and not force
-    ):
-        # 분기 4: legacy 백필. 기존 snapshot은 보존하고, 기존 성공 조각과 새 누락
-        # 조각을 합친 새 Hot revision을 만든다.
-        have_parts = existing.artifacts.bronze.parts
-        prior_revision = existing.artifacts.bronze.revision
-        prior_chunks = dict(
-            zip(
-                have_parts,
-                storage.read_bronze(
-                    config.source_id, window_start, have_parts, prior_revision
-                ),
+    run = _load_bronze(
+        config,
+        window,
+        existing,
+        adapter_cls=adapter_cls,
+        planned_parts=planned_parts,
+        force=force,
+        client=client,
+        sleep_fn=sleep_fn,
+    )
+
+    if FetchErrorKind.FATAL in run.missing_keys.values():
+        # 인증 오류는 나머지 조각도 같은 이유로 실패하므로 게이트·검증 없이 끝낸다.
+        return _fail_fetch(
+            run,
+            "reason=fatal",
+            missing=_build_missing(run.missing_keys, run.expected_total, 0),
+            counts=Counts(),
+        )
+    if _is_probe(config) and run.expected_total is None:
+        # 종료 페이지를 보기 전에 끝나면 전체 cardinality를 모른다. 잘린 대여소
+        # snapshot이 삭제·비활성화 authority가 되지 않게 normalize 전에 막는다.
+        return _fail_fetch(
+            run,
+            "reason=pagination_unconfirmed",
+            missing=_build_missing(run.missing_keys, None, 0),
+            counts=Counts(),
+        )
+
+    rows = adapter_cls.normalize([run.chunks[key] for key in sorted(run.chunks)], config)
+    completeness = _check_completeness(run, len(rows))
+    if isinstance(completeness, Manifest):
+        return completeness
+    if not rows:
+        return _finish_empty(run, completeness)
+    return _validate_and_store(run, rows, completeness)
+
+
+def _verify_completed_authority(
+    config: SourceConfig,
+    window_start: datetime,
+    value: Manifest,
+    planned_parts: frozenset[str] | None,
+) -> None:
+    """완료 진단 manifest가 이미 확정된 authority와 같은지 검증하고 다시 확정한다.
+
+    직전 실행이 진단 manifest만 쓰고 authority 기록 전에 죽었으면 여기서 채운다.
+    """
+    if value.status not in {RunStatus.SUCCEEDED, RunStatus.EMPTY}:
+        return
+
+    silver = None
+    if value.status is RunStatus.SUCCEEDED:
+        if value.artifacts.silver is None:
+            raise RuntimeError("완료 SUCCEEDED manifest에 Silver key가 없습니다.")
+        try:
+            silver = storage.read_immutable_silver_artifact(
+                value.artifacts.silver, row_count=value.counts.kept
             )
+        except ValueError:
+            # 전환 전 mutable Silver는 authority로 승격하지 않는다.
+            return
+
+    snapshots = manifest_module.load_source_snapshots(config.source_id, window_start)
+    if not snapshots:
+        raise RuntimeError(
+            "content-addressed 완료 run에 source authority manifest가 없습니다."
         )
-        bronze_revision = storage.next_bronze_revision(
-            config.source_id, window_start
-        )
-        for key, payload in prior_chunks.items():
-            storage.write_bronze_part(
-                config.source_id, window_start, key, payload, bronze_revision
-            )
-        round_result = fetch_with_rounds(
-            adapter_cls.fetch,
-            config,
-            window,
-            client=client,
-            skip=frozenset(have_parts),
-            expected_total=existing.counts.expected,
-            sleep_fn=sleep_fn,
-            on_chunk=lambda key, payload: storage.write_bronze_part(
-                config.source_id, window_start, key, payload, bronze_revision
-            ),
-            planned_parts=planned_parts,
-        )
-        chunks = {**prior_chunks, **round_result.chunks}
-        missing_keys = round_result.missing
-        # 이번에 새로 알아낸 값이 있으면 그걸 쓰고, 없으면 이전 실행이 남긴 값을 이어받는다.
-        expected_total = (
-            round_result.expected_total
-            if round_result.expected_total is not None
-            else existing.counts.expected
-        )
-        attempt = existing.attempt + 1
-        revision_base = existing.revision
-    elif (
-        existing
-        and existing.stage.value >= Stage.BRONZE_WRITTEN.value
-        and not force
-    ):
-        # 분기 2: bronze 재사용 — 이전 실행이 fetch까지는 끝냈지만(예: silver 쓰기
-        # 실패로 VALIDATED에서 멈췄음) 그 뒤에서 죽은 경우다. 지금 다시 fetch하면
-        # 실시간 API에서는 그 시점의 다른 데이터를 받게 되므로, 반드시 이전에 저장된
-        # bronze 조각을 그대로 재사용한다.
+    prepared = manifest_module.prepare_source_snapshot(
+        source_id=config.source_id,
+        logical_dttm=window_start,
+        status=(
+            SourceSnapshotStatus.SUCCEEDED
+            if value.status is RunStatus.SUCCEEDED
+            else SourceSnapshotStatus.EMPTY
+        ),
+        config_version=value.config_version,
+        silver=silver,
+        counts=value.counts,
+        planned_parts=_effective_plan(planned_parts, value.artifacts.bronze.parts),
+        completed_parts=value.artifacts.bronze.parts,
+    )
+    if prepared.manifest != snapshots[-1].manifest:
+        raise RuntimeError("mutable 진단 manifest가 확정된 source authority와 다릅니다.")
+    manifest_module.finalize_source_snapshot(prepared)
+
+
+def _load_bronze(
+    config: SourceConfig,
+    window: Window,
+    existing: Manifest | None,
+    *,
+    adapter_cls: type,
+    planned_parts: frozenset[str] | None,
+    force: bool,
+    client,
+    sleep_fn,
+) -> _WindowRun:
+    """기존 Bronze를 재사용하거나 새 Hot revision에 fetch해 실행 상태를 만든다."""
+    source_id = config.source_id
+    window_start = window.window_start
+    started_at = _now()
+
+    if existing and existing.stage >= Stage.BRONZE_WRITTEN and not force:
         parts = existing.artifacts.bronze.parts
-        bronze_revision = existing.artifacts.bronze.revision
+        revision = existing.artifacts.bronze.revision
         chunks = dict(
-            zip(
-                parts,
-                storage.read_bronze(
-                    config.source_id, window_start, parts, bronze_revision
-                ),
-            )
+            zip(parts, storage.read_bronze(source_id, window_start, parts, revision))
         )
-        # 조각 자체는 재시도하지 않으므로 실제 실패 종류는 중요하지 않다 — 아래
-        # 게이트 계산이 "재시도 불가능한 누락"으로만 취급하면 되므로 PERMANENT로 채운다.
+        # 조각을 다시 받지 않으므로 실패 종류는 게이트 계산에 영향이 없다.
         missing_keys = {key: FetchErrorKind.PERMANENT for key in existing.missing.parts}
         expected_total = existing.counts.expected
-        attempt = existing.attempt + 1
-        revision_base = existing.revision
     else:
-        # 분기 3(또는 --force): 처음부터 전체 fetch하되 이전 원본은 지우지 않는다.
-        # 새 immutable revision 경로라 조각 수가 줄어도 이전 실행의 유령 조각이
-        # 현재 snapshot에 섞이지 않는다.
-        bronze_revision = storage.next_bronze_revision(
-            config.source_id, window_start
-        )
+        revision = storage.next_bronze_revision(source_id, window_start)
         round_result = fetch_with_rounds(
             adapter_cls.fetch,
             config,
@@ -465,385 +309,324 @@ def execute_window(
             client=client,
             sleep_fn=sleep_fn,
             on_chunk=lambda key, payload: storage.write_bronze_part(
-                config.source_id, window_start, key, payload, bronze_revision
+                source_id, window_start, key, payload, revision
             ),
             planned_parts=planned_parts,
         )
         chunks = round_result.chunks
         missing_keys = round_result.missing
         expected_total = round_result.expected_total
-        attempt = (existing.attempt + 1) if existing else 1
-        revision_base = existing.revision if existing else 0
 
     bronze_parts = tuple(sorted(chunks))
-    authority_planned_parts = _effective_plan(bronze_parts, tuple(sorted(missing_keys)))
-    artifacts = Artifacts(
+    return _WindowRun(
+        config=config,
+        window=window,
+        started_at=started_at,
+        attempt=(existing.attempt + 1) if existing else 1,
+        revision=existing.revision if existing else 0,
         bronze=BronzeArtifacts(
-            prefix=storage.bronze_prefix(
-                config.source_id, window_start, bronze_revision
-            ),
+            prefix=storage.bronze_prefix(source_id, window_start, revision),
             parts=bronze_parts,
-            revision=bronze_revision,
-        )
+            revision=revision,
+        ),
+        chunks=chunks,
+        missing_keys=missing_keys,
+        expected_total=expected_total,
+        planned_parts=_effective_plan(
+            planned_parts, bronze_parts, tuple(sorted(missing_keys))
+        ),
     )
 
-    def _base_manifest(**over) -> Manifest:
-        # 실패 케이스가 대부분 같은 필드(source_id·window·attempt 등)를 반복하므로,
-        # 기본값은 "가장 이른 실패 지점"(FAILED, BRONZE_WRITTEN)으로 깔고 각
-        # 호출부가 필요한 값만 덮어쓴다.
-        fields = {
-            "source_id": config.source_id,
-            "window_start": window_start,
-            "window_end": window_end,
-            "status": RunStatus.FAILED,
-            "stage": Stage.BRONZE_WRITTEN,
-            "attempt": attempt,
-            "revision": revision_base,
-            "started_at": started_at,
-            "ended_at": _now(),
-            "artifacts": artifacts,
-            "config_version": config.config_version,
-        }
-        fields.update(over)
-        return Manifest(**fields)
 
-    def _finish(
-        *,
-        authority_status: SourceSnapshotStatus | None = None,
-        authority_silver: storage.ImmutableSilverArtifact | None = None,
-        **over,
-    ) -> Manifest:
-        """manifest를 만들고 마커를 동기화해 저장한 뒤 그대로 반환한다.
+def _check_completeness(run: _WindowRun, fetched_rows: int) -> _Completeness | Manifest:
+    """행 수로 cardinality를 확정하고 누락 게이트를 판정한다.
 
-        아래 모든 종료 지점이 공유한다. `missing`을 넘기지 않은 호출(FATAL 등)은
-        누락 없음으로 보고, 그 경우 마커도 건드리지 않는다. Authority 대상이면
-        immutable Silver를 이미 완성한 뒤 revision을 먼저 결정하고, mutable 진단
-        manifest와 retry marker를 기록한 다음 authority manifest를 마지막에 쓴다.
-        """
-        missing = over.get("missing", Missing())
-
-        prepared_authority = None
-        if authority_status is not None:
-            provisional = _base_manifest(**over)
-            if authority_status is SourceSnapshotStatus.SUCCEEDED:
-                if authority_silver is None:
-                    raise RuntimeError(
-                        "SUCCEEDED authority에 immutable Silver가 없습니다."
-                    )
-                if provisional.artifacts.silver != authority_silver.key:
-                    raise RuntimeError(
-                        "진단 manifest와 authority Silver key가 다릅니다."
-                    )
-                if provisional.counts.kept != authority_silver.row_count:
-                    raise RuntimeError(
-                        "Silver 실제 row 수와 authority count가 다릅니다."
-                    )
-            elif authority_silver is not None:
-                raise RuntimeError("EMPTY authority에는 Silver가 없어야 합니다.")
-            prepared_authority = manifest_module.prepare_source_snapshot(
-                source_id=config.source_id,
-                logical_dttm=window_start,
-                status=authority_status,
-                config_version=config.config_version,
-                silver=authority_silver,
-                counts=provisional.counts,
-                planned_parts=authority_planned_parts,
-                completed_parts=bronze_parts,
-            )
-            over["revision"] = prepared_authority.manifest.revision_no
-
-        # S3 원자적 갱신 불가 문제 해결: manifest 저장을 먼저 수행하고,
-        # 실패하지 않았을 때만 마커를 갱신/삭제해 무한 대기나 고아 마커를 방지한다.
-        status_str = (
-            "pending"
-            if (config.backfill and config.backfill.enabled and missing.parts)
-            else None
-        )
-        result = _base_manifest(backfill_status=status_str, **over)
-        manifest_module.save(result)
-
-        _sync_retry_marker(config, window_start, missing, started_at)
-        if prepared_authority is not None:
-            try:
-                manifest_module.finalize_source_snapshot(prepared_authority)
-            except Exception as exc:  # noqa: BLE001 — authority 부재를 명시적 실패로 남긴다
-                failed = result.model_copy(
-                    update={
-                        "status": RunStatus.FAILED,
-                        "stage": Stage.VALIDATED,
-                        "failure_reason": FailureReason.STORAGE_ERROR,
-                    }
-                )
-                manifest_module.save(failed)
-                logger.error(
-                    "stage=validated status=failed failure_reason=storage_error "
-                    f"reason=authority_manifest_write error={type(exc).__name__}"
-                )
-                return failed
-        return result
-
-    if FetchErrorKind.FATAL in missing_keys.values():
-        # FATAL(인증 오류 등)은 나머지 조각도 같은 이유로 실패할 게 뻔하므로, 게이트
-        # 계산도 검증도 건너뛰고 즉시 끝낸다. stage는 기본값 BRONZE_WRITTEN 그대로
-        # 둔다 — 실행 내부 round는 중단하고 Airflow 재실행 정책에 판정을 넘긴다.
-        logger.error(
-            "stage=bronze_written status=failed failure_reason=fetch_error reason=fatal"
-        )
-        missing = _build_missing(missing_keys, expected_total, fetched_rows=0)
-        return _finish(failure_reason=FailureReason.FETCH_ERROR, missing=missing)
-
-    if (
-        config.adapter_params.get("pagination") == "probe_until_empty"
-        and expected_total is None
-    ):
-        # Sentinel을 보기 전에 deadline이 끝나면 지금까지 받은 page가 정상처럼 보여도
-        # 전체 cardinality를 모른다. 이 상태를 completeness=1로 간주하면 잘린 station
-        # snapshot이 삭제·비활성화 authority가 되므로 normalize/Silver 전에 차단한다.
-        logger.error(
-            "stage=bronze_written status=failed failure_reason=fetch_error "
-            "reason=pagination_unconfirmed"
-        )
-        missing = _build_missing(missing_keys, expected_total, fetched_rows=0)
-        return _finish(
-            failure_reason=FailureReason.FETCH_ERROR,
-            missing=missing,
-            counts=Counts(expected=None, fetched=0),
-        )
-
-    # normalize는 bronze 재사용 여부와 무관하게 항상 다시 수행한다(네트워크를
-    # 타지 않는 순수 변환이라 비용이 없다). 그 결과로 나온 행 수를 "성공 조각으로
-    # 계산하는 missing_ratio"에도 그대로 재사용한다.
-    rows = adapter_cls.normalize(_sorted_chunks(chunks), config)
-    fetched_rows = len(rows)
-    if config.adapter_params.get("pagination") == "probe_until_empty":
-        # Probe adapter의 non-None expected_total은 빈 sentinel을 실제로 봤다는 완료
-        # marker다. Retry round는 이미 확보한 page를 skip할 수 있으므로 adapter 내부의
-        # 이번-round 누적값이 아니라 전체 Bronze를 normalize한 실제 cardinality로
-        # source count를 확정한다.
+    게이트에 걸리면 FAILED manifest를, 통과하면 확정한 완결도 정보를 반환한다.
+    """
+    quality = run.config.quality
+    expected_total = run.expected_total
+    if _is_probe(run.config):
+        # probe adapter의 expected_total은 종료 페이지를 봤다는 표시일 뿐이다. 재시도
+        # 라운드는 이미 받은 page를 건너뛰므로 전체 Bronze의 실제 행 수로 확정한다.
         expected_total = fetched_rows
-    ratio = _missing_ratio(len(missing_keys), expected_total, fetched_rows, len(chunks))
-    missing = _build_missing(missing_keys, expected_total, fetched_rows)
-
-    parts_summary = f"{len(chunks)}/{len(chunks) + len(missing_keys)}"
+    parts_summary = f"{len(run.chunks)}/{len(run.chunks) + len(run.missing_keys)}"
 
     if expected_total is not None and fetched_rows > expected_total:
-        # 1 - fetched/expected를 0으로 clamp하면 probe 재시도 사이 snapshot이
-        # 축소·재정렬돼 옛 Bronze payload와 새 total이 섞인 상태를 완결로 오인한다.
-        # 초과분을 임의로 자를 근거도 없으므로 Silver를 쓰지 않고 force 재수집이
-        # 필요한 명시적 fetch 실패로 남긴다.
-        #
-        # 단, 행이 쌓이기만 하는 소스는 진행 중인 window를 조회할 때 API가 같은
-        # 본문 안에서 list_total_count보다 많은 row를 주는 일이 있다(실측: 대여이력
-        # rows=989 expected=988). 그 초과분은 잘린 데이터가 아니라 카운트 계산과
-        # 직렬화 사이에 들어온 실제 레코드이므로, max_overfetch_ratio를 연 소스는
-        # 경고만 남기고 통과시킨다. 페이지 중복 병합 같은 진짜 사고는 최소 +100%라
-        # 작은 허용치로도 계속 걸린다.
-        allowed_total = expected_total * (1 + config.quality.max_overfetch_ratio)
-        if fetched_rows > allowed_total:
-            logger.error(
-                "stage=bronze_written status=failed failure_reason=fetch_error "
-                f"reason=fetched_exceeds_expected parts={parts_summary} "
-                f"rows={fetched_rows} expected={expected_total} "
-                f"allowed={allowed_total:.0f}"
-            )
-            return _finish(
-                failure_reason=FailureReason.FETCH_ERROR,
-                missing=missing,
-                counts=Counts(expected=expected_total, fetched=fetched_rows),
-            )
-        logger.warning(
-            f"stage=bronze_written reason=fetched_exceeds_expected_within_tolerance "
+        # 진행 중인 window를 조회하면 API가 list_total_count보다 많은 행을 주는 일이
+        # 있다(대여이력 rows=989 expected=988). 페이지 중복 병합 같은 사고는 최소
+        # +100%라 작은 허용치로도 걸러지므로, 허용치 안이면 실제 행 수로 확정한다.
+        allowed_total = expected_total * (1 + quality.max_overfetch_ratio)
+        detail = (
             f"parts={parts_summary} rows={fetched_rows} expected={expected_total} "
             f"allowed={allowed_total:.0f}"
         )
-        # 허용치 안의 초과는 "카운트가 뒤처졌다"고 판정한 것이므로, 실제 행 수를 이
-        # window의 cardinality로 확정한다. Gold의 SUCCEEDED 계약이 expected==fetched를
-        # 요구하기도 한다(core.source_snapshot._validate_succeeded).
+        if fetched_rows > allowed_total:
+            return _fail_fetch(
+                run,
+                f"reason=fetched_exceeds_expected {detail}",
+                missing=_build_missing(run.missing_keys, expected_total, fetched_rows),
+                counts=Counts(expected=expected_total, fetched=fetched_rows),
+            )
+        logger.warning(
+            f"stage=bronze_written reason=fetched_exceeds_expected_within_tolerance {detail}"
+        )
+        # Gold의 SUCCEEDED 계약이 expected==fetched를 요구한다.
         expected_total = fetched_rows
-        ratio = _missing_ratio(
-            len(missing_keys), expected_total, fetched_rows, len(chunks)
-        )
-        missing = _build_missing(missing_keys, expected_total, fetched_rows)
 
-    exceeds_missing_gate = ratio > config.quality.max_missing_ratio and not math.isclose(
-        ratio,
-        config.quality.max_missing_ratio,
-        rel_tol=0.0,
-        abs_tol=1e-12,
+    ratio = _missing_ratio(
+        len(run.missing_keys), expected_total, fetched_rows, len(run.chunks)
     )
-    if exceeds_missing_gate:
-        # 완결도 게이트 초과 — silver를 쓰지 않고 fetch_error로 끝낸다. stage는
-        # BRONZE_WRITTEN 그대로라 재실행하면 기존 Bronze 재사용 분기로 들어간다.
-        logger.error(
-            "stage=bronze_written status=failed failure_reason=fetch_error "
-            f"parts={parts_summary} missing_ratio={ratio:.3f}"
-        )
-        return _finish(
-            failure_reason=FailureReason.FETCH_ERROR,
-            missing=missing,
+    if ratio > quality.max_missing_ratio and not math.isclose(
+        ratio, quality.max_missing_ratio, rel_tol=0.0, abs_tol=1e-12
+    ):
+        return _fail_fetch(
+            run,
+            f"parts={parts_summary} missing_ratio={ratio:.3f}",
+            missing=_build_missing(run.missing_keys, expected_total, fetched_rows),
             counts=Counts(expected=expected_total, fetched=fetched_rows),
         )
 
-    # 여기 도달했다는 것은 완결도 게이트를 통과했다는 뜻이다 — fetch 단계 경계의
-    # 로그 한 줄을 여기서 남긴다. 누락이 남아 있으면 WARNING, 없으면 INFO.
-    bronze_bytes = sum(len(v) for v in chunks.values())
-    if missing_keys:
+    bronze_bytes = sum(len(v) for v in run.chunks.values())
+    summary = f"stage=bronze_written parts={parts_summary} rows={fetched_rows} bytes={bronze_bytes}"
+    if run.missing_keys:
         logger.warning(
-            f"stage=bronze_written parts={parts_summary} rows={fetched_rows} bytes={bronze_bytes} "
-            f"missing={','.join(sorted(missing_keys))} completeness={1.0 - ratio:.3f}"
+            f"{summary} missing={','.join(sorted(run.missing_keys))} "
+            f"completeness={1.0 - ratio:.3f}"
         )
     else:
-        logger.info(
-            f"stage=bronze_written parts={parts_summary} rows={fetched_rows} bytes={bronze_bytes}"
-        )
-
-    if fetched_rows == 0:
-        # 행이 0건이면 검증을 돌릴 대상이 없으므로 여기서 바로 갈린다. allow_empty인
-        # 소스(행사 등)만 정상 종료로 인정하고, 그 외에는 quality_gate로 묶는다.
-        confirmed_empty = (
-            expected_total == 0
-            and not missing.parts
-            and bool(bronze_parts)
-            and authority_planned_parts == bronze_parts
-        )
-        if config.quality.allow_empty and confirmed_empty:
-            logger.info("stage=completed status=empty")
-            return _finish(
-                status=RunStatus.EMPTY,
-                stage=Stage.COMPLETED,
-                failure_reason=None,
-                missing=missing,
-                counts=Counts(expected=expected_total),
-                completeness=1.0,
-                authority_status=SourceSnapshotStatus.EMPTY,
-            )
-        logger.error(
-            "stage=validated status=failed failure_reason=quality_gate "
-            "rows=0 reason=unconfirmed_empty"
-        )
-        return _finish(
-            stage=Stage.VALIDATED,
-            failure_reason=FailureReason.QUALITY_GATE,
-            missing=missing,
-            counts=Counts(expected=expected_total),
-        )
-
-    ctx = RunContext(
-        source_id=config.source_id,
-        window_start=window_start,
-        window_end=window_end,
-        attempt=attempt,
+        logger.info(summary)
+    return _Completeness(
+        expected_total=expected_total,
+        ratio=ratio,
+        missing=_build_missing(run.missing_keys, expected_total, fetched_rows),
     )
+
+
+def _finish_empty(run: _WindowRun, completeness: _Completeness) -> Manifest:
+    """행이 0건인 window를 EMPTY 또는 quality_gate 실패로 마감한다."""
+    confirmed_empty = (
+        completeness.expected_total == 0
+        and not completeness.missing.parts
+        and bool(run.bronze.parts)
+        and run.planned_parts == run.bronze.parts
+    )
+    counts = Counts(expected=completeness.expected_total)
+    if run.config.quality.allow_empty and confirmed_empty:
+        logger.info("stage=completed status=empty")
+        return _finish(
+            run,
+            status=RunStatus.EMPTY,
+            stage=Stage.COMPLETED,
+            missing=completeness.missing,
+            counts=counts,
+            completeness=1.0,
+            authority_status=SourceSnapshotStatus.EMPTY,
+        )
+    logger.error(
+        "stage=validated status=failed failure_reason=quality_gate "
+        "rows=0 reason=unconfirmed_empty"
+    )
+    return _finish(
+        run,
+        stage=Stage.VALIDATED,
+        failure_reason=FailureReason.QUALITY_GATE,
+        missing=completeness.missing,
+        counts=counts,
+    )
+
+
+def _validate_and_store(
+    run: _WindowRun, rows: list[dict], completeness: _Completeness
+) -> Manifest:
+    """행을 검증해 폐기 게이트를 판정하고 quarantine·Silver를 저장한다."""
+    config = run.config
+    missing = completeness.missing
     try:
-        outcome = validate_batch(rows, config, ctx)
+        outcome = validate_batch(
+            rows,
+            config,
+            RunContext(
+                source_id=config.source_id,
+                window_start=run.window.window_start,
+                window_end=run.window.window_end,
+                attempt=run.attempt,
+            ),
+        )
     except BatchValidationFailed:
-        # 컬럼 정책이 FAIL_BATCH를 반환했다 — 그 시점 이후 행은 처리되지 않았으므로
-        # silver·quarantine 어느 쪽도 쓸 수 없다. 같은 bronze + 같은 config면
-        # 재시도해도 결과가 같으므로 config를 고쳐야 하는 quality_gate로 남긴다.
+        # 같은 Bronze·config면 재시도해도 결과가 같으므로 config를 고쳐야 한다.
         logger.error(
             "stage=validated status=failed failure_reason=quality_gate reason=fail_batch"
         )
         return _finish(
+            run,
             stage=Stage.VALIDATED,
             failure_reason=FailureReason.QUALITY_GATE,
             missing=missing,
-            counts=Counts(expected=expected_total, fetched=fetched_rows),
+            counts=Counts(expected=completeness.expected_total, fetched=len(rows)),
         )
 
-    counts = Counts(expected=expected_total, **outcome.counts)
-    column_issues = {
-        col: ColumnIssueCount(**v) for col, v in outcome.column_issues.items()
-    }
-    # 아래 세 종료 지점(quarantine 실패·drop_ratio 초과·silver 실패)이 공통으로 남길
-    # 필드. artifacts만 지점마다 달라(quarantine 키가 언제 붙는지) 따로 넘긴다.
+    exceeds_drop_gate = outcome.drop_ratio > config.quality.max_drop_ratio
+    _log_validated(outcome, completeness, exceeds_drop_gate)
     common = {
         "missing": missing,
-        "counts": counts,
-        "column_issues": column_issues,
+        "counts": Counts(expected=completeness.expected_total, **outcome.counts),
+        "column_issues": {
+            col: ColumnIssueCount(**v) for col, v in outcome.column_issues.items()
+        },
         "policy_actions": outcome.policy_actions,
         "drop_ratio": outcome.drop_ratio,
     }
-
-    # 데이터 품질 관점의 validated 단계 경계 로그. 폐기 게이트 초과 여부는 이 시점에
-    # 이미 알 수 있으므로 여기서 ERROR로 확정해 남긴다 — 뒤에 storage_error가 나면
-    # 그건 별개 사건이라 각자 자기 ERROR 줄을 남긴다(둘이 겹쳐도 서로 다른 사유다).
-    validated_summary = (
-        f"stage=validated kept={outcome.counts['kept']} repaired={outcome.counts['repaired']} "
-        f"dropped={outcome.counts['dropped']} drop_ratio={outcome.drop_ratio:.3f} completeness={1.0 - ratio:.3f}"
-    )
-    if outcome.drop_ratio > config.quality.max_drop_ratio:
-        logger.error(f"{validated_summary} status=failed failure_reason=quality_gate")
-    elif outcome.counts["dropped"] or missing.parts:
-        logger.warning(f"{validated_summary} status=partial")
-    else:
-        logger.info(f"{validated_summary} status=succeeded")
+    window_start = run.window.window_start
 
     try:
-        # 폐기 행이 없으면 quarantine 객체 자체를 만들지 않는다(빈 객체를 굳이 남기지 않는다).
-        quarantine_key = (
-            storage.write_quarantine(
-                config.source_id, window_start, outcome.quarantine_records
-            )
-            if outcome.quarantine_records
-            else None
+        quarantine_key = storage.write_quarantine(
+            config.source_id, window_start, outcome.quarantine_records
         )
     except Exception:  # noqa: BLE001 — 저장소 예외 종류를 가리지 않고 storage_error로 묶는다
         logger.error(
             "stage=validated status=failed failure_reason=storage_error reason=quarantine_write"
         )
         return _finish(
-            stage=Stage.VALIDATED, failure_reason=FailureReason.STORAGE_ERROR, **common
+            run, stage=Stage.VALIDATED, failure_reason=FailureReason.STORAGE_ERROR, **common
         )
 
-    if outcome.drop_ratio > config.quality.max_drop_ratio:
-        # 폐기 게이트 초과 — silver는 쓰지 않지만 quarantine은 남긴다(왜 실패했는지
-        # 분석하려면 폐기된 행이 필요하다).
+    if exceeds_drop_gate:
         return _finish(
+            run,
             stage=Stage.VALIDATED,
             failure_reason=FailureReason.QUALITY_GATE,
+            artifacts=Artifacts(bronze=run.bronze, quarantine=quarantine_key),
             **common,
-            artifacts=Artifacts(bronze=artifacts.bronze, quarantine=quarantine_key),
         )
 
     try:
-        silver_artifact = storage.write_immutable_silver(
-            config.source_id,
-            window_start,
-            pa.Table.from_pylist(outcome.silver_rows),
+        silver = storage.write_immutable_silver(
+            config.source_id, window_start, pa.Table.from_pylist(outcome.silver_rows)
         )
     except Exception:  # noqa: BLE001 — 저장소 예외 종류를 가리지 않고 storage_error로 묶는다
         logger.error(
             "stage=validated status=failed failure_reason=storage_error reason=silver_write"
         )
         return _finish(
+            run,
             stage=Stage.VALIDATED,
             failure_reason=FailureReason.STORAGE_ERROR,
+            artifacts=Artifacts(bronze=run.bronze, quarantine=quarantine_key),
             **common,
-            artifacts=Artifacts(bronze=artifacts.bronze, quarantine=quarantine_key),
         )
 
-    # 폐기·누락이 전혀 없을 때만 SUCCEEDED이고, 그 외(둘 중 하나라도 게이트 이내로
-    # 존재)에는 PARTIAL이다. Source correction ordinal은 mutable 실행 횟수가 아니라
-    # authority content 비교로 정하므로 여기서 임의로 증가시키지 않는다.
-    status = (
-        RunStatus.SUCCEEDED
-        if outcome.counts["dropped"] == 0 and ratio == 0.0
-        else RunStatus.PARTIAL
-    )
-    logger.info(f"stage=completed status={status.value} key={silver_artifact.key}")
+    succeeded = outcome.counts["dropped"] == 0 and completeness.ratio == 0.0
+    status = RunStatus.SUCCEEDED if succeeded else RunStatus.PARTIAL
+    logger.info(f"stage=completed status={status.value} key={silver.key}")
+    # PARTIAL은 authority manifest를 열지 않는다.
     return _finish(
+        run,
         status=status,
         stage=Stage.COMPLETED,
-        failure_reason=None,
-        completeness=1.0 - ratio,
-        **common,
+        completeness=1.0 - completeness.ratio,
         artifacts=Artifacts(
-            bronze=artifacts.bronze,
-            silver=silver_artifact.key,
-            quarantine=quarantine_key,
+            bronze=run.bronze, silver=silver.key, quarantine=quarantine_key
         ),
-        authority_status=(
-            SourceSnapshotStatus.SUCCEEDED if status is RunStatus.SUCCEEDED else None
-        ),
-        authority_silver=(silver_artifact if status is RunStatus.SUCCEEDED else None),
+        authority_status=SourceSnapshotStatus.SUCCEEDED if succeeded else None,
+        authority_silver=silver if succeeded else None,
+        **common,
     )
+
+
+def _log_validated(
+    outcome: BatchOutcome, completeness: _Completeness, exceeds_drop_gate: bool
+) -> None:
+    """validated 단계 경계 로그 한 줄을 남긴다."""
+    counts = outcome.counts
+    summary = (
+        f"stage=validated kept={counts['kept']} repaired={counts['repaired']} "
+        f"dropped={counts['dropped']} drop_ratio={outcome.drop_ratio:.3f} "
+        f"completeness={1.0 - completeness.ratio:.3f}"
+    )
+    if exceeds_drop_gate:
+        logger.error(f"{summary} status=failed failure_reason=quality_gate")
+    elif counts["dropped"] or completeness.missing.parts:
+        logger.warning(f"{summary} status=partial")
+    else:
+        logger.info(f"{summary} status=succeeded")
+
+
+def _fail_fetch(
+    run: _WindowRun, detail: str, *, missing: Missing, counts: Counts
+) -> Manifest:
+    """fetch_error로 실패한 manifest를 BRONZE_WRITTEN 단계로 마감한다."""
+    logger.error(
+        f"stage=bronze_written status=failed failure_reason=fetch_error {detail}"
+    )
+    return _finish(
+        run, failure_reason=FailureReason.FETCH_ERROR, missing=missing, counts=counts
+    )
+
+
+def _base_manifest(run: _WindowRun, **over) -> Manifest:
+    """가장 이른 실패 지점(FAILED, BRONZE_WRITTEN)을 기본값으로 manifest를 만든다."""
+    fields = {
+        "source_id": run.config.source_id,
+        "window_start": run.window.window_start,
+        "window_end": run.window.window_end,
+        "status": RunStatus.FAILED,
+        "stage": Stage.BRONZE_WRITTEN,
+        "attempt": run.attempt,
+        "revision": run.revision,
+        "started_at": run.started_at,
+        "ended_at": _now(),
+        "artifacts": Artifacts(bronze=run.bronze),
+        "config_version": run.config.config_version,
+    }
+    fields.update(over)
+    return Manifest(**fields)
+
+
+def _finish(
+    run: _WindowRun,
+    *,
+    authority_status: SourceSnapshotStatus | None = None,
+    authority_silver: storage.ImmutableSilverArtifact | None = None,
+    **over,
+) -> Manifest:
+    """진단 manifest를 저장하고, authority 대상이면 authority manifest를 마지막에 쓴다.
+
+    authority revision을 먼저 결정해 진단 manifest의 `revision`에 싣는다. authority
+    확정에 실패하면 진단 manifest를 `storage_error`로 다시 저장한다.
+    """
+    prepared = None
+    if authority_status is not None:
+        prepared = manifest_module.prepare_source_snapshot(
+            source_id=run.config.source_id,
+            logical_dttm=run.window.window_start,
+            status=authority_status,
+            config_version=run.config.config_version,
+            silver=authority_silver,
+            counts=over["counts"],
+            planned_parts=run.planned_parts,
+            completed_parts=run.bronze.parts,
+        )
+        over["revision"] = prepared.manifest.revision_no
+
+    result = _base_manifest(run, **over)
+    manifest_module.save(result)
+    if prepared is None:
+        return result
+
+    try:
+        manifest_module.finalize_source_snapshot(prepared)
+    except Exception as exc:  # noqa: BLE001 — authority 부재를 명시적 실패로 남긴다
+        failed = result.model_copy(
+            update={
+                "status": RunStatus.FAILED,
+                "stage": Stage.VALIDATED,
+                "failure_reason": FailureReason.STORAGE_ERROR,
+            }
+        )
+        manifest_module.save(failed)
+        logger.error(
+            "stage=validated status=failed failure_reason=storage_error "
+            f"reason=authority_manifest_write error={type(exc).__name__}"
+        )
+        return failed
+    return result

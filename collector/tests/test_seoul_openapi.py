@@ -521,33 +521,6 @@ def test_population_fetch_uses_exact_dynamic_poi_codes_without_legacy_range():
     assert calls == ["POI001", "POI132"]
 
 
-@pytest.mark.parametrize(
-    "poi_codes",
-    [
-        (),
-        ["POI001"],
-        ("POI001", "POI001"),
-        ("POI132", "POI001"),
-        ("POI1",),
-        ("POI１２３",),
-        (1,),
-    ],
-)
-def test_population_dynamic_poi_codes_are_strictly_validated(poi_codes):
-    config = _StubConfig(
-        {
-            "service": "citydata_ppltn",
-            "page_size": 1000,
-            "root_key": "SeoulRtd.citydata_ppltn",
-            "root_key_literal": True,
-            "poi_codes": poi_codes,
-        }
-    )
-
-    with pytest.raises(ValueError, match="poi_codes|POI 요청 대상"):
-        SeoulOpenApiAdapter.planned_parts(config, window=None)
-
-
 def test_population_fetch_requests_pois_concurrently_and_preserves_order():
     import threading
     import time

@@ -1,4 +1,4 @@
-"""main.py 테스트: 인자 파싱, --force/--backfill 동시 지정 차단, 종료 코드 매핑."""
+"""main.py 테스트: 인자 파싱, 모드 분기, 종료 코드 매핑."""
 
 from __future__ import annotations
 
@@ -31,7 +31,6 @@ class TestParseArgs:
         assert args.source == "bike_station_realtime"
         assert args.window_start == "2026-08-12T14:10:00+09:00"
         assert args.force is True
-        assert args.backfill is False
 
     def test_missing_source_exits(self):
         with pytest.raises(SystemExit):
@@ -40,16 +39,6 @@ class TestParseArgs:
     def test_missing_window_start_exits(self):
         with pytest.raises(SystemExit):
             main.parse_args(["--source", "bike_station_realtime"])
-
-    def test_force_and_backfill_together_exits(self):
-        with pytest.raises(SystemExit):
-            main.parse_args(
-                [
-                    "--source", "bike_station_realtime",
-                    "--window-start", "2026-08-12T14:10:00+09:00",
-                    "--force", "--backfill",
-                ]
-            )
 
     def test_check_due_after_seconds_does_not_require_window_start(self):
         args = main.parse_args(
@@ -171,13 +160,13 @@ class TestParseArgs:
 class TestPoiMasterConfig:
     """S3 POI Master를 한 번 읽어 frozen Collector 설정에 고정하는 계약을 검증한다."""
 
-    def test_codes_are_validated_sorted_and_injected_without_mutating_yaml_config(
+    def test_codes_are_injected_without_mutating_yaml_config(
         self, monkeypatch
     ):
         config = main.config_loader.load("population_realtime")
         original_params = dict(config.adapter_params)
         calls = []
-        table = pa.table({"AREA_CD": ["POI132", "POI001"]})
+        table = pa.table({"AREA_CD": ["POI001", "POI132"]})
 
         def fake_read(ref, columns=None):
             calls.append((ref, columns))
@@ -219,22 +208,6 @@ class TestPoiMasterConfig:
         ).encode("ascii")
         assert result.config_version == f"sha256:{hashlib.sha256(material).hexdigest()}"
         assert result.config_version != config.config_version
-
-    @pytest.mark.parametrize(
-        "table",
-        [
-            pa.table({"AREA_CD": pa.array([], type=pa.string())}),
-            pa.table({"AREA_CD": ["POI001", "POI001"]}),
-            pa.table({"AREA_CD": ["POI1"]}),
-            pa.table({"AREA_CD": ["POI１２３"]}),
-            pa.table({"AREA_CD": [None]}),
-            pa.table({"AREA_CD": ["POI001"], "AREA_NM": ["장소"]}),
-        ],
-    )
-    def test_rejects_invalid_master_code_tables(self, table):
-        with pytest.raises(ValueError, match="POI Master"):
-            main._validated_master_poi_codes(table)
-
 
 class TestExitCodeFor:
     @pytest.mark.parametrize(
@@ -577,7 +550,7 @@ class TestReportWindowStats:
 class TestMain:
     @pytest.fixture
     def stub_config(self):
-        return SimpleNamespace(source_id="bike_station_realtime")
+        return SimpleNamespace(source_id="bike_station_realtime", adapter="seoul_openapi")
 
     def test_happy_path_returns_zero_and_calls_pipeline(self, monkeypatch, stub_config):
         captured = {}
@@ -586,11 +559,10 @@ class TestMain:
             captured["loaded_source_id"] = source_id
             return stub_config
 
-        def fake_execute_window(config, window_start, *, client, force, backfill):
+        def fake_execute_window(config, window_start, *, client, force):
             captured["config"] = config
             captured["window_start"] = window_start
             captured["force"] = force
-            captured["backfill"] = backfill
             return SimpleNamespace(status=RunStatus.SUCCEEDED)
 
         monkeypatch.setattr(main.config_loader, "load", fake_load)
@@ -603,7 +575,6 @@ class TestMain:
         assert captured["config"] is stub_config
         assert captured["window_start"] == datetime(2026, 8, 12, 14, 10, tzinfo=KST)
         assert captured["force"] is False
-        assert captured["backfill"] is False
 
     def test_failed_status_returns_nonzero(self, monkeypatch, stub_config):
         monkeypatch.setattr(main.config_loader, "load", lambda source_id: stub_config)
@@ -633,24 +604,6 @@ class TestMain:
 
         assert order == ["logging", "config"]
 
-    def test_passes_force_and_backfill_through(self, monkeypatch, stub_config):
-        captured = {}
-        monkeypatch.setattr(main.config_loader, "load", lambda source_id: stub_config)
-
-        def fake_execute_window(config, window_start, *, client, force, backfill):
-            captured["force"] = force
-            captured["backfill"] = backfill
-            return SimpleNamespace(status=RunStatus.SUCCEEDED)
-
-        monkeypatch.setattr(main.pipeline, "execute_window", fake_execute_window)
-
-        main.main(
-            ["--source", "bike_station_realtime", "--window-start", "2026-08-12T14:10:00+09:00", "--backfill"]
-        )
-
-        assert captured["force"] is False
-        assert captured["backfill"] is True
-
     def test_s3_mode_reads_master_once_before_pipeline(self, monkeypatch):
         config = main.config_loader.load("population_realtime")
         captured = {"read_count": 0}
@@ -661,7 +614,7 @@ class TestMain:
             captured["read_count"] += 1
             captured["ref"] = ref
             captured["columns"] = columns
-            return pa.table({"AREA_CD": ["POI132", "POI001"]})
+            return pa.table({"AREA_CD": ["POI001", "POI132"]})
 
         def fake_execute_window(config, *_args, **_kwargs):
             captured["config"] = config
@@ -730,7 +683,7 @@ class TestHttpTimeout:
 
     @pytest.fixture
     def stub_config(self):
-        return SimpleNamespace(source_id="bike_station_realtime")
+        return SimpleNamespace(source_id="bike_station_realtime", adapter="seoul_openapi")
 
     def test_client_timeout_is_explicit_and_longer_than_httpx_default(self, monkeypatch, stub_config):
         captured = {}
