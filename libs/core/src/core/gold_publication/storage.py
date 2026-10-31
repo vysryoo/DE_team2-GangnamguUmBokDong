@@ -159,7 +159,6 @@ class S3ImmutableObjectStore:
         location = _parse_s3_uri(uri)
         if type(payload) is not bytes:
             raise TypeError("immutable object payload는 bytes여야 합니다.")
-
         actual_sha256 = sha256_hex(payload)
         if expected_sha256 is not None:
             expected = validate_sha256_hex(expected_sha256)
@@ -172,19 +171,14 @@ class S3ImmutableObjectStore:
             _validate_canonical_json(uri, payload)
 
         for attempt in range(_CONDITIONAL_RETRY_LIMIT):
-            conflict = self._put_if_absent(uri, location, payload)
-            if not conflict:
+            if not self._put_if_absent(uri, location, payload):
                 return ImmutablePutOutcome.CREATED
-
-            try:
-                existing = self._read_exact(uri, location)
-            except ObjectMissingError as exc:
-                if attempt + 1 < _CONDITIONAL_RETRY_LIMIT:
-                    continue
-                raise ObjectStoreAccessError(
-                    f"조건부 쓰기 충돌 뒤 object를 확인할 수 없습니다: uri={uri}"
-                ) from exc
-
+            # 충돌 직후 기존 object가 사라진 경우만 조건부 PUT을 다시 시도함
+            existing = self._read_after_conflict(
+                uri, location, is_last_attempt=attempt + 1 == _CONDITIONAL_RETRY_LIMIT
+            )
+            if existing is None:
+                continue
             if existing == payload:
                 return ImmutablePutOutcome.ALREADY_EXISTS
             raise ObjectCollisionError(
@@ -195,6 +189,19 @@ class S3ImmutableObjectStore:
         raise ObjectStoreAccessError(
             f"immutable object 조건부 쓰기를 완료하지 못했습니다: {uri}"
         )
+
+    def _read_after_conflict(
+        self, uri: str, location: _S3Location, *, is_last_attempt: bool
+    ) -> bytes | None:
+        """조건부 쓰기 충돌 뒤 기존 bytes를 읽는다. 사라졌으면 재시도할 수 있게 None을 반환한다."""
+        try:
+            return self._read_exact(uri, location)
+        except ObjectMissingError as exc:
+            if not is_last_attempt:
+                return None
+            raise ObjectStoreAccessError(
+                f"조건부 쓰기 충돌 뒤 object를 확인할 수 없습니다: uri={uri}"
+            ) from exc
 
     def put_verified(
         self,
