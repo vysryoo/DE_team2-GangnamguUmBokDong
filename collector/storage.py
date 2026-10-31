@@ -22,7 +22,6 @@ from core.gold_publication.storage import S3ImmutableObjectStore
 from core.kst import KST
 from core.s3 import (
     S3Object,
-    delete_objects,
     get_object_bytes,
     list_keys,
     list_objects,
