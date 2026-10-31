@@ -269,6 +269,16 @@ def read_exact_source_snapshot_manifest(
     except HashFormatError as exc:
         raise ValueError("expected_sha256 형식이 잘못됐습니다.") from exc
 
+    manifest = _read_pinned_manifest(manifest_uri, checksum)
+    if key != _manifest_key(manifest):
+        raise SourceSnapshotReadError(
+            f"고정한 source manifest key와 본문 identity가 다릅니다: {manifest_uri}"
+        )
+    return _snapshot_data(manifest, columns)
+
+
+def _read_pinned_manifest(manifest_uri: str, checksum: str) -> SourceSnapshotManifest:
+    """고정 URI의 manifest bytes를 checksum·canonical JSON으로 검증해 파싱한다."""
     try:
         payload = S3ImmutableObjectStore().read_bytes(
             manifest_uri,
@@ -279,18 +289,12 @@ def read_exact_source_snapshot_manifest(
         raise SourceSnapshotReadError(
             f"고정한 source manifest를 검증해 읽을 수 없습니다: {manifest_uri}"
         ) from exc
-
     try:
-        manifest = parse_source_snapshot_manifest(payload)
+        return parse_source_snapshot_manifest(payload)
     except SourceSnapshotContractError as exc:
         raise SourceSnapshotReadError(
             f"고정한 source manifest 본문이 계약을 위반했습니다: {manifest_uri}"
         ) from exc
-    if key != _manifest_key(manifest):
-        raise SourceSnapshotReadError(
-            f"고정한 source manifest key와 본문 identity가 다릅니다: {manifest_uri}"
-        )
-    return _snapshot_data(manifest, columns)
 
 
 def read_exact_source_snapshot(
@@ -332,22 +336,24 @@ def read_latest_source_snapshot(
     current = cutoff.replace(minute=0, second=0, microsecond=0)
     final = lower.replace(minute=0, second=0, microsecond=0)
     while current >= final:
-        keys = list_keys(layout.source_snapshot_hour_prefix(source, current))
-        logicals = sorted(
-            {
-                parsed
-                for key in keys
-                if lower <= (parsed := _logical_from_key(key, source)) <= cutoff
-            },
-            reverse=True,
-        )
-        for logical in logicals:
+        for logical in _logicals_in_hour_desc(source, current, lower, cutoff):
             snapshot = read_exact_source_snapshot(source, logical, columns=columns)
             if snapshot.table is not None:
                 return snapshot
         current -= timedelta(hours=1)
     raise SourceSnapshotNotFoundError(
         f"{source} SUCCEEDED source authority가 lookback 안에 없습니다."
+    )
+
+
+def _logicals_in_hour_desc(
+    source: str, hour: datetime, lower: datetime, cutoff: datetime
+) -> list[datetime]:
+    """UTC 한 시간 파티션에서 ``lower``~``cutoff`` 안의 logical 시각을 최신순으로 반환한다."""
+    keys = list_keys(layout.source_snapshot_hour_prefix(source, hour))
+    logicals = {_logical_from_key(key, source) for key in keys}
+    return sorted(
+        (logical for logical in logicals if lower <= logical <= cutoff), reverse=True
     )
 
 

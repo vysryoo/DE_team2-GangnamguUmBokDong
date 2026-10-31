@@ -157,19 +157,9 @@ class S3ImmutableObjectStore:
             ObjectStoreAccessError: 그 밖의 object store 접근 오류가 발생했을 때
         """
         location = _parse_s3_uri(uri)
-        if type(payload) is not bytes:
-            raise TypeError("immutable object payload는 bytes여야 합니다.")
-        actual_sha256 = sha256_hex(payload)
-        if expected_sha256 is not None:
-            expected = validate_sha256_hex(expected_sha256)
-            if actual_sha256 != expected:
-                raise ObjectChecksumMismatchError(
-                    f"immutable object payload checksum이 다릅니다: uri={uri}, "
-                    f"expected={expected}, actual={actual_sha256}"
-                )
-        if require_canonical_json:
-            _validate_canonical_json(uri, payload)
-
+        actual_sha256 = _validated_payload_sha256(
+            uri, payload, expected_sha256, require_canonical_json
+        )
         for attempt in range(_CONDITIONAL_RETRY_LIMIT):
             if not self._put_if_absent(uri, location, payload):
                 return ImmutablePutOutcome.CREATED
@@ -359,6 +349,28 @@ def _parse_s3_uri(uri: str) -> _S3Location:
             "immutable object URI는 정확한 s3://bucket/key 형식이어야 합니다."
         )
     return _S3Location(bucket=parsed.netloc, key=parsed.path[1:])
+
+
+def _validated_payload_sha256(
+    uri: str,
+    payload: bytes,
+    expected_sha256: str | None,
+    require_canonical_json: bool,
+) -> str:
+    """쓰기 전 payload의 타입, 기대 checksum, canonical JSON을 확인하고 SHA-256을 반환한다."""
+    if type(payload) is not bytes:
+        raise TypeError("immutable object payload는 bytes여야 합니다.")
+    actual_sha256 = sha256_hex(payload)
+    if expected_sha256 is not None:
+        expected = validate_sha256_hex(expected_sha256)
+        if actual_sha256 != expected:
+            raise ObjectChecksumMismatchError(
+                f"immutable object payload checksum이 다릅니다: uri={uri}, "
+                f"expected={expected}, actual={actual_sha256}"
+            )
+    if require_canonical_json:
+        _validate_canonical_json(uri, payload)
+    return actual_sha256
 
 
 def _validate_canonical_json(uri: str, payload: bytes) -> None:

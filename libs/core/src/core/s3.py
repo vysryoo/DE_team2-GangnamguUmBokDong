@@ -594,13 +594,7 @@ def list_keys(prefix: str, delimiter: str = "") -> list[str]:
     returns:
         prefix로 시작하는 모든 객체 키 목록
     """
-    client = _client()
-    paginator = client.get_paginator("list_objects_v2")
-    return [
-        obj["Key"]
-        for page in paginator.paginate(Bucket=bucket_name(), Prefix=prefix, Delimiter=delimiter)
-        for obj in page.get("Contents", [])
-    ]
+    return [obj.key for obj in list_objects(prefix, delimiter)]
 
 
 @dataclass(frozen=True)

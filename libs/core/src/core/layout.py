@@ -34,16 +34,18 @@ class SourceSnapshotManifestKey(NamedTuple):
     revision_no: int
 
 
-def _as_kst(value: datetime) -> datetime:
+def _require_aware(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError(f"키 시각은 timezone-aware여야 한다: {value!r}")
-    return value.astimezone(KST)
+    return value
+
+
+def _as_kst(value: datetime) -> datetime:
+    return _require_aware(value).astimezone(KST)
 
 
 def _as_utc(value: datetime) -> datetime:
-    if value.tzinfo is None or value.utcoffset() is None:
-        raise ValueError(f"키 시각은 timezone-aware여야 한다: {value!r}")
-    return value.astimezone(UTC)
+    return _require_aware(value).astimezone(UTC)
 
 
 def _window_path(source_id: str, window_start: datetime) -> str:

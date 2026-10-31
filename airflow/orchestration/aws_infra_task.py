@@ -93,27 +93,30 @@ def read_s3_json(key: str) -> dict | None:
     Raises:
         botocore.exceptions.ClientError: ``NoSuchKey`` 외의 S3 오류
     """
-    import boto3
     from botocore.exceptions import ClientError
 
-    endpoint_url = os.environ.get("S3_ENDPOINT_URL") or None
-    if endpoint_url:
-        client = boto3.client(
-            "s3",
-            endpoint_url=endpoint_url,
-            aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID", "minioadmin"),
-            aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY", "minioadmin"),
-        )
-    else:
-        client = boto3.client("s3", region_name=DEFAULT_REGION)
-
     try:
-        body = client.get_object(Bucket=S3_BUCKET, Key=key)["Body"].read()
+        body = _s3_client().get_object(Bucket=S3_BUCKET, Key=key)["Body"].read()
     except ClientError as exc:
         if exc.response["Error"]["Code"] == "NoSuchKey":
             return None
         raise
     return json.loads(body)
+
+
+def _s3_client() -> Any:
+    # 로컬 MinIO는 endpoint와 환경변수 자격증명으로, 운영 S3는 instance profile로 접근함
+    endpoint_url = os.environ.get("S3_ENDPOINT_URL") or None
+    if not endpoint_url:
+        return _get_boto3_client("s3")
+    import boto3
+
+    return boto3.client(
+        "s3",
+        endpoint_url=endpoint_url,
+        aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID", "minioadmin"),
+        aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY", "minioadmin"),
+    )
 
 
 def terminate_emr_cluster(cluster_id: str | None, *, mock_override: str | None = None) -> None:
@@ -370,17 +373,24 @@ def submit_emr_step(
         ],
     )["StepIds"][0]
 
+    if _wait_for_step_completed(emr, cluster_id, step_id, name, timeout_seconds):
+        return {"StepId": step_id, "State": "COMPLETED"}
+    raise TimeoutError(f"EMR 스텝 '{name}'({step_id})이 {timeout_seconds}초 내에 완료되지 못했습니다.")
+
+
+def _wait_for_step_completed(
+    emr: Any, cluster_id: str, step_id: str, name: str, timeout_seconds: int
+) -> bool:
     start_time = time.time()
     while time.time() - start_time < timeout_seconds:
         status = emr.describe_step(ClusterId=cluster_id, StepId=step_id)["Step"]["Status"]
         state = status["State"]
         logger.info("[EMR] 스텝 '%s'(%s) 상태: %s", name, step_id, state)
         if state == "COMPLETED":
-            return {"StepId": step_id, "State": state}
+            return True
         if state in ("FAILED", "CANCELLED", "INTERRUPTED"):
             raise RuntimeError(
                 f"EMR 스텝 '{name}'({step_id}) 실패({state}): {status.get('FailureDetails', {})}"
             )
         time.sleep(15)
-
-    raise TimeoutError(f"EMR 스텝 '{name}'({step_id})이 {timeout_seconds}초 내에 완료되지 못했습니다.")
+    return False
