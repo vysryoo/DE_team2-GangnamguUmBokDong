@@ -1,7 +1,7 @@
 """Collector 소스 YAML 10종 테스트.
 
-`sources/*.yaml` 전부가 config loader를 통과하는지, 이번에 늘어난 3개 키
-(`max_missing_ratio` · `fetch` · `backfill`)가 생략 가능한지, 그리고 실제
+`sources/*.yaml` 전부가 config loader를 통과하는지, 선택 키
+(`max_missing_ratio` · `fetch`)가 생략 가능한지, 그리고 실제
 어댑터(`seoul_openapi` · `kma_apihub`)를 공통 코드 수정 없이 pipeline까지
 end-to-end로 통과시킬 수 있는지 확인한다.
 """
@@ -93,13 +93,6 @@ class TestAllSourcesLoad:
         assert config.source_id == source_id
         assert config.adapter in ("seoul_openapi", "kma_apihub")
         assert config.config_version.startswith("sha256:")
-
-    @pytest.mark.parametrize("source_id", SOURCE_IDS)
-    def test_no_source_uses_delayed_backfill(self, source_id):
-        """운영 소스는 소비 DAG가 없는 지연 backfill 큐를 만들지 않는다."""
-        config = config_loader.load(source_id, base_dir=SOURCES_DIR)
-
-        assert config.backfill is None
 
     @pytest.mark.parametrize(
         ("source_id", "expected_ratio"),
@@ -411,18 +404,13 @@ columns: {stationName: {types: [str]}}
 
 
 class TestOptionalKeysOmittable:
-    """새로 늘어난 3개 키가 생략 가능하고, 생략 시 기존과 같이 동작하는지 확인한다."""
+    """선택 키가 생략 가능하고, 생략 시 기존과 같이 동작하는지 확인한다."""
 
     def test_fetch_omitted_falls_back_to_effective_budget(self):
         config = config_loader.load("bike_station_realtime", base_dir=SOURCES_DIR)
 
         assert config.fetch is None
         assert config.effective_fetch_budget() == config.schedule.interval / 2
-
-    def test_backfill_omitted_defaults_to_disabled(self):
-        config = config_loader.load("population_realtime", base_dir=SOURCES_DIR)
-
-        assert config.backfill is None
 
     def test_cultural_event_keeps_explicit_partial_tolerance(self):
         """문화행사는 합의된 범위의 catalog 누락을 PARTIAL로 처리한다."""
@@ -431,7 +419,7 @@ class TestOptionalKeysOmittable:
         assert config.quality.max_missing_ratio == 0.1
 
     def test_max_missing_ratio_truly_omitted_defaults_to_zero(self, tmp_path):
-        # 3개 키를 아예 안 쓴 최소 YAML로 기본값 자체를 확인한다.
+        # 선택 키를 아예 안 쓴 최소 YAML로 기본값 자체를 확인한다.
         minimal = tmp_path / "minimal_source.yaml"
         minimal.write_text(
             """
@@ -455,7 +443,6 @@ columns: {}
         assert config.quality.max_missing_ratio == 0.0
         assert config.quality.allow_empty is False
         assert config.fetch is None
-        assert config.backfill is None
 
 
 def _seoul_response(

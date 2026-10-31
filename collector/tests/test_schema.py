@@ -6,7 +6,6 @@ import pytest
 from pydantic import ValidationError
 
 from config.schema import (
-    Backfill,
     ColumnSpec,
     Fetch,
     Policies,
@@ -148,21 +147,6 @@ class TestFetch:
     def test_budget_parses(self):
         assert Fetch(budget="2m30s").budget == timedelta(minutes=2, seconds=30)
 
-class TestBackfill:
-    def test_disabled_without_max_age_ok(self):
-        b = Backfill()
-        assert b.enabled is False
-        assert b.max_age is None
-
-    def test_enabled_without_max_age_rejected(self):
-        with pytest.raises(ValidationError):
-            Backfill(enabled=True)
-
-    def test_enabled_with_max_age_ok(self):
-        b = Backfill(enabled=True, max_age="7d")
-        assert b.max_age == timedelta(days=7)
-
-
 def _minimal_source_config(**overrides):
     base = {
         "source_id": "test_source",
@@ -206,9 +190,12 @@ class TestSourceConfig:
         assert config.adapter_params == {}
         assert config.config_version == ""
 
-    def test_forbids_extra_top_level_key(self):
+    @pytest.mark.parametrize(
+        "extra", [{"unknown_key": "x"}, {"backfill": {"enabled": False}}]
+    )
+    def test_forbids_extra_top_level_key(self, extra):
         with pytest.raises(ValidationError):
-            _minimal_source_config(unknown_key="x")
+            _minimal_source_config(**extra)
 
     def test_effective_fetch_budget_derives_when_unset(self):
         config = _minimal_source_config(schedule={"interval": "10m"})
