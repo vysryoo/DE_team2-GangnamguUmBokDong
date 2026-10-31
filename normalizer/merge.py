@@ -181,6 +181,13 @@ def _composite_spop(cell: GridCell, ordered: list[tuple[PoiSnapshot, float]]) ->
     return spop
 
 
+def _unchanged(cell: GridCell) -> MergedCell:
+    """겹치는 POI가 없는 격자를 baseline 값 그대로 반환한다."""
+    return MergedCell(
+        cell_id=cell.cell_id, h_dng_cd=cell.h_dng_cd, spop=cell.spop, ages=dict(cell.ages)
+    )
+
+
 def merge_cell_total_only(
     cell: GridCell, overlapping: list[tuple[PoiSnapshot, float]]
 ) -> MergedCell:
@@ -196,9 +203,7 @@ def merge_cell_total_only(
         합성된 MergedCell 객체
     """
     if not overlapping:
-        return MergedCell(
-            cell_id=cell.cell_id, h_dng_cd=cell.h_dng_cd, spop=cell.spop, ages=dict(cell.ages)
-        )
+        return _unchanged(cell)
 
     spop = _composite_spop(cell, _ordered_by_area(overlapping))
     return MergedCell(
@@ -218,9 +223,7 @@ def merge_cell(cell: GridCell, overlapping: list[tuple[PoiSnapshot, float]]) -> 
         합성된 MergedCell 객체
     """
     if not overlapping:
-        return MergedCell(
-            cell_id=cell.cell_id, h_dng_cd=cell.h_dng_cd, spop=cell.spop, ages=dict(cell.ages)
-        )
+        return _unchanged(cell)
 
     ordered = _ordered_by_area(overlapping)
     spop = _composite_spop(cell, ordered)

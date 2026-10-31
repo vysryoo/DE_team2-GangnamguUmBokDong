@@ -99,19 +99,29 @@ def _realtime_by_station(table: pa.Table | None) -> dict[str, dict]:
     }
 
 
-def _grid_index(grid_table: pa.Table) -> tuple[list[str], list, STRtree]:
-    """baseline의 고유 CELL_ID와 그 폴리곤, 공간 인덱스를 만든다. 24시간 행은 하나로 합친다."""
-    cell_ids = sorted(
-        {
-            str(row["CELL_ID"])
-            for row in grid_table.to_pylist()
-            if row.get("CELL_ID") is not None
-        }
-    )
-    if not cell_ids:
-        raise ValueError("living_population_grid에 CELL_ID가 없음")
-    polygons = [grid.cell_id_to_polygon(cell_id) for cell_id in cell_ids]
-    return cell_ids, polygons, STRtree(polygons)
+class _GridIndex:
+    """baseline 고유 CELL_ID 폴리곤의 공간 인덱스. 24시간 행은 CELL_ID 하나로 합친다."""
+
+    def __init__(self, grid_table: pa.Table) -> None:
+        self._cell_ids = sorted(
+            {
+                str(row["CELL_ID"])
+                for row in grid_table.to_pylist()
+                if row.get("CELL_ID") is not None
+            }
+        )
+        if not self._cell_ids:
+            raise ValueError("living_population_grid에 CELL_ID가 없음")
+        self._polygons = [grid.cell_id_to_polygon(cell_id) for cell_id in self._cell_ids]
+        self._tree = STRtree(self._polygons)
+
+    def cell_at(self, latitude: float, longitude: float) -> str | None:
+        """위경도 점을 덮는 첫 CELL_ID를 반환한다. 없으면 None."""
+        point = Point(*_TO_EPSG5179.transform(longitude, latitude))
+        for index in self._tree.query(point):
+            if self._polygons[int(index)].covers(point):
+                return self._cell_ids[int(index)]
+        return None
 
 
 def _station_coordinates(raw: dict, live: dict) -> tuple[float | None, float | None]:
@@ -155,7 +165,7 @@ def enrich_station_master(
     격자 목록은 생활인구 baseline의 CELL_ID에서 가져오며 동일 CELL_ID의 24시간
     행은 하나로 중복 제거한다.
     """
-    cell_ids, polygons, tree = _grid_index(grid_table)
+    grid_index = _GridIndex(grid_table)
     realtime = _realtime_by_station(realtime_table)
 
     rows_by_station: dict[str, dict] = {}
@@ -163,34 +173,37 @@ def enrich_station_master(
         if raw.get("RNTLS_ID") is None:
             continue
         station_id = str(raw["RNTLS_ID"])
-        live = realtime.get(station_id, {})
-        latitude, longitude = _station_coordinates(raw, live)
-        grid_id = None
-        weather_nx = weather_ny = None
-        # LAT/LOT가 0인 대여소도 _number()는 0.0을 돌려주므로 적도의 엉뚱한 격자를 막음
-        if _valid_wgs84(latitude, longitude):
-            weather_nx, weather_ny = latlon_to_grid(latitude, longitude)
-            point = Point(*_TO_EPSG5179.transform(longitude, latitude))
-            matches = [int(index) for index in tree.query(point) if polygons[int(index)].covers(point)]
-            if matches:
-                grid_id = cell_ids[matches[0]]
-
-        capacity_value = _number(live.get("rackTotCnt"))
-        rows_by_station[station_id] = {
-            "station_id": station_id,
-            "station_no": _station_no(station_id),
-            "station_name": live.get("stationName") or raw.get("ADDR1") or raw.get("ADDR2"),
-            "capacity": int(capacity_value) if capacity_value is not None else None,
-            "lat": latitude,
-            "lon": longitude,
-            "grid_id": grid_id,
-            "weather_nx": weather_nx,
-            "weather_ny": weather_ny,
-        }
+        rows_by_station[station_id] = _enriched_row(
+            station_id, raw, realtime.get(station_id, {}), grid_index
+        )
 
     rows = list(rows_by_station.values())
     metrics = _coverage_metrics(rows)
     return pa.Table.from_pylist(rows, schema=_OUTPUT_SCHEMA), metrics
+
+
+def _enriched_row(station_id: str, raw: dict, live: dict, grid_index: _GridIndex) -> dict:
+    """master 행 하나에 좌표·격자·정원을 붙여 출력 행을 만든다."""
+    latitude, longitude = _station_coordinates(raw, live)
+    grid_id = None
+    weather_nx = weather_ny = None
+    # LAT/LOT가 0인 대여소도 _number()는 0.0을 돌려주므로 적도의 엉뚱한 격자를 막음
+    if _valid_wgs84(latitude, longitude):
+        weather_nx, weather_ny = latlon_to_grid(latitude, longitude)
+        grid_id = grid_index.cell_at(latitude, longitude)
+
+    capacity_value = _number(live.get("rackTotCnt"))
+    return {
+        "station_id": station_id,
+        "station_no": _station_no(station_id),
+        "station_name": live.get("stationName") or raw.get("ADDR1") or raw.get("ADDR2"),
+        "capacity": int(capacity_value) if capacity_value is not None else None,
+        "lat": latitude,
+        "lon": longitude,
+        "grid_id": grid_id,
+        "weather_nx": weather_nx,
+        "weather_ny": weather_ny,
+    }
 
 
 def run(window_start: datetime) -> int:
