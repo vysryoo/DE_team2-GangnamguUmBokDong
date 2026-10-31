@@ -57,35 +57,35 @@ def evaluate_source_stats(source_id: str, stats: dict) -> SourceStatEvaluation:
     }
 
 
-_COLUMNS = ("STATUS", "SOURCE", "RUN", "SUCC", "FAIL", "PART", "KEEP", "DROP")
-_STATUS_OK = "OK"
-_STATUS_RISK = "RISK"
-_STATUS_WIDTH = max(len(_STATUS_OK), len(_STATUS_RISK), len(_COLUMNS[0]))
+# RUN/SUCC/FAIL/PART는 실행 횟수, KEEP/DROP은 행 수. 한글은 폰트마다 폭이 달라
+# 고정폭 정렬이 어긋나므로 표 안은 ASCII만 씀
+_COUNT_COLUMNS = (("RUN", 5), ("SUCC", 5), ("FAIL", 5), ("PART", 5), ("KEEP", 9), ("DROP", 9))
+_STATUS_WIDTH = len("STATUS")
+
+
+def _row(status: str, source_id: str, counts: tuple, name_width: int) -> str:
+    cells = " ".join(
+        f"{count:>{width}}" for count, (_, width) in zip(counts, _COUNT_COLUMNS)
+    )
+    return f"{status:<{_STATUS_WIDTH}}  {source_id:<{name_width}}  {cells}"
 
 
 def _table(evaluations: list[SourceStatEvaluation]) -> str:
-    # RUN/SUCC/FAIL/PART는 실행 횟수, KEEP/DROP은 행 수. 한글은 폰트마다 폭이 달라
-    # 고정폭 정렬이 어긋나므로 표 안은 ASCII만 씀
-    name_width = max(
-        (len(e["source_id"]) for e in evaluations), default=len(_COLUMNS[1])
-    )
-    name_width = max(name_width, len(_COLUMNS[1]))
-    header = (
-        f"{_COLUMNS[0]:<{_STATUS_WIDTH}}  {_COLUMNS[1]:<{name_width}}  "
-        f"{_COLUMNS[2]:>5} {_COLUMNS[3]:>5} {_COLUMNS[4]:>5} {_COLUMNS[5]:>5} "
-        f"{_COLUMNS[6]:>9} {_COLUMNS[7]:>9}"
-    )
+    name_width = max([len("SOURCE"), *(len(e["source_id"]) for e in evaluations)])
+    header = _row("STATUS", "SOURCE", tuple(name for name, _ in _COUNT_COLUMNS), name_width)
     rows = [header, "-" * len(header)]
     for e in evaluations:
         stats = e["stats"]
         status_counts = stats["status_counts"]
-        status = _STATUS_RISK if e["is_risky"] else _STATUS_OK
-        rows.append(
-            f"{status:<{_STATUS_WIDTH}}  {e['source_id']:<{name_width}}  "
-            f"{stats['run_count']:>5} {status_counts.get('succeeded', 0):>5} "
-            f"{status_counts.get('failed', 0):>5} {status_counts.get('partial', 0):>5} "
-            f"{stats['kept_count']:>9} {stats['dropped_count']:>9}"
+        counts = (
+            stats["run_count"],
+            status_counts.get("succeeded", 0),
+            status_counts.get("failed", 0),
+            status_counts.get("partial", 0),
+            stats["kept_count"],
+            stats["dropped_count"],
         )
+        rows.append(_row("RISK" if e["is_risky"] else "OK", e["source_id"], counts, name_width))
     return "\n".join(rows)
 
 
