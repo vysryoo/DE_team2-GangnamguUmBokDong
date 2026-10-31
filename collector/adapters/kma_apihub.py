@@ -1,24 +1,13 @@
 """기상청 API 허브 어댑터.
 
-초단기실황·예보(10분)와 단기예보(3시간)를 수집한다. 전체 행 수를 알려주지 않아
-`expected_total`이 항상 None이고, 완결도는 (성공 격자 / 계획 격자)로 계산된다.
+초단기실황·예보(10분)와 단기예보(3시간)를 격자 단위로 수집한다. 전체 행 수를 알려주지
+않아 `expected_total`은 항상 None이고 완결도는 조각(격자) 기준으로 계산된다.
 
-`time_rule`은 window를 API가 허용하는 발표 시각(`base_time`)으로 내린다.
-`freshness_rule`은 fetch에는 쓰지 않고 `main.py`의 freshness 판정에만 쓰는 폴링
-그리드다. 초단기실황·예보는 발표 그리드(시간당 1슬롯)와 실제 갱신 주기(10분·30분)가
-달라, 발표 그리드로 freshness를 판정하면 시간당 1번만 수집된다.
-
-| rule | 용도 | 규칙 | 예시 |
-| --- | --- | --- | --- |
-| `hourly` | 초단기실황 fetch | 매시 정각(40분 발표) | 14:40 → 14:00, 14:39 → 13:00 |
-| `half_hourly` | 초단기예보 fetch | 매시 30분 | 14:40 → 14:30, 14:20 → 13:30 |
-| `vilage_fcst` | 단기예보 fetch | 02, 05, 08...시 정각(10분 발표) | 05:05 → 02:00 |
-| `ten_minutely` | freshness | 10분 단위 내림 | 14:37 → 14:30 |
-| `thirty_minutely` | freshness | 30분 단위 내림 | 14:37 → 14:30 |
-
-격자 하나의 행 수가 `numOfRows`를 넘으면(단기예보 1052건) `totalCount`로 남은 페이지를
-받아 격자당 하나의 `FetchResult`로 합친다. 재시도·skip은 격자 단위이므로 페이지 중
-하나라도 실패하면 그 격자 전체를 실패로 처리한다.
+`time_rule`은 window를 API가 허용하는 발표 시각(`base_time`)으로 내린다. `freshness_rule`은
+fetch에는 쓰지 않고 `main.py`의 freshness 판정에만 쓴다. 초단기실황·예보는 발표 그리드
+(시간당 1슬롯)와 실제 갱신 주기(10분·30분)가 달라 발표 그리드로 판정하면 시간당 1번만
+수집되기 때문이다. 격자 하나가 `numOfRows`를 넘으면(단기예보 1052건) 남은 페이지까지
+받아 한 조각으로 합치며, 페이지 하나라도 실패하면 그 격자 전체를 실패로 본다.
 """
 
 from __future__ import annotations
@@ -76,7 +65,12 @@ def _classify_result_code(code: str | None) -> FetchErrorKind | None:
 
 
 def adjust_base_time(dt: datetime, rule: str | None) -> datetime:
-    """`rule` 그리드에서 `dt` 이전 가장 최근 슬롯으로 내린다(모듈 docstring 표 참고)."""
+    """`rule` 그리드에서 `dt` 이전 가장 최근 슬롯으로 내린다.
+
+    `hourly`는 매시 40분 발표(14:39 → 13:00), `half_hourly`는 매시 30분(14:20 → 13:30),
+    `vilage_fcst`는 02·05·08…시 10분 발표(05:05 → 02:00)다. `ten_minutely`·
+    `thirty_minutely`는 freshness 판정용 단순 내림이다.
+    """
     if not rule:
         return dt
 
@@ -161,69 +155,78 @@ def _fetch_grid(
         f"&base_date={base_date}&base_time={base_time}&nx={nx}&ny={ny}"
     )
 
-    page_bodies: list[dict] = []
-    first_page_raw: bytes | None = None
+    pages: list[tuple[bytes, dict]] = []
     total_pages = 1
     page_no = 1
-
     while page_no <= total_pages:
-        url = f"{base_url}&pageNo={page_no}"
-        started_at = time.monotonic()
-        try:
-            response = client.get(url)
-        except httpx.RequestError as exc:
-            logger.info(
-                "stage=kma_http_request endpoint=%s grid=%03dx%03d page=%d "
-                "outcome=request_error error_type=%s elapsed_ms=%.1f",
-                endpoint,
-                nx,
-                ny,
-                page_no,
-                type(exc).__name__,
-                (time.monotonic() - started_at) * 1000,
-            )
-            return _GridOutcome(payload=None, error=FetchErrorKind.TRANSIENT)
+        page = _fetch_grid_page(
+            client, f"{base_url}&pageNo={page_no}", endpoint, nx, ny, page_no
+        )
+        if isinstance(page, FetchErrorKind):
+            return _GridOutcome(payload=None, error=page)
+        pages.append(page)
+        if page_no == 1:
+            total_count = page[1].get("response", {}).get("body", {}).get("totalCount")
+            if isinstance(total_count, int) and total_count > _NUM_OF_ROWS:
+                total_pages = math.ceil(total_count / _NUM_OF_ROWS)
+        page_no += 1
 
+    if len(pages) == 1:
+        return _GridOutcome(payload=pages[0][0], error=None)
+    merged = _merge_pages([body for _, body in pages], root_key)
+    return _GridOutcome(payload=merged, error=None)
+
+
+def _fetch_grid_page(
+    client: httpx.Client, url: str, endpoint: str, nx: int, ny: int, page_no: int
+) -> tuple[bytes, dict] | FetchErrorKind:
+    """격자의 페이지 하나를 요청해 (원본 bytes, JSON 본문) 또는 실패 범주를 반환한다.
+
+    httpx 요청 로그 대신 endpoint·격자·페이지·소요시간을 담은 로그를 한 줄 남긴다.
+    """
+    started_at = time.monotonic()
+    try:
+        response = client.get(url)
+    except httpx.RequestError as exc:
         logger.info(
             "stage=kma_http_request endpoint=%s grid=%03dx%03d page=%d "
-            "outcome=response status_code=%d elapsed_ms=%.1f",
+            "outcome=request_error error_type=%s elapsed_ms=%.1f",
             endpoint,
             nx,
             ny,
             page_no,
-            response.status_code,
+            type(exc).__name__,
             (time.monotonic() - started_at) * 1000,
         )
+        return FetchErrorKind.TRANSIENT
 
-        category = classify_http_status(response.status_code)
-        if category is not None:
-            return _GridOutcome(payload=None, error=category)
-
-        try:
-            body = json.loads(response.content)
-            if not isinstance(body, dict):
-                raise TypeError("응답이 JSON 객체가 아님")
-            result_code = body.get("response", {}).get("header", {}).get("resultCode")
-        except (json.JSONDecodeError, TypeError):
-            return _GridOutcome(payload=None, error=FetchErrorKind.TRANSIENT)
-
-        api_category = _classify_result_code(result_code)
-        if api_category is not None:
-            return _GridOutcome(payload=None, error=api_category)
-
-        page_bodies.append(body)
-        if page_no == 1:
-            first_page_raw = response.content
-            total_count = body.get("response", {}).get("body", {}).get("totalCount")
-            if isinstance(total_count, int) and total_count > _NUM_OF_ROWS:
-                total_pages = math.ceil(total_count / _NUM_OF_ROWS)
-
-        page_no += 1
-
-    payload = (
-        first_page_raw if len(page_bodies) == 1 else _merge_pages(page_bodies, root_key)
+    logger.info(
+        "stage=kma_http_request endpoint=%s grid=%03dx%03d page=%d "
+        "outcome=response status_code=%d elapsed_ms=%.1f",
+        endpoint,
+        nx,
+        ny,
+        page_no,
+        response.status_code,
+        (time.monotonic() - started_at) * 1000,
     )
-    return _GridOutcome(payload=payload, error=None)
+
+    category = classify_http_status(response.status_code)
+    if category is not None:
+        return category
+
+    try:
+        body = json.loads(response.content)
+        if not isinstance(body, dict):
+            raise TypeError("응답이 JSON 객체가 아님")
+        result_code = body.get("response", {}).get("header", {}).get("resultCode")
+    except (json.JSONDecodeError, TypeError):
+        return FetchErrorKind.TRANSIENT
+
+    api_category = _classify_result_code(result_code)
+    if api_category is not None:
+        return api_category
+    return response.content, body
 
 
 @adapter("kma_apihub")
