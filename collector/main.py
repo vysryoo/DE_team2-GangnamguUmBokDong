@@ -1,20 +1,11 @@
 """collector CLI 진입점.
 
-    cd collector
-    uv run python main.py --source bike_station_realtime \
-        --window-start 2026-08-12T23:10:00+09:00 [--force]
-
-모드:
-
-| 인자 | 동작 |
-| --- | --- |
-| `--window-start` | window 하나 수집. `--force`면 새 Hot Bronze revision에 전체 재수집 |
-| `--check-due-after-seconds N` | freshness gate 판정 JSON 출력 |
-| `--report-window-stats --window-day [--window-hour]` | 수집 통계 JSON 출력 |
+- `--window-start`: window 하나 수집. `--force`면 새 Hot Bronze revision에 전체 재수집
+- `--check-due-after-seconds N`: freshness gate 판정 JSON 출력
+- `--report-window-stats --window-day [--window-hour]`: 수집 통계 JSON 출력
 
 수집 모드의 종료 코드는 `SUCCEEDED`·`PARTIAL`·`EMPTY`·`SKIPPED`가 0, `FAILED`가
-non-zero다. 인증키는 인자로 받지 않고 환경변수(`SEOUL_OPENAPI_KEY`, `KMA_APIHUB_KEY`)
-에서만 읽는다.
+non-zero다. 인증키는 환경변수(`SEOUL_OPENAPI_KEY`, `KMA_APIHUB_KEY`)에서만 읽는다.
 """
 
 from __future__ import annotations
