@@ -15,7 +15,7 @@
   → FastAPI → React 대시보드
 ```
 
-Airflow는 계산을 직접 구현하지 않는다. `BashOperator`로 각 애플리케이션의 CLI를 실행하고 순서, 재시도, timeout과 성공·실패 상태를 관리한다. 월별 재학습 DAG만 `PythonOperator`로 AWS EC2 제어와 원격 명령 실행을 오케스트레이션한다.
+Airflow는 계산을 직접 구현하지 않는다. `BashOperator`로 각 애플리케이션의 CLI를 실행하고 순서, 재시도, timeout과 성공·실패 상태를 관리한다. 월별 재학습과 EMR 정리 DAG만 `PythonOperator`로 AWS EMR 클러스터와 스텝을 제어한다.
 
 ## DAG와 실제 주기
 
@@ -23,112 +23,52 @@ Airflow는 계산을 직접 구현하지 않는다. `BashOperator`로 각 애플
 
 | DAG | cron | 역할 |
 | --- | --- | --- |
-| `realtime_tick` | 매시 5·15·25·35·45·55분 | 실시간 수집과 serving 체인 실행 |
-| `realtime_tick_ultra_weather` | 매시 10·20·30·40·50분 | 위 체인 + 초단기실황·초단기예보 수집 |
-| `realtime_tick_ultra_weather_on_hour` | 3의 배수가 아닌 시의 정각 | 위 체인 + 초단기실황·초단기예보 수집 |
-| `realtime_tick_full_weather` | 0·3·6·9·12·15·18·21시 정각 | 위 체인 + 초단기실황·초단기예보·단기예보 수집 |
+| `realtime_tick` | 5분마다 | 실시간 수집, 필요한 날씨 수집, serving 체인 실행 |
+| `poi_master_refresh` | 매일 02:04 | 서울시 POI 파일 변경 확인 후 POI Master 게시 |
 | `daily_population_and_events` | 매일 03:00 | 생활인구 수집·nowcast와 두 행사 source 게시 |
 | `station_master` | 매일 03:04 | 대여소 마스터 수집 후 공간·격자 정보 보강 |
-| `daily_compaction` | 매일 04:30 | D-6 대여이력 재수집 후 일별 Archive 생성 |
-| `monthly_retrain_rental` | 매월 1일 03:00 | 대여 모델 평가 및 조건부 재학습 |
-| `monthly_retrain_return` | 매월 1일 06:00 | 반납 모델 평가 및 조건부 재학습 |
-
-네 realtime DAG의 실행 시각은 겹치지 않으며 합치면 정확히 5분 간격이다. 별도의 `realtime_5min`, `weather_10min`, `weather_3h` DAG나 날씨 대기 sensor는 현재 없다.
+| `daily_compaction` | 매일 04:30 | D-6 대여이력 재수집, Archive·Cold Bronze 생성, Hot Bronze·Silver 정리 |
+| `daily_collection_report` | 매일 07:00 | 전날 수집 통계 Slack 보고 |
+| `hourly_collection_alert` | 매시 정각 | 지난 1시간 수집 통계가 위험 기준을 넘으면 Slack 알림 |
+| `monthly_retrain` | 매월 1일 03:00 | EMR 클러스터 하나에서 대여 → 반납 순으로 평가 및 조건부 재학습 |
+| `emr_orphan_reaper` | 15분마다 | teardown이 실행되지 못해 남은 재학습 EMR 클러스터 종료 |
 
 `station_master`의 03:04는 03:00 realtime 실행 중 source authority가 바뀌어 Gold finalize가 중단되는 것을 피하기 위한 운영값이다. realtime 처리시간이 5분에 가까워지면 이 간격을 다시 검토해야 한다.
 
-## 왜 `realtime_5min`과 날씨 DAG를 통합했는가
+## 날씨 수집을 realtime 체인에 넣은 방식
 
-### 변경 전 구조
-
-```text
-weather_10min ─┐
-weather_3h ────┴→ S3 weather manifest
-                         ↑ 2초 간격, 최대 30초 폴링
-realtime_5min → wait_for_weather_manifests → prepare → inference → Gold
-```
-
-기존에는 `realtime_5min`과 날씨 수집 DAG가 서로 독립적으로 스케줄되었다. 따라서
-realtime DAG는 같은 시각의 날씨 수집이 끝났는지 Airflow 의존성으로 알 수 없었고,
-`wait_for_weather_manifests` sensor가 S3 manifest를 반복 조회해야 했다.
-
-이 구조에는 다음 문제가 있었다.
-
-- 날씨 완료 관계가 DAG 그래프에 나타나지 않고 S3 상태와 polling에 의존했다.
-- LocalExecutor 병렬 슬롯이 3개인 환경에서 sensor가 대기하는 동안 슬롯 하나를
-  점유했다.
-- 날씨가 필요한 시각은 고정돼 있는데도 모든 5분 tick에서 런타임 확인이 필요했다.
-- 분리 DAG를 유지하면서 realtime DAG에도 날씨 수집을 추가하면 같은 source를 같은
-  시각에 중복 수집할 수 있었다.
-
-### 현재 구조
-
-날씨가 필요한 시각에만 weather collector를 realtime 실행 안에 넣고,
-`weather_ready_gate → prepare_serving_plan`을 명시적인 task dependency로 연결했다.
+예전에는 날씨 수집 DAG가 따로 돌고 realtime DAG의 sensor가 S3 manifest를 polling했다. 이 방식은 완료 관계가 DAG 그래프에 드러나지 않고, sensor가 LocalExecutor 슬롯을 점유했다. 현재는 `realtime_tick` 하나가 매 tick 날씨 collector를 포함하고, `weather_ready_gate → prepare_serving_plan`을 명시적인 task dependency로 연결한다.
 
 ```text
-필요한 weather collectors ─→ weather_ready_gate ─┐
-bike_station_realtime ────────────────────────────┴→ prepare → inference → Gold
+freshness_gate_{source} → collect_{source} ─→ weather_ready_gate ─┐
+bike_station_realtime ────────────────────────────────────────────┴→ prepare → inference → Gold
 ```
 
-이제 prepare는 별도 DAG의 완료를 추측하거나 manifest를 polling하지 않는다. 같은 DAG
-run의 날씨 태스크가 끝난 직후 실행되므로 의존성과 실행 상태를 Airflow graph에서 바로
-확인할 수 있다. 기존 `weather_10min`과 `weather_3h` DAG는 제거하여 중복 수집도 막았다.
+- 날씨 source마다 `freshness_gate_{source}`가 collector CLI(`--check-due-after-seconds`)로 마지막 성공 수집 이후 경과 시간을 확인한다. 초단기실황·초단기예보는 10분, 단기예보는 3시간이 지나지 않았으면 그 source의 수집만 건너뛴다.
+- 경과 시간은 Airflow `logical_date`가 아니라 collector가 실제 현재 시각으로 판단한다. 이전 run이 늦게 끝나면 `logical_date`가 실제 시각보다 뒤처지기 때문이다.
+- gate는 `ignore_downstream_trigger_rules=False`라 직접 하위 collect만 스킵한다.
+- `weather_ready_gate`는 `TriggerRule.ALL_DONE`이므로 날씨 수집이 실패하거나 스킵돼도 prepare는 이전의 유효한 weather snapshot으로 진행한다. 각 날씨 collector는 `retries=0`, timeout 60초로 제한한다.
 
-단, 날씨 장애가 전체 serving을 막지는 않는다. `weather_ready_gate`는
-`TriggerRule.ALL_DONE`이므로 새 날씨 수집이 실패해도 성공하고, prepare는 이전의
-유효한 weather snapshot으로 계속 진행할 수 있다. 이는 기존 sensor의 soft-fail
-정책을 유지한 것이다. 각 날씨 collector는 `retries=0`, timeout 60초로 제한하여
-날씨 장애가 realtime 체인을 장시간 붙잡지 않게 했다.
+DAG를 cron별로 나누면 DAG마다 `max_active_runs`가 따로 관리돼 지연된 tick끼리 겹칠 수 있으므로 한 DAG에서 태스크 의존성으로 순서를 강제한다. 또 모든 root 태스크 앞의 `allow_current_tick`이 예약 시각보다 1분 넘게 늦게 시작한 scheduled run을 Slack 알림과 함께 건너뛴다. 수동 run과 clear된 run은 항상 실행한다.
 
-### 왜 하나가 아니라 4개 realtime DAG인가
-
-운영 관점에서는 하나의 공통 realtime 파이프라인이지만, Airflow에는 다음 4개 DAG로
-등록된다. `_build_realtime_tick_dag()`가 동일한 core task를 만들고 cron과 포함할
-날씨 source만 다르게 받는다.
-
-| tick 구간 | 포함할 날씨 | DAG |
-| --- | --- | --- |
-| 10분 경계가 아닌 시각 | 없음 | `realtime_tick` |
-| 매시 10·20·30·40·50분 | 초단기실황·초단기예보 | `realtime_tick_ultra_weather` |
-| 3시간 경계가 아닌 정각 | 초단기실황·초단기예보 | `realtime_tick_ultra_weather_on_hour` |
-| 3시간 경계 정각 | 위 두 source + 단기예보 | `realtime_tick_full_weather` |
-
-분할 기준은 데이터 상태가 아니라 `minute % 10`, `hour % 3`으로 미리 결정되는 발행
-주기다. 이를 cron으로 표현하면 sensor 없이 필요한 task만 생성할 수 있다. 정각의
-“3시간 경계 여부”를 하나의 cron으로 함께 표현하기 어려워 초단기 weather DAG가 두
-종류로 나뉘었다.
-
-### 코드와 검증 근거
-
-- `airflow/dags/realtime_tick.py`: 공통 DAG builder, weather task와 `ALL_DONE` gate의
-  직접 의존성
-- `airflow/config/schedules.py`: 4개 cron과 분할 사유
-- `airflow/tests/test_realtime_tick.py`: 4개 cron이 서로 겹치지 않고, 합집합이 기존
-  `*/5 * * * *`의 모든 tick과 정확히 같은지 검증
-- `airflow/tests/test_dag_imports.py`: 날씨 source가 해당 realtime DAG에만 포함되고
-  prepare의 upstream으로 연결되는지 검증
-
-변경 당시 로컬 Airflow에서도 DAG import 오류가 없고, 초단기 날씨 실행에서 collector
-종료 후 gate가 약 0.04초 만에 통과하는 것을 확인했다. 따라서 이 변경의 핵심은 DAG
-수를 단순히 줄이는 것이 아니라, **외부 상태 polling을 같은 DAG 내부의 명시적
-의존성으로 바꾸고 제한된 worker slot을 돌려주는 것**이다.
+- `airflow/dags/realtime_tick.py`: DAG 구성
+- `airflow/tests/test_realtime_tick.py`: gate, 날씨 의존성, serving 체인, replay 검증
 
 ## Realtime serving 체인
 
 ```text
-bike_station_realtime ────────────────────────┐
-필요 시 weather collectors → ALL_DONE gate ──┤
-                                              ├→ prepare_serving_plan
-bike_rental_history ──────────────────────────┼→ run_inference
-population_realtime → run_normalizer ─────────┘       ↓
-                                          finalize_serving_release
-                                                      ↓
-                                          publish_station_urgency
-                                                      ↓
-                                          publish_rebalance_route
+bike_station_realtime ─────────────────────────────────────┐
+freshness gate → weather collectors → weather_ready_gate ──┴→ prepare_serving_plan
+                                                                    ↓
+bike_rental_history ───────────────────────────────────────────→ run_inference
+resolve_poi_master → population_realtime → run_normalizer ─────────↗   ↓
+                                                         finalize_serving_release
+                                                                    ↓
+                                                         publish_station_urgency
+                                                                    ↓
+                                                         publish_rebalance_route
 
-bike_rental_history → 1시간 전 replay  (serving과 독립된 side chain)
+bike_rental_history → 1시간 전 replay → 2시간 전 replay  (serving과 독립된 side chain)
 ```
 
 | 단계 | 실제 책임 | 실패 시 경계 |
@@ -171,17 +111,16 @@ D-6의 대여이력 24개 시간대를 순차적으로 강제 재조회한다. �
 
 ### 월별 모델 점검
 
-대여와 반납은 같은 DAG builder를 쓰되 실행 시간을 분리한다.
+대여와 반납을 한 DAG에서 순서대로 실행해 EMR 클러스터가 동시에 두 개 뜨지 않게 한다.
 
 ```text
-EC2 시작 → champion 평가 → 평가 EC2 중지 → 재학습 여부 분기
-                                      ├→ 조건부 재학습 loop
-                                      └→ skip
-                                             ↓
-                                  모든 관련 EC2 중지 보장
+start_mlflow → create_cluster → [rental 체인] → [return 체인] → terminate_cluster → stop_mlflow
+
+모델 체인: refresh_feature_mart → evaluate → check_retrain_branch ─┬→ orchestrate_retrain_loop
+                                                                  └→ skip_monthly_retrain
 ```
 
-재학습은 단일 학습 EC2에서 수행한다. Airflow scheduler 프로세스에서 모델을 직접 학습하지 않는다.
+`terminate_cluster`와 `stop_mlflow`는 teardown이라 DAG run을 수동으로 실패 처리해도 실행된다. 평가·학습은 EMR core 노드의 YARN 컨테이너에서 실행하고, Airflow scheduler 프로세스에서 모델을 직접 학습하지 않는다. teardown이 실행되지 못한 경우는 `emr_orphan_reaper`가 활성 스텝 없이 유휴 유예 시간이 지난 클러스터를 종료한다.
 
 ## 데이터 계층과 소비자
 
@@ -211,5 +150,4 @@ API와 화면은 S3를 직접 읽지 않는다. Gold의 freshness와 공통 기�
 - 스케줄·timeout: `airflow/config/schedules.py`
 - source 그룹: `airflow/config/sources.py`
 - 태스크 명령: `airflow/orchestration/`
-- 자원 manifest: `airflow/resource-profiles/<dag_id>/<run_id>/<task_id>/...json`
 - DAG 구조 회귀 테스트: `airflow/tests/`

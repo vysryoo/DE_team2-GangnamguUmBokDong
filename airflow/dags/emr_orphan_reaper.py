@@ -37,46 +37,40 @@ def _reap_orphan_emr_clusters(**context: Any) -> dict[str, Any]:
     """
     clusters = list_active_emr_clusters()
     now = datetime.now(UTC)
-    reaped: list[str] = []
-    still_active: list[str] = []
-    still_within_grace: list[str] = []
-
+    outcome: dict[str, list[str]] = {"reaped": [], "still_active": [], "still_within_grace": []}
     for cluster in clusters:
-        activity = get_cluster_step_activity(cluster["id"])
-
-        if activity["has_active_step"]:
-            still_active.append(cluster["id"])
-            continue
-
-        idle_since = activity["last_step_completed_at"] or cluster["created_at"]
-        idle_minutes = (now - idle_since).total_seconds() / 60
-        if idle_minutes >= EMR_IDLE_GRACE_MINUTES:
-            logger.warning(
-                "[emr-reaper] 클러스터 '%s'(%s)가 활성 스텝 없이 %.1f분째 유휴 상태라 "
-                "(기준 %.1f분) 강제 종료합니다",
-                cluster["name"],
-                cluster["id"],
-                idle_minutes,
-                EMR_IDLE_GRACE_MINUTES,
-            )
-            terminate_emr_cluster(cluster["id"])
-            reaped.append(cluster["id"])
-        else:
-            still_within_grace.append(cluster["id"])
+        outcome[_reap_if_idle(cluster, now)].append(cluster["id"])
 
     logger.info(
         "[emr-reaper] 점검 완료 — 전체 %d개, 종료 %d개, 재학습 중 %d개, 유예 중 %d개",
         len(clusters),
-        len(reaped),
-        len(still_active),
-        len(still_within_grace),
+        len(outcome["reaped"]),
+        len(outcome["still_active"]),
+        len(outcome["still_within_grace"]),
     )
-    return {
-        "total": len(clusters),
-        "reaped": reaped,
-        "still_active": still_active,
-        "still_within_grace": still_within_grace,
-    }
+    return {"total": len(clusters), **outcome}
+
+
+def _reap_if_idle(cluster: dict[str, Any], now: datetime) -> str:
+    activity = get_cluster_step_activity(cluster["id"])
+    if activity["has_active_step"]:
+        return "still_active"
+
+    idle_since = activity["last_step_completed_at"] or cluster["created_at"]
+    idle_minutes = (now - idle_since).total_seconds() / 60
+    if idle_minutes < EMR_IDLE_GRACE_MINUTES:
+        return "still_within_grace"
+
+    logger.warning(
+        "[emr-reaper] 클러스터 '%s'(%s)가 활성 스텝 없이 %.1f분째 유휴 상태라 "
+        "(기준 %.1f분) 강제 종료합니다",
+        cluster["name"],
+        cluster["id"],
+        idle_minutes,
+        EMR_IDLE_GRACE_MINUTES,
+    )
+    terminate_emr_cluster(cluster["id"])
+    return "reaped"
 
 
 with DAG(

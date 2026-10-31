@@ -3,7 +3,14 @@
 값은 `collector/sources/*.yaml`의 `source_id`와 정확히 일치해야 한다.
 """
 
-REALTIME_5MIN_SOURCES = ("bike_rental_history", "bike_station_realtime", "population_realtime")
+RENTAL_HISTORY_SOURCE = "bike_rental_history"
+BIKE_STATION_REALTIME_SOURCE = "bike_station_realtime"
+POPULATION_REALTIME_SOURCE = "population_realtime"
+REALTIME_5MIN_SOURCES = (
+    RENTAL_HISTORY_SOURCE,
+    BIKE_STATION_REALTIME_SOURCE,
+    POPULATION_REALTIME_SOURCE,
+)
 WEATHER_10MIN_SOURCE = "weather_ultra_short_live"
 WEATHER_ULTRA_SHORT_FORECAST_SOURCE = "weather_ultra_short_forecast"
 WEATHER_3H_SOURCE = "weather_short_term_forecast"
@@ -37,16 +44,12 @@ HOURLY_MONITORED_SOURCES = (
 # weather_short_term_forecast)은 사후 재현이 불가해 archive 가치가 낮아 제외한다.
 # cultural_event·performance_event·living_population_grid는 하루 1파일이라 묶을 것이 없다.
 COMPACTION_SOURCES = (
-    "bike_rental_history",
-    "bike_station_realtime",
-    "population_realtime",
-    "weather_ultra_short_live",
+    *REALTIME_5MIN_SOURCES,
+    WEATHER_10MIN_SOURCE,
 )
 
-# bike_rental_history를 몇 시간 전까지 다시 수집할지.
-#
 # tbCycleRentData는 반납이 완료된 기록만 보여 주므로, 대여 시간대가 끝난 뒤 반납된
-# 기록은 이후 재조회에서만 잡힌다. 2시간 재조회 시 잔여 누락 약 0.3% (2026-08-18 실측).
+# 기록은 이후 재조회에서만 잡힌다. 2시간 재조회로 잔여 누락이 약 0.3%까지 줄었음
 RENTAL_HISTORY_LOOKBACK_HOURS = 2
 
 # 일별 archive를 확정하기 전에 대여이력을 전체 재조회할 지연 일수.

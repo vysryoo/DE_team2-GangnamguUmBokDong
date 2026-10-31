@@ -230,15 +230,9 @@ def test_read_parquet_date_range_with_columns_keeps_date_and_requested_order():
 
 
 def test_read_parquet_date_range_without_date_in_columns_omits_it_and_skips_building_it(monkeypatch):
-    """columns에 "date"를 안 넣으면 결과에도 없어야 하고(기존부터 참), 애초에
-    그 문자열 배열을 만드는 작업 자체를 건너뛰어야 한다(2026-08 수정 — 예전엔
-    combined.select(columns)에서 나중에 버리기 전까지 전체 구간 크기로 만들어져
-    있었다, 리뷰 지적: station_categories_for_dates()처럼 "date" 없이 컬럼 1개만
-    1년 전체를 읽는 호출에서 그 버려지는 배열만 수 GB 규모).
+    """columns에 date가 없으면 결과에서 빠지고, 버릴 date 문자열 배열도 만들지 않는다.
 
-    `pa.array`를 통째로 스파이하면 pandas/pyarrow 내부(`to_pandas()`의 컬럼 인덱스
-    역직렬화 등)에서도 호출돼 오탐이 난다 — "date" 파티션 문자열이 그대로 반복된
-    호출(예: `pa.array(["2025-11-01"])`)만 걸러서 우리 코드가 만든 것인지 구분한다.
+    `pa.array`는 pyarrow 내부에서도 불리므로 파티션 날짜만 반복한 호출만 센다.
     """
     s3.write_parquet(pd.DataFrame({"a": [1], "b": [10]}), "mh2b/date=2025-11-01/part-00000.parquet")
 

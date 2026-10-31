@@ -15,6 +15,7 @@ import pendulum
 from airflow import DAG
 from airflow.providers.standard.operators.empty import EmptyOperator
 from airflow.providers.standard.operators.python import ShortCircuitOperator
+from airflow.sdk import BaseOperator
 from airflow.task.trigger_rule import TriggerRule
 from airflow.timetables.trigger import CronTriggerTimetable
 
@@ -28,8 +29,10 @@ from config.schedules import (
     TIMEZONE,
 )
 from config.sources import (
-    REALTIME_5MIN_SOURCES,
+    BIKE_STATION_REALTIME_SOURCE,
+    POPULATION_REALTIME_SOURCE,
     RENTAL_HISTORY_LOOKBACK_HOURS,
+    RENTAL_HISTORY_SOURCE,
     WEATHER_3H_SOURCE,
     WEATHER_10MIN_SOURCE,
     WEATHER_ULTRA_SHORT_FORECAST_SOURCE,
@@ -139,109 +142,127 @@ def _build_realtime_tick_dag() -> DAG:
         on_failure_callback=_on_realtime_tick_failure,
         tags=["realtime"],
     ) as dag:
-        allow_current_tick = ShortCircuitOperator(
-            task_id="allow_current_tick",
-            python_callable=_allow_current_tick,
-            retries=0,
-            on_success_callback=on_success_callback,
-            on_failure_callback=on_failure_callback,
-            dag=dag,
-        )
-        resolve_poi_master = build_poi_master_resolve_task(dag)
-        collector_tasks = {
-            source_id: build_collector_task(
-                dag,
-                source_id,
-                poi_master_task_id=(
-                    resolve_poi_master.task_id
-                    if source_id == "population_realtime"
-                    else None
-                ),
-            )
-            for source_id in REALTIME_5MIN_SOURCES
-        }
-        run_normalizer = build_normalizer_task(
+        run_normalizer = _build_population_chain(dag)
+        collect_station = build_collector_task(dag, BIKE_STATION_REALTIME_SOURCE)
+        collect_rental = build_collector_task(dag, RENTAL_HISTORY_SOURCE)
+        weather_ready = _build_weather_chain(dag)
+        _build_serving_chain(
             dag,
-            poi_master_task_id=resolve_poi_master.task_id,
+            plan_upstream=[collect_station, weather_ready],
+            inference_upstream=[collect_rental, run_normalizer],
         )
-        resolve_poi_master >> collector_tasks["population_realtime"]
-        collector_tasks["population_realtime"] >> run_normalizer
-
-        weather_collect_tasks = []
-        for source_id, min_interval in _WEATHER_MIN_INTERVAL_BY_SOURCE.items():
-            freshness_gate = build_weather_freshness_gate_task(
-                dag, source_id, min_interval=min_interval
-            )
-            collect = build_collector_task(
-                dag,
-                source_id,
-                retries=0,
-                execution_timeout=_WEATHER_COLLECTOR_TIMEOUT,
-            )
-            freshness_gate >> collect
-            weather_collect_tasks.append(collect)
-
-        # 날씨 수집이 실패하거나 스킵돼도 이 게이트는 성공하므로 prepare는 이전
-        # 날씨 스냅샷으로 진행함
-        weather_gate = EmptyOperator(
-            task_id="weather_ready_gate",
-            trigger_rule=TriggerRule.ALL_DONE,
-            on_success_callback=on_success_callback,
-            on_failure_callback=on_failure_callback,
-            dag=dag,
-        )
-        weather_collect_tasks >> weather_gate
-
-        prepare_plan = build_prepare_serving_task(
-            dag,
-            trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
-        )
-        [collector_tasks["bike_station_realtime"], weather_gate] >> prepare_plan
-
-        run_inference = build_inference_task(dag, plan_task_id=prepare_plan.task_id)
-        [
-            prepare_plan,
-            collector_tasks["bike_rental_history"],
-            run_normalizer,
-        ] >> run_inference
-        finalize_release = build_finalize_serving_task(
-            dag,
-            plan_task_id=prepare_plan.task_id,
-            inference_task_id=run_inference.task_id,
-        )
-        publish_urgency = build_urgency_task(
-            dag,
-            final_task_id=finalize_release.task_id,
-        )
-        publish_routes = build_routes_task(
-            dag,
-            urgency_task_id=publish_urgency.task_id,
-        )
-        run_inference >> finalize_release >> publish_urgency >> publish_routes
-
-        # 대여 시간대가 끝난 뒤 반납된 기록을 회수하는 비차단 side chain. 완결된
-        # 윈도우를 다시 받아야 하므로 --force를 쓰고, 현재 tick 성패와 무관하게
-        # 실행되도록 ALL_DONE으로 둠
-        replay_chain = collector_tasks["bike_rental_history"]
-        for hours_back in range(1, RENTAL_HISTORY_LOOKBACK_HOURS + 1):
-            replay = build_collector_task(
-                dag,
-                "bike_rental_history",
-                task_id=f"collect_bike_rental_history_replay_{hours_back}h",
-                window_start=kst_window_start_shifted(hours_back),
-                force=True,
-                trigger_rule=TriggerRule.ALL_DONE,
-            )
-            replay_chain >> replay
-            replay_chain = replay
-
-        root_tasks = [
-            task
-            for task in dag.tasks
-            if task is not allow_current_tick and not task.upstream_task_ids
-        ]
-        allow_current_tick >> root_tasks
+        _build_rental_replay_chain(dag, collect_rental)
+        _gate_root_tasks(dag)
     return dag
+
+
+def _build_population_chain(dag: DAG) -> BaseOperator:
+    """POI Master를 고정하고 실시간 인구 수집과 normalizer가 같은 버전을 쓰게 한다."""
+    resolve_poi_master = build_poi_master_resolve_task(dag)
+    collect_population = build_collector_task(
+        dag,
+        POPULATION_REALTIME_SOURCE,
+        poi_master_task_id=resolve_poi_master.task_id,
+    )
+    run_normalizer = build_normalizer_task(
+        dag,
+        poi_master_task_id=resolve_poi_master.task_id,
+    )
+    resolve_poi_master >> collect_population >> run_normalizer
+    return run_normalizer
+
+
+def _build_weather_chain(dag: DAG) -> BaseOperator:
+    """source별 freshness gate 뒤에 날씨를 수집하고 항상 통과하는 합류 게이트를 반환한다."""
+    weather_collect_tasks = []
+    for source_id, min_interval in _WEATHER_MIN_INTERVAL_BY_SOURCE.items():
+        freshness_gate = build_weather_freshness_gate_task(
+            dag, source_id, min_interval=min_interval
+        )
+        collect = build_collector_task(
+            dag,
+            source_id,
+            retries=0,
+            execution_timeout=_WEATHER_COLLECTOR_TIMEOUT,
+        )
+        freshness_gate >> collect
+        weather_collect_tasks.append(collect)
+
+    # 날씨 수집이 실패하거나 스킵돼도 이 게이트는 성공하므로 prepare는 이전
+    # 날씨 스냅샷으로 진행함
+    weather_gate = EmptyOperator(
+        task_id="weather_ready_gate",
+        trigger_rule=TriggerRule.ALL_DONE,
+        on_success_callback=on_success_callback,
+        on_failure_callback=on_failure_callback,
+        dag=dag,
+    )
+    weather_collect_tasks >> weather_gate
+    return weather_gate
+
+
+def _build_serving_chain(
+    dag: DAG,
+    *,
+    plan_upstream: list[BaseOperator],
+    inference_upstream: list[BaseOperator],
+) -> None:
+    """serving plan → inference → finalize → urgency → routes 순서의 게시 체인을 만든다."""
+    prepare_plan = build_prepare_serving_task(
+        dag,
+        trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
+    )
+    run_inference = build_inference_task(dag, plan_task_id=prepare_plan.task_id)
+    finalize_release = build_finalize_serving_task(
+        dag,
+        plan_task_id=prepare_plan.task_id,
+        inference_task_id=run_inference.task_id,
+    )
+    publish_urgency = build_urgency_task(
+        dag,
+        final_task_id=finalize_release.task_id,
+    )
+    publish_routes = build_routes_task(
+        dag,
+        urgency_task_id=publish_urgency.task_id,
+    )
+    plan_upstream >> prepare_plan
+    [prepare_plan, *inference_upstream] >> run_inference
+    run_inference >> finalize_release >> publish_urgency >> publish_routes
+
+
+def _build_rental_replay_chain(dag: DAG, collect_rental: BaseOperator) -> None:
+    """대여 시간대가 끝난 뒤 반납된 기록을 회수하는 비차단 side chain을 만든다.
+
+    완결된 윈도우를 다시 받아야 하므로 ``--force``를 쓰고, 현재 tick 성패와 무관하게
+    실행되도록 ``ALL_DONE``으로 둠.
+    """
+    replay_chain = collect_rental
+    for hours_back in range(1, RENTAL_HISTORY_LOOKBACK_HOURS + 1):
+        replay = build_collector_task(
+            dag,
+            RENTAL_HISTORY_SOURCE,
+            task_id=f"collect_bike_rental_history_replay_{hours_back}h",
+            window_start=kst_window_start_shifted(hours_back),
+            force=True,
+            trigger_rule=TriggerRule.ALL_DONE,
+        )
+        replay_chain >> replay
+        replay_chain = replay
+
+
+def _gate_root_tasks(dag: DAG) -> None:
+    """지연된 scheduled run이 실제 작업을 시작하지 않도록 모든 root 앞에 gate를 둔다."""
+    root_tasks = [task for task in dag.tasks if not task.upstream_task_ids]
+    allow_current_tick = ShortCircuitOperator(
+        task_id="allow_current_tick",
+        python_callable=_allow_current_tick,
+        retries=0,
+        on_success_callback=on_success_callback,
+        on_failure_callback=on_failure_callback,
+        dag=dag,
+    )
+    allow_current_tick >> root_tasks
 
 
 dag = _build_realtime_tick_dag()

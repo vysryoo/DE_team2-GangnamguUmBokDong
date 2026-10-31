@@ -14,7 +14,6 @@ from orchestration import collector_task
 from orchestration.collector_task import (
     COLLECTOR_DIR,
     build_collector_task,
-    build_daily_history_replay_task,
     build_weather_freshness_gate_task,
     build_window_stats_task,
 )
@@ -491,17 +490,6 @@ def test_daily_replay_templates_render_d_minus_six_boundaries() -> None:
     assert target_date == "2026-08-13"
     assert datetime.fromisoformat(first_end) == datetime(2026, 8, 13, 0, 55, tzinfo=kst)
     assert datetime.fromisoformat(last_end) == datetime(2026, 8, 13, 23, 55, tzinfo=kst)
-
-
-def test_daily_history_replay_task_contract(dag) -> None:
-    """D-6 시간대 끝 시각의 rental history를 force 수집한다."""
-    task = build_daily_history_replay_task(dag, 23, 6)
-
-    assert task.task_id == "replay_bike_rental_history_23h"
-    assert "--source bike_rental_history" in task.bash_command
-    assert "--force" in task.bash_command
-    assert "macros.timedelta(days=6)" in task.bash_command
-    assert "hour=23, minute=55" in task.bash_command
 
 
 def test_window_stats_task_reports_a_full_day_without_hour_flag(dag) -> None:

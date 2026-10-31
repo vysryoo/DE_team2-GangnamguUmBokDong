@@ -10,7 +10,9 @@
 |---|---|---|
 | `db.py` | PostgreSQL(psycopg3) 연결 관리 및 기본 쿼리 실행 | `get_connection()`, `execute()`, `fetch_all()`, `fetch_one()` |
 | `upsert.py` | PostgreSQL 대량 Upsert (`INSERT ON CONFLICT DO UPDATE`) 쿼리 실행 | `upsert(conn, table, rows, conflict_cols, update_cols)` |
-| `s3.py` | S3 / MinIO 제네릭 I/O (Parquet, JSON, Bytes) 및 배치/스레드 병렬 처리 | `get_object_bytes`, `read_parquet`, `write_parquet`, `read_json`, `write_json`, `list_keys`, `delete_objects`, `bucket_name`, `object_uri` |
+| `s3.py` | S3 / MinIO 제네릭 I/O (Parquet, JSON, Bytes) 및 배치/스레드 병렬 처리 | `get_object_bytes`, `read_parquet`, `read_parquet_many`, `write_parquet`, `concat_compatible_tables`, `capture_object_reads`, `read_json`, `write_json`, `list_keys`, `delete_objects`, `bucket_name`, `object_uri` |
+| `source_snapshot.py` | Collector가 게시하는 immutable source snapshot manifest 계약 | `SourceSnapshotManifest`, `build_source_snapshot_manifest()`, `parse_source_snapshot_manifest()` |
+| `source_snapshot_io.py` | manifest를 따라 source Silver를 checksum·행 수까지 검증해 읽음 | `read_exact_source_snapshot()`, `read_latest_source_snapshot()`, `read_available_source_snapshot()` |
 | `layout.py` | 여러 모듈이 공유하는 데이터 레이크 객체 키 규칙 (silver·nowcast·window manifest·source snapshot manifest·archive) | `silver_content_key()`, `window_manifest_key()`, `source_snapshot_manifest_key()`, `parse_source_snapshot_manifest_key()`, `archive_key()` |
 | `kst.py` | 파이프라인 공통 시간대(KST)와 CLI 시각 인자 파싱 | `KST`, `parse_kst_datetime()`, `today_kst()` |
 | `sources.py` | S3 경로와 manifest에 쓰이는 source id 상수 | `BIKE_STATION_REALTIME` 등, `COLLECTOR_SOURCE_IDS` |

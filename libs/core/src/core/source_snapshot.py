@@ -151,24 +151,6 @@ def parse_source_snapshot_manifest(payload: bytes) -> SourceSnapshotManifest:
         counts_document = _require_object(
             document["counts"], _COUNTS_KEYS, "source snapshot counts"
         )
-        expected = counts_document["expected"]
-        counts = SourceSnapshotCounts(
-            expected=(
-                None
-                if expected is None
-                else _require_nonnegative_integer(expected, "counts.expected")
-            ),
-            fetched=_require_nonnegative_integer(
-                counts_document["fetched"], "counts.fetched"
-            ),
-            kept=_require_nonnegative_integer(counts_document["kept"], "counts.kept"),
-            repaired=_require_nonnegative_integer(
-                counts_document["repaired"], "counts.repaired"
-            ),
-            dropped=_require_nonnegative_integer(
-                counts_document["dropped"], "counts.dropped"
-            ),
-        )
         status_value = _require_string(document["status"], "status")
         try:
             status = SourceSnapshotStatus(status_value)
@@ -176,26 +158,21 @@ def parse_source_snapshot_manifest(payload: bytes) -> SourceSnapshotManifest:
             raise SourceSnapshotContractError(
                 "status는 succeeded 또는 empty여야 합니다."
             ) from exc
+        # count, source_id, revision_no 등의 타입과 값은 생성자 검증이 다시 확인함
         return SourceSnapshotManifest(
-            schema_version=_require_string(
-                document["schema_version"], "schema_version"
-            ),
-            source_id=_require_string(document["source_id"], "source_id"),
+            schema_version=document["schema_version"],
+            source_id=document["source_id"],
             logical_dttm=parse_utc_dttm(
                 _require_string(document["logical_dttm"], "logical_dttm")
             ),
-            revision_no=_require_nonnegative_integer(
-                document["revision_no"], "revision_no"
-            ),
+            revision_no=document["revision_no"],
             status=status,
-            config_version=_require_string(
-                document["config_version"], "config_version"
-            ),
+            config_version=document["config_version"],
             silver_uri=_require_optional_string(document["silver_uri"], "silver_uri"),
             silver_byte_sha256=_require_optional_string(
                 document["silver_byte_sha256"], "silver_byte_sha256"
             ),
-            counts=counts,
+            counts=SourceSnapshotCounts(**counts_document),
             planned_parts=_parse_parts(document["planned_parts"], "planned_parts"),
             completed_parts=_parse_parts(
                 document["completed_parts"], "completed_parts"
@@ -230,13 +207,6 @@ def validate_source_snapshot_manifest(manifest: SourceSnapshotManifest) -> None:
     _require_nonblank_nfc(manifest.config_version, "config_version")
     if type(manifest.counts) is not SourceSnapshotCounts:
         raise SourceSnapshotContractError("counts는 SourceSnapshotCounts여야 합니다.")
-    SourceSnapshotCounts(
-        expected=manifest.counts.expected,
-        fetched=manifest.counts.fetched,
-        kept=manifest.counts.kept,
-        repaired=manifest.counts.repaired,
-        dropped=manifest.counts.dropped,
-    )
     _validate_parts(manifest.planned_parts, "planned_parts")
     _validate_parts(manifest.completed_parts, "completed_parts")
     if manifest.planned_parts != manifest.completed_parts:
@@ -396,12 +366,10 @@ def _require_source_id(value: str) -> str:
 
 
 def _parse_parts(value: JsonValue, label: str) -> tuple[str, ...]:
-    """Canonical JSON array를 정렬된 part tuple로 파싱한다."""
+    """Canonical JSON array를 part tuple로 바꾼다. 값 검증은 생성자가 한다."""
     if type(value) is not list:
         raise SourceSnapshotContractError(f"{label}는 JSON array여야 합니다.")
-    parts = tuple(_require_string(item, label) for item in value)
-    _validate_parts(parts, label)
-    return parts
+    return tuple(value)
 
 
 def _validate_parts(value: tuple[str, ...], label: str) -> None:
