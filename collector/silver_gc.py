@@ -12,6 +12,7 @@ from datetime import date, datetime, timedelta
 
 from core import layout
 from core.kst import KST
+from core.s3 import S3Object
 
 import cold_bronze
 import compaction
@@ -64,10 +65,9 @@ def collect_date(
     archive_manifest = None
     if require_archive:
         archive_manifest = storage.read_archive_manifest(source_id, day)
-        if not archive_manifest:
-            return SilverGcResult("skipped", 0, len(objects), "archive_manifest_missing")
-        if archive_manifest.get("silver_signature") != signature:
-            return SilverGcResult("skipped", 0, len(objects), "archive_authority_stale")
+        archive_problem = _archive_problem(archive_manifest, signature)
+        if archive_problem is not None:
+            return SilverGcResult("skipped", 0, len(objects), archive_problem)
 
     authority_keys = {item.object.key for item in authority.selected}
     cutoff = (now or datetime.now(KST)) - timedelta(days=NON_AUTHORITY_RETENTION_DAYS)
@@ -94,17 +94,27 @@ def collect_date(
             "retained_keys": retained_keys,
             "retention_days": NON_AUTHORITY_RETENTION_DAYS,
             "cutoff": cutoff.isoformat(),
-            "deletion_candidates": [
-                {
-                    "key": obj.key,
-                    "size": obj.size,
-                    "last_modified": obj.last_modified.isoformat(),
-                }
-                for obj in candidates
-            ],
+            "deletion_candidates": [_candidate_record(obj) for obj in candidates],
         },
         deleted_keys,
         layout.silver_day_prefix(source_id, day),
         completed={"status": "completed"},
     )
     return SilverGcResult("completed", len(deleted_keys), len(retained_keys))
+
+
+def _archive_problem(archive_manifest: dict | None, signature: str) -> str | None:
+    """Archive가 없거나 현재 authority와 다르면 skip 이유를 반환한다."""
+    if not archive_manifest:
+        return "archive_manifest_missing"
+    if archive_manifest.get("silver_signature") != signature:
+        return "archive_authority_stale"
+    return None
+
+
+def _candidate_record(obj: S3Object) -> dict:
+    return {
+        "key": obj.key,
+        "size": obj.size,
+        "last_modified": obj.last_modified.isoformat(),
+    }

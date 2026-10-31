@@ -225,42 +225,54 @@ def _select_date_authority(
     published = set(snapshot_windows)
     for window_start in sorted(set(objects_by_window) | published):
         if window_start not in published:
-            markers.append(
-                (
-                    "unpublished_immutable",
-                    window_start.isoformat(),
-                    _diagnostic_manifest_sha256(source_id, window_start),
-                )
-            )
+            markers.append(_unpublished_marker(source_id, window_start))
             continue
-
-        latest = manifest_module.load_source_snapshots(source_id, window_start)[-1].manifest
-        markers.append(
-            (
-                "source_snapshot",
-                window_start.isoformat(),
-                str(latest.revision_no),
-                latest.sha256,
-            )
+        marker, silver = _select_published_window(
+            source_id, window_start, objects_by_window.get(window_start, [])
         )
-        if latest.status is SourceSnapshotStatus.EMPTY:
-            continue
-
-        exact_key = layout.silver_content_key(
-            source_id, window_start, latest.silver_byte_sha256
-        )
-        by_key = {obj.key: obj for obj in objects_by_window.get(window_start, [])}
-        if exact_key not in by_key:
-            raise ValueError(
-                f"source snapshot이 가리키는 Silver object가 목록에 없다: {exact_key}"
-            )
-        selected.append(_SelectedSilver(by_key[exact_key], latest.counts.kept))
+        markers.append(marker)
+        if silver is not None:
+            selected.append(silver)
 
     return DateAuthority(
         selected=tuple(selected),
         markers=tuple(markers),
         completed_windows=len(published),
     )
+
+
+def _unpublished_marker(source_id: str, window_start: datetime) -> tuple[str, ...]:
+    """게시 전 window의 변경 감지 marker를 진단 manifest 상태로 만든다."""
+    return (
+        "unpublished_immutable",
+        window_start.isoformat(),
+        _diagnostic_manifest_sha256(source_id, window_start),
+    )
+
+
+def _select_published_window(
+    source_id: str, window_start: datetime, window_objects: list[S3Object]
+) -> tuple[tuple[str, ...], _SelectedSilver | None]:
+    """게시된 window의 marker와 최신 snapshot이 가리키는 Silver를 반환한다. EMPTY면 None."""
+    latest = manifest_module.load_source_snapshots(source_id, window_start)[-1].manifest
+    marker = (
+        "source_snapshot",
+        window_start.isoformat(),
+        str(latest.revision_no),
+        latest.sha256,
+    )
+    if latest.status is SourceSnapshotStatus.EMPTY:
+        return marker, None
+
+    exact_key = layout.silver_content_key(
+        source_id, window_start, latest.silver_byte_sha256
+    )
+    by_key = {obj.key: obj for obj in window_objects}
+    if exact_key not in by_key:
+        raise ValueError(
+            f"source snapshot이 가리키는 Silver object가 목록에 없다: {exact_key}"
+        )
+    return marker, _SelectedSilver(by_key[exact_key], latest.counts.kept)
 
 
 def _authority_signature(authority: DateAuthority) -> str:
