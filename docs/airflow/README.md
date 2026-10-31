@@ -7,7 +7,7 @@
 | 문서 | 내용 |
 | --- | --- |
 | [운영 구조와 데이터 흐름](./explain.md) | DAG별 주기, 의존성, 실패 경계, 외부 시스템 연결 |
-| [태스크 자원 계측](./TASK_RESOURCE_PROFILES.md) | BashOperator 자원 측정 범위와 manifest 해석법 |
+| [태스크 자원 계측](./TASK_RESOURCE_PROFILES.md) | resource probe가 Airflow에서 빠졌다는 기록 |
 
 ## 과거 설계 기록
 
