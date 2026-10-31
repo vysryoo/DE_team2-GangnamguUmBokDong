@@ -13,7 +13,7 @@ import threading
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from contextvars import Context, ContextVar, copy_context
+from contextvars import ContextVar, copy_context
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -405,10 +405,24 @@ def read_parquet(
         return _read_parquet_by_dates(
             key, dates, columns=columns, as_pandas=as_pandas, filters=filters, on_complete=on_complete
         )
+    return _read_object_or_parts(
+        key, columns, as_pandas, filters, on_complete, allow_missing_columns=_allow_missing_columns
+    )
 
+
+def _read_object_or_parts(
+    key: str,
+    columns: list[str] | None,
+    as_pandas: bool,
+    filters: list[tuple] | None,
+    on_complete: Callable[[int, int], None] | None,
+    *,
+    allow_missing_columns: bool,
+) -> pd.DataFrame | pq.Table | None:
+    """`key`가 객체면 그 파일을, 아니면 `key/` 아래 part 파일을 모두 읽어 결합한다."""
     body = get_object_bytes(key)
     if body is not None:
-        table = _read_parquet_bytes(body, columns, filters, allow_missing_columns=_allow_missing_columns)
+        table = _read_parquet_bytes(body, columns, filters, allow_missing_columns=allow_missing_columns)
         return _to_pandas_or_table(table, as_pandas)
 
     part_keys = _list_parquet_keys(key)
@@ -522,12 +536,8 @@ def read_parquet_many(
 
     def _read(key: str) -> pd.DataFrame | pq.Table | None:
         nonlocal completed
-        result = read_parquet(
-            key,
-            columns=columns,
-            as_pandas=as_pandas,
-            filters=filters,
-            _allow_missing_columns=True,
+        result = _read_object_or_parts(
+            key, columns, as_pandas, filters, None, allow_missing_columns=True
         )
         if on_complete is not None:
             with lock:
@@ -536,22 +546,11 @@ def read_parquet_many(
             on_complete(current, total)
         return result
 
-    capture = _ACTIVE_READ_CAPTURE.get()
-    if capture is None:
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            return list(pool.map(_read, keys))
-
-    # ContextVar는 worker thread로 전파되지 않으므로 context copy를 넘김. copy 안의
-    # S3ReadCapture는 같은 객체라 multipart GET도 한 capture에 모임
+    # ContextVar는 worker thread로 전파되지 않으므로 caller thread에서 key마다 context를
+    # 복사해 넘김. copy 안의 S3ReadCapture는 같은 객체라 multipart GET도 한 capture에 모임
     contexts = [copy_context() for _ in keys]
-
-    def _read_in_context(item: tuple[Context, str]) -> pd.DataFrame | pq.Table | None:
-        """복사한 caller context 안에서 단일 parquet key를 읽는다."""
-        context, key = item
-        return context.run(_read, key)
-
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        return list(pool.map(_read_in_context, zip(contexts, keys)))
+        return list(pool.map(lambda context, key: context.run(_read, key), contexts, keys))
 
 
 def write_parquet(
