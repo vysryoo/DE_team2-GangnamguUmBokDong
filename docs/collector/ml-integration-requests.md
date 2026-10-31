@@ -109,6 +109,8 @@
 
 ## 5. Silver 불변성 — backfill 재작성과 `revision`을 ML이 신경써야 하는가
 
+> 현재: 지연 백필은 제거됐고 Silver는 content-addressed immutable 객체다. 아래는 당시 기록이다.
+
 `implementation-plan.md`(739~754행)에 따르면 **silver는 불변이 아니다** — 백필로
 같은 window가 덮어써지고 `manifest.revision`이 올라간다("하류는 `revision`을 보고
 멱등 재처리한다"). 그런데 ML의 실시간 조회 함수들
@@ -236,7 +238,7 @@ YAML 예시(210행 근처)에 `adapter_params.page_size: 1000`이 있어, 혹시
 - `realtime_collection.py`(5분 주기)의 `airflow/config/sources.py`
   `REALTIME_SOURCES`엔 `bike_station_realtime`/`population_realtime`만 있고
   날씨는 없다.
-- `collector_backfill`(`airflow/dags/backfill.py`)에 두 날씨 source_id가
+- (당시 기록. 현재 `collector_backfill` DAG는 없다.) `collector_backfill`(`airflow/dags/backfill.py`)에 두 날씨 source_id가
   들어있긴 한데 `schedule=None`(수동 트리거 전용)이고, "이미 도는 1차 수집의
   누락 조각만 채우는" 백필 용도라 1차 수집 자체가 없으면 채울 게 없다.
 - 실제로 지금은 사람이 직접 `collector/main.py --source weather_... --window-start ...`를

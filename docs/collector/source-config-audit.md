@@ -136,12 +136,10 @@ Bronze가 저장된 뒤 Silver 쓰기나 품질 검증이 실패하면 다음 �
 조각만 재시도한다. Airflow가 같은 window를 다시 실행하면 외부 API를 호출하지 않고
 manifest가 가리키는 기존 Bronze를 재사용한다.
 
-현재 운영 source에는 delayed `backfill` 설정이 없고 범용 Backfill DAG도 없다.
-`--backfill`, `_retry_queue`와 manifest 필드는 기존 코드·저장 포맷 파싱 호환을 위해
-남아 있지만 기존 marker는 발견·소비되지 않는 정리 대상이다.
+지연 백필(`--backfill`, `_retry_queue`, source 설정의 `backfill` 키)은 제거됐다.
+manifest의 `backfill_status`만 기존 manifest 호환을 위해 남아 있으며 항상 `null`이다.
 
-`--force`는 기존 Bronze를 보존한 채 새 Hot revision에 전체를 다시 받는 명령이며
-`--backfill`과 동시에 사용할 수 없다.
+`--force`는 기존 Bronze를 보존한 채 새 Hot revision에 전체를 다시 받는 명령이다.
 
 ## Archive 대상
 
