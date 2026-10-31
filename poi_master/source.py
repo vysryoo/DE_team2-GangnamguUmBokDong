@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass
 from html.parser import HTMLParser
@@ -26,6 +27,7 @@ _LIST_FILENAME = re.compile(
 _AREAS_FILENAME = re.compile(
     r"서울시\s+주요\s+(?P<count>[1-9][0-9]*)장소\s+영역\.zip\Z"
 )
+_FILENAME_PATTERNS = {"list": _LIST_FILENAME, "areas": _AREAS_FILENAME}
 _DOWNLOAD_SEQUENCE = re.compile(r"downloadFile\s*\(\s*['\"](\d+)['\"]\s*\)")
 _MODIFIED_DATE = re.compile(r"(?<![0-9])(\d{4}\.\d{2}\.\d{2}\.)(?![0-9])")
 _ZIP_SIGNATURES = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
@@ -47,7 +49,7 @@ class Attachment:
 
     def __post_init__(self) -> None:
         """역할별 파일명과 파일명이 선언한 장소 수가 정확히 같은지 검증한다."""
-        pattern = {"list": _LIST_FILENAME, "areas": _AREAS_FILENAME}.get(self.role)
+        pattern = _FILENAME_PATTERNS.get(self.role)
         matched = pattern.fullmatch(self.filename) if pattern is not None else None
         if matched is None or int(matched.group("count")) != self.declared_place_count:
             raise PoiSourceError(
@@ -66,6 +68,16 @@ class SourceAssets:
     list_bytes: bytes
     areas_bytes: bytes
     page_url: str = DEFAULT_DATASET_PAGE_URL
+
+    @property
+    def list_sha256(self) -> str:
+        """목록 XLSX bytes의 SHA-256."""
+        return hashlib.sha256(self.list_bytes).hexdigest()
+
+    @property
+    def areas_sha256(self) -> str:
+        """영역 ZIP bytes의 SHA-256."""
+        return hashlib.sha256(self.areas_bytes).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,38 +158,8 @@ def parse_attachments(page_html: str) -> tuple[Attachment, Attachment]:
 
     found: dict[str, list[Attachment]] = {"list": [], "areas": []}
     for row in parser.rows:
-        filenames: list[tuple[str, str, int]] = []
-        for cell in row.cells:
-            list_match = _LIST_FILENAME.fullmatch(cell)
-            if list_match is not None:
-                filenames.append(("list", cell, int(list_match.group("count"))))
-            areas_match = _AREAS_FILENAME.fullmatch(cell)
-            if areas_match is not None:
-                filenames.append(("areas", cell, int(areas_match.group("count"))))
-        if not filenames:
-            continue
-        sequences = tuple(dict.fromkeys(row.sequences))
-        if len(sequences) != 1:
-            raise PoiSourceError(
-                "POI 첨부 행의 downloadFile sequence가 하나가 아닙니다: "
-                f"cells={row.cells}, sequences={sequences}"
-            )
-        row_text = " ".join(row.cells)
-        dates = tuple(dict.fromkeys(_MODIFIED_DATE.findall(row_text)))
-        if len(dates) != 1:
-            raise PoiSourceError(
-                f"POI 첨부 행의 수정일을 하나로 판별할 수 없습니다: cells={row.cells}"
-            )
-        for role, filename, declared_place_count in filenames:
-            found[role].append(
-                Attachment(
-                    role=role,
-                    filename=filename,
-                    sequence=sequences[0],
-                    modified_date=dates[0],
-                    declared_place_count=declared_place_count,
-                )
-            )
+        for attachment in _row_attachments(row):
+            found[attachment.role].append(attachment)
 
     for role in ("list", "areas"):
         if len(found[role]) != 1:
@@ -194,6 +176,39 @@ def parse_attachments(page_html: str) -> tuple[Attachment, Attachment]:
             f"areas={areas_attachment.declared_place_count}"
         )
     return list_attachment, areas_attachment
+
+
+def _row_attachments(row: _ParsedRow) -> list[Attachment]:
+    """첨부 표의 한 행에서 파일명 패턴이 맞는 첨부를 찾아 sequence·수정일과 묶는다."""
+    filenames = [
+        (role, cell, int(matched.group("count")))
+        for cell in row.cells
+        for role, pattern in _FILENAME_PATTERNS.items()
+        if (matched := pattern.fullmatch(cell)) is not None
+    ]
+    if not filenames:
+        return []
+    sequences = tuple(dict.fromkeys(row.sequences))
+    if len(sequences) != 1:
+        raise PoiSourceError(
+            "POI 첨부 행의 downloadFile sequence가 하나가 아닙니다: "
+            f"cells={row.cells}, sequences={sequences}"
+        )
+    dates = tuple(dict.fromkeys(_MODIFIED_DATE.findall(" ".join(row.cells))))
+    if len(dates) != 1:
+        raise PoiSourceError(
+            f"POI 첨부 행의 수정일을 하나로 판별할 수 없습니다: cells={row.cells}"
+        )
+    return [
+        Attachment(
+            role=role,
+            filename=filename,
+            sequence=sequences[0],
+            modified_date=dates[0],
+            declared_place_count=declared_place_count,
+        )
+        for role, filename, declared_place_count in filenames
+    ]
 
 
 def _require_zip_payload(payload: bytes, attachment: Attachment) -> None:
