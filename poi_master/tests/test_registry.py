@@ -10,6 +10,7 @@ from pathlib import Path
 import pyarrow as pa
 import pytest
 import shapely
+from core import poi_master as core_poi_master
 from core.poi_master import POI_MASTER_SCHEMA_VERSION
 from shapely.geometry import box
 
@@ -21,6 +22,11 @@ from registry import (
     build_registry,
 )
 from tests.conftest import real_source_assets
+
+
+def test_schema_matches_core_consumer_contract() -> None:
+    """게시 schema와 core가 읽을 때 강제하는 schema가 따로 정의돼 있어 어긋나지 않게 고정한다."""
+    assert POI_MASTER_SCHEMA.equals(core_poi_master._POI_MASTER_SCHEMA, check_metadata=True)
 
 
 def test_real_frozen_assets_build_same_121_code_registry() -> None:
