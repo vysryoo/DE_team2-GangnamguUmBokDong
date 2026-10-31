@@ -48,6 +48,11 @@ from orchestration.templates import (
 )
 
 
+def _render(template: str, logical_date: datetime) -> str:
+    dag_run = SimpleNamespace(logical_date=logical_date, start_date=None)
+    return jinja2.Environment().from_string(template).render(dag_run=dag_run, macros=macros)
+
+
 def test_repo_root_resolves_to_repository_root() -> None:
     """Task cwd 기준 저장소 루트를 실제 module directory와 결합한다."""
     assert (REPO_ROOT / "collector").is_dir()
@@ -434,26 +439,15 @@ def test_plan_and_source_tasks_share_same_five_minute_template(dag) -> None:
 def test_replay_template_renders_to_a_whole_hour_earlier() -> None:
     """Replay template가 5분 floor 뒤 정확히 whole hour만큼 이동한다."""
     kst = timezone(timedelta(hours=9))
-    context = {
-        "dag_run": type(
-            "R",
-            (),
-            {
-                "logical_date": datetime(2026, 8, 18, 19, 33, 12, tzinfo=kst),
-                "start_date": None,
-            },
-        )(),
-        "macros": macros,
-    }
-    environment = jinja2.Environment()
+    logical_date = datetime(2026, 8, 18, 19, 33, 12, tzinfo=kst)
 
-    base = environment.from_string(KST_WINDOW_START).render(context)
-    shifted = environment.from_string(kst_window_start_shifted(1)).render(context)
+    base = _render(KST_WINDOW_START, logical_date)
+    shifted = _render(kst_window_start_shifted(1), logical_date)
 
     assert datetime.fromisoformat(base) == datetime(2026, 8, 18, 19, 30, tzinfo=kst)
     assert datetime.fromisoformat(shifted) == datetime(2026, 8, 18, 18, 30, tzinfo=kst)
     assert datetime.fromisoformat(
-        environment.from_string(kst_window_start_shifted(2)).render(context)
+        _render(kst_window_start_shifted(2), logical_date)
     ) == datetime(2026, 8, 18, 17, 30, tzinfo=kst)
 
 
@@ -466,26 +460,11 @@ def test_replay_template_rejects_non_positive_hours() -> None:
 def test_daily_replay_templates_render_d_minus_six_boundaries() -> None:
     """D-6의 첫·마지막 API window boundary를 정확히 렌더링한다."""
     kst = timezone(timedelta(hours=9))
-    context = {
-        "dag_run": type(
-            "R",
-            (),
-            {
-                "logical_date": datetime(2026, 8, 19, 4, 30, tzinfo=kst),
-                "start_date": None,
-            },
-        )(),
-        "macros": macros,
-    }
-    environment = jinja2.Environment()
+    logical_date = datetime(2026, 8, 19, 4, 30, tzinfo=kst)
 
-    target_date = environment.from_string(kst_date_days_ago(6)).render(context)
-    first_end = environment.from_string(kst_day_hour_replay_days_ago(6, 0)).render(
-        context
-    )
-    last_end = environment.from_string(kst_day_hour_replay_days_ago(6, 23)).render(
-        context
-    )
+    target_date = _render(kst_date_days_ago(6), logical_date)
+    first_end = _render(kst_day_hour_replay_days_ago(6, 0), logical_date)
+    last_end = _render(kst_day_hour_replay_days_ago(6, 23), logical_date)
 
     assert target_date == "2026-08-13"
     assert datetime.fromisoformat(first_end) == datetime(2026, 8, 13, 0, 55, tzinfo=kst)
@@ -521,50 +500,17 @@ def test_window_stats_task_adds_hour_flag_when_given(dag) -> None:
     assert "--window-hour" in task.bash_command
 
 
-def test_hours_ago_templates_render_one_hour_earlier() -> None:
-    """kst_hours_ago_date/hour가 기준 시각에서 정확히 N시간 전 날짜·시를 렌더링한다."""
+@pytest.mark.parametrize(
+    "logical_hour,expected_date,expected_hour",
+    [(8, "2026-08-27", "07"), (0, "2026-08-26", "23")],
+)
+def test_hours_ago_templates_render_one_hour_earlier(logical_hour, expected_date, expected_hour) -> None:
+    """kst_hours_ago_date/hour가 정확히 1시간 전 날짜·시를 렌더링하고 자정에는 전날로 넘어간다."""
     kst = timezone(timedelta(hours=9))
-    context = {
-        "dag_run": type(
-            "R",
-            (),
-            {
-                "logical_date": datetime(2026, 8, 27, 8, 0, 0, tzinfo=kst),
-                "start_date": None,
-            },
-        )(),
-        "macros": macros,
-    }
-    environment = jinja2.Environment()
+    logical_date = datetime(2026, 8, 27, logical_hour, 0, 0, tzinfo=kst)
 
-    date_rendered = environment.from_string(kst_hours_ago_date(1)).render(context)
-    hour_rendered = environment.from_string(kst_hours_ago_hour(1)).render(context)
-
-    assert date_rendered == "2026-08-27"
-    assert hour_rendered == "07"
-
-
-def test_hours_ago_templates_cross_day_boundary() -> None:
-    """자정 직후 기준 시각이면 전날 23시로 넘어간다."""
-    kst = timezone(timedelta(hours=9))
-    context = {
-        "dag_run": type(
-            "R",
-            (),
-            {
-                "logical_date": datetime(2026, 8, 27, 0, 0, 0, tzinfo=kst),
-                "start_date": None,
-            },
-        )(),
-        "macros": macros,
-    }
-    environment = jinja2.Environment()
-
-    date_rendered = environment.from_string(kst_hours_ago_date(1)).render(context)
-    hour_rendered = environment.from_string(kst_hours_ago_hour(1)).render(context)
-
-    assert date_rendered == "2026-08-26"
-    assert hour_rendered == "23"
+    assert _render(kst_hours_ago_date(1), logical_date) == expected_date
+    assert _render(kst_hours_ago_hour(1), logical_date) == expected_hour
 
 
 def test_hours_ago_templates_reject_non_positive_hours() -> None:
