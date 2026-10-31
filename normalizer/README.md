@@ -22,7 +22,7 @@
 |---|---|
 | `main.py` | CLI 진입점, 보정 대상 시각 결정(현재 + `FCST_n_TIME`), 시간대(`TT`) 필터링 및 파이프라인 실행 |
 | `grid.py` | 국가지점번호 `CELL_ID`를 EPSG:5179 좌표로 변환하고 250m 정사각 격자 폴리곤 생성 |
-| `poi.py` | 실행에 고정된 S3 POI Master 로딩·검증, 최초 activation 전 repository Shapefile fallback, 메모리 캐싱 |
+| `poi.py` | 실행에 고정된 S3 POI Master 로딩, 최초 activation 전 repository Shapefile fallback, 메모리 캐싱 |
 | `merge.py` | `STRtree` 공간 조인(지오메트리 기준 1회, 전 시각 재사용), 면적 가중 밀도 합성, 연령·성별 재분배(현재) / 총량 스케일(미래), 면적 내림차순 순차 갱신 |
 | `station_master.py` | 대여소 master에 생활인구 250m `CELL_ID`(`grid_id`, STRtree 공간 조인)와 기상청 5km 격자(`weather_nx`/`weather_ny`, `core.weather_grid`)를 보강 |
 | `storage.py` | S3 실버 읽기/쓰기 및 실행 메타데이터 Manifest JSON 저장 |
@@ -31,7 +31,7 @@
 
 ## 3. 공간 합성 알고리즘 및 산식
 
-### ① 공간 교차 탐색 (`find_overlaps`)
+### ① 공간 교차 탐색 (`find_overlap_areas`)
 - **1단계 (R-Tree)**: `STRtree` 공간 인덱스로 격자와 외접 사각형(Bounding Box)이 닿는 POI 후보군을 $O(\log N)$으로 고속 추출합니다.
 - **2단계 (정밀 교차)**: 후보 POI들에 대해서만 정밀 Polygon `intersection()`을 수행하여 실제 겹치는 면적($m^2$)을 계산합니다.
 

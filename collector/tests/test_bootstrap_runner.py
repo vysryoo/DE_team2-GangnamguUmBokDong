@@ -11,8 +11,9 @@ from compaction import archive_schema
 from config.schema import ColumnSpec, Policies, Quality, Schedule, SourceConfig
 from config.schema import Storage as StorageConfig
 from core.s3 import read_parquet
-from storage import read_archive_manifest, write_silver
+from storage import read_archive_manifest
 from core.kst import KST
+from core.testing import put_source_snapshot
 
 pytestmark = pytest.mark.usefixtures("s3_bucket")
 
@@ -149,8 +150,8 @@ class TestLoadDate:
 
     def test_flags_silver_overlap_but_still_writes(self):
         """compaction 구역을 침범해도 막지는 않는다 — 결과 요약에 남긴다."""
-        write_silver("t_source", datetime(2026, 6, 1, 9, 5, tzinfo=KST),
-                     pa.table({"BIKE_ID": ["SPB-9"], "RENT_DT": ["2026-06-01 09:05:00"]}))
+        put_source_snapshot("t_source", datetime(2026, 6, 1, 9, 5, tzinfo=KST),
+                            pa.table({"BIKE_ID": ["SPB-9"], "RENT_DT": ["2026-06-01 09:05:00"]}))
 
         result = load_date(_source_config(), _bootstrap_config(), DAY, _rows("2026-06-01 09:05:00"))
 

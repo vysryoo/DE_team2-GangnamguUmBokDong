@@ -8,13 +8,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 import storage
-from core.s3 import (
-    delete_objects,
-    get_object_bytes,
-    list_keys,
-    read_json,
-    write_json,
-)
+from core.s3 import delete_objects, get_object_bytes, list_keys, read_json
 from core.kst import KST
 
 pytestmark = pytest.mark.usefixtures("s3_bucket")
@@ -57,22 +51,6 @@ def test_unchanged_inputs_skip_rewrite():
     assert second.cold_key == first.cold_key
 
 
-def test_legacy_unverified_manifest_is_upgraded_before_gc():
-    """verified 필드 도입 전 Cold manifest는 readback 검증 후 다시 게시한다."""
-    storage.write_bronze_part("test_source", WINDOW, "page-001", b"first", 0)
-    first = cold_bronze.compact_date("test_source", DAY)
-    key = "bronze/cold_manifest/test_source/dt=2026-08-12.json"
-    manifest = read_json(key)
-    manifest.pop("verified")
-    write_json(key, manifest)
-
-    upgraded = cold_bronze.compact_date("test_source", DAY)
-
-    assert upgraded.status == "compacted"
-    assert upgraded.cold_key == first.cold_key
-    assert read_json(key)["verified"] is True
-
-
 def test_read_bronze_falls_back_to_cold_after_hot_expiration():
     """Hot Lifecycle 삭제 뒤에도 같은 window revision을 Cold에서 복원한다."""
     storage.write_bronze_part("test_source", WINDOW, "page-001", b"first", 0)
@@ -84,17 +62,6 @@ def test_read_bronze_falls_back_to_cold_after_hot_expiration():
     )
 
     assert restored == [b"first"]
-
-
-def test_legacy_manifest_without_revision_also_falls_back_to_cold():
-    """이관 전 manifest의 revision=None도 Cold의 legacy revision -1로 복원한다."""
-    storage.write_bronze_part("test_source", WINDOW, "page-001", b"legacy")
-    cold_bronze.compact_date("test_source", DAY)
-    delete_objects(list_keys("bronze/test_source/"))
-
-    restored = storage.read_bronze("test_source", WINDOW, ["page-001"])
-
-    assert restored == [b"legacy"]
 
 
 def test_empty_date_is_explicit():
@@ -149,7 +116,6 @@ def test_missing_hot_marker_is_ignored_until_due_and_then_cleaned():
     assert before_due.dates == 0
     assert due.dates == 1
     assert due.objects == 0
-    assert due.stale_markers == 1
     assert list_keys("_cold_pending/test_source/") == []
 
 

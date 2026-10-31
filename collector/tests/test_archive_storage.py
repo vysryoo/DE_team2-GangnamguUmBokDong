@@ -17,10 +17,9 @@ from storage import (
     read_archive_manifest,
     write_archive,
     write_archive_manifest,
-    write_silver,
 )
 from core.kst import KST
-from core.testing import TEST_BUCKET
+from core.testing import TEST_BUCKET, put_source_snapshot
 
 pytestmark = pytest.mark.usefixtures("s3_bucket")
 
@@ -77,30 +76,36 @@ class TestArchiveManifest:
         assert "_archive_manifest/test_source/dt=2026-08-12.json" in keys
 
 
+def _put_silver(day: int) -> str:
+    return put_source_snapshot(
+        "test_source", datetime(2026, 8, day, 14, 10, tzinfo=KST), _table()
+    ).silver_key
+
+
 class TestListSilverObjects:
     def test_returns_size_and_last_modified_not_just_keys(self):
-        write_silver("test_source", datetime(2026, 8, 12, 14, 10, tzinfo=KST), _table())
+        key = _put_silver(12)
 
         objs = list_silver_objects("test_source", DAY)
 
         assert len(objs) == 1
-        assert objs[0].key == "silver/test_source/dt=2026-08-12/hh=14/1410.parquet"
+        assert objs[0].key == key
         assert objs[0].size > 0
         assert objs[0].last_modified is not None
 
     def test_only_that_days_objects(self):
-        write_silver("test_source", datetime(2026, 8, 12, 14, 10, tzinfo=KST), _table())
-        write_silver("test_source", datetime(2026, 8, 13, 14, 10, tzinfo=KST), _table())
+        key = _put_silver(12)
+        _put_silver(13)
 
         objs = list_silver_objects("test_source", DAY)
 
-        assert [o.key for o in objs] == ["silver/test_source/dt=2026-08-12/hh=14/1410.parquet"]
+        assert [o.key for o in objs] == [key]
 
     def test_empty_day_returns_empty_list(self):
         assert list_silver_objects("test_source", DAY) == []
 
     def test_ignores_non_parquet_objects(self):
-        write_silver("test_source", datetime(2026, 8, 12, 14, 10, tzinfo=KST), _table())
+        key = _put_silver(12)
         _s3().put_object(
             Bucket=TEST_BUCKET,
             Key="silver/test_source/dt=2026-08-12/hh=00/nowcast.json",
@@ -109,7 +114,7 @@ class TestListSilverObjects:
 
         objs = list_silver_objects("test_source", DAY)
 
-        assert [o.key for o in objs] == ["silver/test_source/dt=2026-08-12/hh=14/1410.parquet"]
+        assert [o.key for o in objs] == [key]
 
 
 class TestArchiveExists:

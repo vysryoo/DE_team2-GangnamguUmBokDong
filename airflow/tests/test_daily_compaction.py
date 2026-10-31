@@ -9,11 +9,15 @@ from orchestration.compaction_task import COLLECTOR_DIR, build_compaction_task
 
 
 class TestCompactionTask:
-    def test_runs_collector_compact_cli(self, dag):
+    def test_runs_collector_maintenance_cli(self, dag):
         task = build_compaction_task(dag, "bike_station_realtime")
 
+        assert task.task_id == "compact_bike_station_realtime"
         assert task.cwd == COLLECTOR_DIR
-        assert "uv run --frozen python compact.py --source bike_station_realtime" in task.bash_command
+        assert (
+            "uv run --frozen python maintenance.py compact --source bike_station_realtime"
+            in task.bash_command
+        )
 
     def test_passes_no_date_so_collector_derives_its_own_range(self, dag):
         """검사 범위는 Collector가 유도한다 — Airflow가 recovery 범위를 알 필요가 없다."""
@@ -114,8 +118,7 @@ class TestDag:
     def test_cold_bronze_runs_for_every_collector_source(self):
         for source in COLD_BRONZE_SOURCES:
             task = dag.get_task(f"cold_compact_{source}")
-            assert "cold_compact.py" in task.bash_command
-            assert "--recover-pending" in task.bash_command
+            assert "maintenance.py cold-compact" in task.bash_command
             assert "--delay-days 6" in task.bash_command
             expected_upstream = (
                 {"replay_bike_rental_history_23h"}
@@ -133,7 +136,7 @@ class TestDag:
         for source in COLD_BRONZE_SOURCES:
             task = dag.get_task(f"gc_silver_{source}")
             assert task.upstream_task_ids == {f"gc_hot_bronze_{source}"}
-            assert "silver_gc_cli.py" in task.bash_command
+            assert "maintenance.py gc-silver" in task.bash_command
             assert "macros.timedelta(days=36)" in task.bash_command
             assert ("--require-archive" in task.bash_command) is (
                 source in COMPACTION_SOURCES
@@ -143,7 +146,7 @@ class TestDag:
         for source in COLD_BRONZE_SOURCES:
             task = dag.get_task(f"gc_hot_bronze_{source}")
             assert task.upstream_task_ids == {f"cold_compact_{source}"}
-            assert "hot_bronze_gc_cli.py" in task.bash_command
+            assert "maintenance.py gc-hot-bronze" in task.bash_command
             assert "--retention-days 30" in task.bash_command
 
     def test_expected_task_count(self):

@@ -28,7 +28,6 @@ from core.source_snapshot_io import (
     read_available_source_snapshot,
     read_exact_source_snapshot,
     read_latest_source_snapshot,
-    read_partial_source_snapshot,
 )
 from core.sources import (
     BIKE_STATION_MASTER,
@@ -50,17 +49,14 @@ class PartitionNotFoundError(RuntimeError):
 def read_nowcast_grid(target_date: date) -> pa.Table:
     """해당 일자의 nowcaster 추정 격자(`nowcast.parquet`)를 읽는다.
 
-    **실측(`living_population_grid` 원본)을 쓰지 않는다.** 이 소스는 관측일이 수집일보다
-    4~5일 늦어(`docs/collector/source-config-audit.md` 5-20) `dt=오늘` 파티션 안의 값이
-    실은 4~5일 전 것이다. 그래서 "오늘"과 "12시간 뒤"의 baseline은 nowcaster가 만든
-    추정치(D-3~D+3)만이 제공할 수 있다. 스키마는 실측과 호환된다
-    (`H_DNG_CD`/`CELL_ID`/`TT`/`SPOP`/연령 28개 + `is_estimated`/`estimation_method`).
+    `living_population_grid` 실측은 수집일보다 4~5일 늦게 관측되므로 오늘과 미래 시각의
+    baseline은 nowcaster 추정치(D-3~D+3)만 제공할 수 있다.
 
-    args:
-        target_date: 대상 일자(미래일 수 있다 — nowcaster가 D+3까지 만든다)
-    returns:
+    Args:
+        target_date: 대상 일자. nowcaster가 D+3까지 만들므로 미래일 수 있음
+    Returns:
         읽어온 PyArrow Table
-    raises:
+    Raises:
         PartitionNotFoundError: 해당 일자의 추정치 파일이 없을 때
     """
     key = layout.nowcast_key(target_date)
@@ -71,18 +67,16 @@ def read_nowcast_grid(target_date: date) -> pa.Table:
 
 
 def read_latest_nowcast_grid(target_date: date) -> tuple[date, pa.Table]:
-    """target_date 이전 최신 nowcast를 정적 격자 목록 용도로 읽는다.
+    """target_date 이전 최신 nowcast를 정적 CELL_ID 목록 용도로 읽는다.
 
-    이 함수는 현재 시각의 인구값을 요구하는 실시간 normalizer가 아니라, CELL_ID
-    geometry 목록만 쓰는 station master 보강 전용이다. 따라서 같은 날 daily
-    nowcaster와의 스케줄 경쟁 때문에 실패시키지 않고 미래 파일은 제외한 최신 성공
-    snapshot을 사용해도 시간 정합성을 해치지 않는다.
+    station master 보강은 인구값이 아니라 CELL_ID 목록만 쓰므로, 같은 날 nowcaster와의
+    스케줄 경합으로 실패시키지 않고 미래가 아닌 최신 성공본을 사용한다.
 
-    args:
+    Args:
         target_date: 이 날짜보다 미래인 snapshot은 선택하지 않는 상한
-    returns:
+    Returns:
         실제 선택한 baseline 날짜와 PyArrow Table
-    raises:
+    Raises:
         PartitionNotFoundError: 상한 이전 nowcast가 하나도 없을 때
     """
     candidates: list[tuple[date, str]] = []
@@ -118,19 +112,6 @@ def read_realtime_snapshot(window_start: datetime) -> AvailableSourceSnapshot:
         raise PartitionNotFoundError(str(exc)) from exc
 
 
-def read_realtime_silver(window_start: datetime) -> pa.Table:
-    """5단계 정책에서 선택된 실시간 POI 인구 Parquet을 반환한다.
-
-    args:
-        window_start: 수집 기준 시각
-    returns:
-        읽어온 PyArrow Table
-    raises:
-        PartitionNotFoundError: 해당 시각의 파일이 없을 때
-    """
-    return read_realtime_snapshot(window_start).table
-
-
 def read_station_master_silver(window_start: datetime) -> pa.Table:
     """Collector가 같은 window에 쓴 대여소 master Silver를 읽는다."""
     return _read_exact_collector_snapshot(BIKE_STATION_MASTER, window_start)
@@ -151,22 +132,10 @@ def read_latest_bike_realtime_silver(window_start: datetime) -> pa.Table | None:
     return snapshot.table
 
 
-def _read_exact_collector_snapshot(
-    source_id: str,
-    window_start: datetime,
-    *,
-    allow_partial: bool = False,
-) -> pa.Table:
+def _read_exact_collector_snapshot(source_id: str, window_start: datetime) -> pa.Table:
     """Collector authority가 가리키는 exact-window Parquet을 읽는다."""
     try:
         snapshot = read_exact_source_snapshot(source_id, window_start)
-    except SourceSnapshotNotFoundError as exc:
-        if allow_partial:
-            try:
-                return read_partial_source_snapshot(source_id, window_start)
-            except SourceSnapshotReadError as partial_exc:
-                raise PartitionNotFoundError(str(partial_exc)) from partial_exc
-        raise PartitionNotFoundError(str(exc)) from exc
     except SourceSnapshotReadError as exc:
         raise PartitionNotFoundError(str(exc)) from exc
     if snapshot.table is None:

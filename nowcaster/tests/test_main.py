@@ -11,6 +11,8 @@ import pytest
 import storage
 from botocore.exceptions import ClientError
 from core.kst import KST
+from core.layout import nowcast_key
+from core.s3 import object_exists
 from core.testing import TEST_BUCKET
 
 
@@ -58,7 +60,7 @@ class TestRunEstimateArchivesD4Data:
         archived = storage.read_archive(biz_date)
         assert archived is not None
         assert archived.column("is_estimated").to_pylist() == [False]
-        assert storage.nowcast_exists(biz_date) is False
+        assert object_exists(nowcast_key(biz_date)) is False
         assert observed["logical"] == source_window_start
 
     def test_skips_actual_promotion_without_exact_window(self, monkeypatch):

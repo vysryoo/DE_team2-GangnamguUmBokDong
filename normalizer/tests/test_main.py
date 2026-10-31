@@ -224,7 +224,7 @@ class TestRealtimePoiContract:
         )
         monkeypatch.setattr(
             main,
-            "_baseline_cells",
+            "_load_baseline_cells",
             lambda *_args: pytest.fail("Master 불일치 뒤 baseline을 읽으면 안 됩니다."),
         )
         monkeypatch.setattr(
@@ -380,7 +380,8 @@ def test_run_rejects_empty_current_window_cells(monkeypatch):
         ),
     )
     monkeypatch.setattr(main.poi, "load_poi_master_areas", lambda _ref: ())
-    monkeypatch.setattr(main, "_baseline_cells", lambda _cache, _target: {})
+    monkeypatch.setattr(main.storage, "read_nowcast_grid", lambda _date: None)
+    monkeypatch.setattr(main, "_filter_grid_rows_for_hour", lambda _table, _hour: {})
 
     with pytest.raises(ValueError, match="현재 window"):
         main.run(window_start)

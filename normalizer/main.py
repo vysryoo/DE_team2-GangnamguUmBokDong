@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+from collections import Counter
 from collections.abc import Callable
 from datetime import date, datetime, timedelta, tzinfo
 
@@ -58,62 +59,45 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _parse_hour(raw: object) -> int:
+    """허용된 TT 표현("0 ", "09", 9 등)을 0~23 정수로 바꾸고 잘못된 값은 실패시킨다."""
+    text = raw.strip() if isinstance(raw, str) else None
+    if text is not None and text.isascii() and text.isdigit() and len(text) <= 2:
+        hour = int(text)
+    elif type(raw) is int:
+        hour = raw
+    else:
+        hour = None
+    if hour is None or not 0 <= hour <= 23:
+        raise ValueError(
+            f"living_population_grid TT가 잘못됐습니다: TT={raw!r} (공백 제거 후 0..23 정수 필수)"
+        )
+    return hour
+
+
+def _required_text(raw: object, field: str, *, ascii_digits: bool = False) -> str:
+    """필수 식별자를 trim하고 빈 값·숫자가 아닌 행정동 코드를 실패시킨다."""
+    text = "" if raw is None else str(raw).strip()
+    if not text or (ascii_digits and not (text.isascii() and text.isdigit())):
+        raise ValueError(f"living_population_grid {field}가 잘못됐습니다: {field}={raw!r}")
+    return text
+
+
 def _filter_grid_rows_for_hour(grid_table: pa.Table, hour: int) -> dict[str, merge.GridCell]:
     """해당 시간대(TT)의 행을 CELL별로 합산해 GridCell 맵으로 변환한다.
 
-    nowcaster 입력의 ``TT``는 과거 원천에 따라 ``"0 "``처럼 뒤 공백이 붙거나
-    ``"9"``/``"09"``/정수 ``9``처럼 표현이 다를 수 있다. 표현만 정규화하고
-    0~23 정수 계약은 모든 행에 엄격히 적용한다. 같은 CELL·시간에 여러
-    ``H_DNG_CD`` component가 있으면 training의 인구 집계와 같은 의미가 되도록
-    SPOP과 28개 age를 합산한다.
+    같은 CELL·시간에 여러 `H_DNG_CD` component가 있으면 training의 인구 집계와 같은
+    의미가 되도록 SPOP과 28개 age를 합산한다. TT 검증은 대상 시각이 아닌 행에도 적용한다.
 
-    args:
+    Args:
         grid_table: 24시간 생활인구 격자 테이블
         hour: 대상 시각 (0~23)
-    returns:
+    Returns:
         CELL_ID를 키로 하는 GridCell 딕셔너리
+    Raises:
+        ValueError: TT·CELL_ID·H_DNG_CD 값이 계약을 어길 때
     """
-    def _parse_hour(raw: object) -> int:
-        """허용된 TT 표현을 정수 시각으로 바꾸고 잘못된 값은 실패시킨다."""
-        if isinstance(raw, bool):
-            parsed = None
-        elif isinstance(raw, int):
-            parsed = raw
-        elif isinstance(raw, str):
-            text = raw.strip()
-            is_ascii_integer = (
-                1 <= len(text) <= 2 and all("0" <= character <= "9" for character in text)
-            )
-            parsed = int(text) if is_ascii_integer else None
-        else:
-            parsed = None
-        if parsed is None or not 0 <= parsed <= 23:
-            raise ValueError(
-                "living_population_grid TT가 잘못됐습니다: "
-                f"TT={raw!r} (공백 제거 후 0..23 정수 필수)"
-            )
-        return parsed
-
-    def _required_text(raw: object, field: str, *, ascii_digits: bool = False) -> str:
-        """필수 식별자를 trim하고 빈 값·잘못된 행정동 코드를 실패시킨다."""
-        text = "" if raw is None else str(raw).strip()
-        digits_valid = not ascii_digits or (
-            bool(text) and all("0" <= character <= "9" for character in text)
-        )
-        if not text or not digits_valid:
-            suffix = (
-                " (공백이 아닌 ASCII 숫자 문자열 필수)"
-                if ascii_digits
-                else " (공백이 아닌 문자열 필수)"
-            )
-            raise ValueError(
-                f"living_population_grid {field}가 잘못됐습니다: {field}={raw!r}{suffix}"
-            )
-        return text
-
-    # 하루치 테이블(25만 행대)을 매 target(최대 13개)마다 통째로 to_pylist하면 비용이
-    # 13배로 쌓인다. TT 컬럼만 먼저 pylist로 훑어 대상 시각 행의 인덱스를 추리고,
-    # 전체 컬럼 변환은 그 부분집합에만 적용한다 — TT 검증은 여전히 전 행에 적용된다.
+    # 하루치(25만 행대) 전체를 target마다 to_pylist하지 않도록 TT로 대상 행만 먼저 추림
     matching_indices = [
         index
         for index, raw in enumerate(grid_table.column("TT").to_pylist())
@@ -127,26 +111,22 @@ def _filter_grid_rows_for_hour(grid_table: pa.Table, hour: int) -> dict[str, mer
         cell_id = _required_text(row.get("CELL_ID"), "CELL_ID")
         h_dng_cd = _required_text(row.get("H_DNG_CD"), "H_DNG_CD", ascii_digits=True)
         spop_by_cell[cell_id] = spop_by_cell.get(cell_id, 0.0) + float(row["SPOP"] or 0.0)
-        if cell_id not in ages_by_cell:
-            ages_by_cell[cell_id] = {column: 0.0 for column in merge.AGE_COLUMNS}
-            h_dng_codes_by_cell[cell_id] = set()
+        ages = ages_by_cell.setdefault(cell_id, dict.fromkeys(merge.AGE_COLUMNS, 0.0))
         for column in merge.AGE_COLUMNS:
-            ages_by_cell[cell_id][column] += float(row.get(column) or 0.0)
-        h_dng_codes_by_cell[cell_id].add(h_dng_cd)
+            ages[column] += float(row.get(column) or 0.0)
+        h_dng_codes_by_cell.setdefault(cell_id, set()).add(h_dng_cd)
 
-    cells: dict[str, merge.GridCell] = {}
-    for cell_id in sorted(spop_by_cell):
-        # 출력 schema는 H_DNG_CD 한 값만 담는다. 단일 component면 원값을 보존하고,
-        # 여러 component를 합친 CELL은 정렬상 최소 코드를 deterministic 대표값으로 쓴다.
-        representative_h_dng_cd = min(h_dng_codes_by_cell[cell_id])
-        cells[cell_id] = merge.GridCell(
+    # 출력 schema는 H_DNG_CD 한 값만 담으므로 여러 component면 최소 코드를 대표값으로 씀
+    return {
+        cell_id: merge.GridCell(
             cell_id=cell_id,
-            h_dng_cd=representative_h_dng_cd,
+            h_dng_cd=min(h_dng_codes_by_cell[cell_id]),
             spop=spop_by_cell[cell_id],
             ages=ages_by_cell[cell_id],
             geometry=grid.cell_id_to_polygon(cell_id),
         )
-    return cells
+        for cell_id in sorted(spop_by_cell)
+    }
 
 
 def _build_poi_snapshots(
@@ -186,26 +166,19 @@ def _validate_realtime_poi_contract(
 ) -> frozenset[str]:
     """실시간 AREA_CD가 유효하고 선택된 POI Master의 부분집합인지 검증한다.
 
-    API의 부분 실패로 Master 일부 코드가 실시간 snapshot에 없는 것은 허용한다. 반대로
-    실시간 snapshot에만 있는 코드는 Collector와 Normalizer가 서로 다른 Master를 썼거나
-    입력 authority가 손상됐다는 뜻이므로 출력 전에 실패시킨다.
+    API 부분 실패로 Master 일부 코드가 빠지는 것은 허용한다. 실시간에만 있는 코드는
+    Collector와 Normalizer가 서로 다른 Master를 썼다는 뜻이라 출력 전에 실패시킨다.
 
-    args:
+    Args:
         realtime_table: Collector가 게시한 실시간 POI 인구 테이블
         poi_areas: 이번 실행에 고정된 POI Master 영역
-    returns:
+    Returns:
         검증된 실시간 AREA_CD 집합
-    raises:
-        RealtimePoiContractError: AREA_CD 컬럼·값·고유성 또는 Master 부분집합 계약이 깨질 때
+    Raises:
+        RealtimePoiContractError: AREA_CD 컬럼·형식·고유성 또는 Master 부분집합 계약이 깨질 때
     """
-    if type(realtime_table) is not pa.Table:
-        raise RealtimePoiContractError(
-            "population_realtime 입력은 pyarrow.Table이어야 합니다."
-        )
     if "AREA_CD" not in realtime_table.column_names:
-        raise RealtimePoiContractError(
-            "population_realtime 입력에 AREA_CD 컬럼이 없습니다."
-        )
+        raise RealtimePoiContractError("population_realtime 입력에 AREA_CD 컬럼이 없습니다.")
 
     raw_codes = realtime_table.column("AREA_CD").to_pylist()
     invalid_codes = [
@@ -218,18 +191,14 @@ def _validate_realtime_poi_contract(
             "population_realtime AREA_CD는 POI와 ASCII 숫자 3자리 형식이어야 합니다: "
             f"invalid={invalid_codes!r}"
         )
-    if len(raw_codes) != len(set(raw_codes)):
-        duplicates = sorted(
-            code for code in set(raw_codes) if raw_codes.count(code) > 1
-        )
+    duplicates = sorted(code for code, count in Counter(raw_codes).items() if count > 1)
+    if duplicates:
         raise RealtimePoiContractError(
-            "population_realtime AREA_CD에 중복 코드가 있습니다: "
-            f"duplicates={duplicates}"
+            f"population_realtime AREA_CD에 중복 코드가 있습니다: duplicates={duplicates}"
         )
 
     realtime_codes = frozenset(raw_codes)
-    master_codes = frozenset(area.area_cd for area in poi_areas)
-    unknown_codes = sorted(realtime_codes - master_codes)
+    unknown_codes = sorted(realtime_codes - {area.area_cd for area in poi_areas})
     if unknown_codes:
         raise RealtimePoiContractError(
             "population_realtime에 선택된 POI Master에 없는 AREA_CD가 있습니다: "
@@ -333,18 +302,45 @@ _OUTPUT_SCHEMA = pa.schema(
 )
 
 
-def _baseline_cells(
-    baseline_cache: dict[date, pa.Table], target: datetime
-) -> dict[str, merge.GridCell]:
-    """해당 시각의 baseline 격자(nowcaster 추정치)를 GridCell 맵으로 돌려준다.
+def _load_baseline_cells(
+    window_start: datetime, targets: list[datetime]
+) -> tuple[dict[datetime, dict[str, merge.GridCell]], list[str], list[str]]:
+    """현재와 미래 시각의 baseline 격자(nowcaster 추정치)를 시각별로 읽는다.
 
-    날짜별 테이블을 캐시한다 — 12시간 앞이 자정을 넘으면 두 날짜(오늘/내일)를 읽게 되고,
-    시각마다 다시 읽으면 같은 파일을 13번 내려받는다.
+    현재 시각의 baseline이 없으면 보정이 불가능하고 inference가 이 실행의 결과 없이
+    진행되므로 실패시킨다. 미래 시각만 없으면 그 시각을 건너뛴다.
+
+    Returns:
+        시각별 GridCell 맵, 건너뛴 시각, 읽은 baseline 날짜
+    Raises:
+        storage.PartitionNotFoundError: 현재 시각 날짜의 nowcast가 없을 때
+        ValueError: 현재 시각의 nowcast 행이 없을 때
     """
-    target_date = target.date()
-    if target_date not in baseline_cache:
-        baseline_cache[target_date] = storage.read_nowcast_grid(target_date)
-    return _filter_grid_rows_for_hour(baseline_cache[target_date], target.hour)
+    # 12시간 앞이 자정을 넘으면 두 날짜를 읽으므로 시각마다 같은 파일을 다시 받지 않게 캐시함
+    tables: dict[date, pa.Table] = {}
+    cells_by_target: dict[datetime, dict[str, merge.GridCell]] = {}
+    skipped: list[str] = []
+    for target in [window_start, *targets]:
+        is_current = target == window_start
+        try:
+            if target.date() not in tables:
+                tables[target.date()] = storage.read_nowcast_grid(target.date())
+        except storage.PartitionNotFoundError:
+            if is_current:
+                raise
+            skipped.append(target.isoformat())
+            continue
+        cells = _filter_grid_rows_for_hour(tables[target.date()], target.hour)
+        if not cells:
+            if is_current:
+                raise ValueError(
+                    "현재 window의 living_population_grid nowcast에 대상 시각 행이 없습니다: "
+                    f"target={target.isoformat()}"
+                )
+            skipped.append(target.isoformat())
+            continue
+        cells_by_target[target] = cells
+    return cells_by_target, skipped, sorted(day.isoformat() for day in tables)
 
 
 def _write_normalized(
@@ -377,54 +373,26 @@ def run(
     """현재 시각과 향후 12시간 예측 시각을 각각 보정해 그 시각의 Silver tick에 쓴다.
 
     현재 시각은 실측 POI 인구와 성비로 성·연령까지 재분배하고(`merge.merge_cell`), 미래
-    시각은 예측 인구로 총량만 합성한다(`merge.merge_cell_total_only`) — 예측값에는 성비가
-    없다. 시각과 무관한 교차 면적은 한 번만 계산해 모든 시각에 재사용한다.
+    시각은 예측 인구로 총량만 합성한다(`merge.merge_cell_total_only`). 예측값에는 성비가
+    없기 때문이다.
 
-    args:
+    Args:
         window_start: 수집 기준 시각
-    returns:
+        poi_master_ref: Airflow가 고정한 POI Master. 생략하면 static
+    Returns:
         종료 코드 (성공 시 0)
     """
     realtime_snapshot = storage.read_realtime_snapshot(window_start)
     realtime_table = realtime_snapshot.table
-    source_selection = realtime_snapshot.selection_metadata(
-        POPULATION_REALTIME,
-        window_start,
-        partial_policy=storage.PARTIAL_POLICY,
-    )
     selected_ref = poi_master_ref or PoiMasterRef(mode="static")
     poi_areas = poi.load_poi_master_areas(selected_ref)
     _validate_realtime_poi_contract(realtime_table, poi_areas)
 
     forecasts_by_code = _collect_forecasts(realtime_table, window_start)
     targets = _forecast_targets(forecasts_by_code)
+    cells_by_target, skipped, baseline_dates = _load_baseline_cells(window_start, targets)
 
-    baseline_cache: dict[date, pa.Table] = {}
-    cells_by_target: dict[datetime, dict[str, merge.GridCell]] = {}
-    skipped: list[str] = []
-    for target in [window_start, *targets]:
-        try:
-            cells = _baseline_cells(baseline_cache, target)
-        except storage.PartitionNotFoundError:
-            # 현재 시각의 baseline이 없으면 보정 자체가 불가능하므로 실패로 올린다.
-            # 미래 날짜만 없으면 그 시각을 건너뛰고 나머지를 쓴다.
-            if target == window_start:
-                raise
-            skipped.append(target.isoformat())
-            continue
-        if not cells:
-            # 현재 tick이 없는데 성공 처리하면 inference가 이 실행의 normalized
-            # population 없이 진행한다. 미래 target만 fallback 가능 대상으로 건너뛴다.
-            if target == window_start:
-                raise ValueError(
-                    "현재 window의 living_population_grid nowcast에 대상 시각 행이 없습니다: "
-                    f"target={target.isoformat()}"
-                )
-            skipped.append(target.isoformat())
-            continue
-        cells_by_target[target] = cells
-
-    # 교차 면적은 지오메트리만 보므로 시각과 무관하다 — 모든 시각의 셀 합집합으로 1회 계산한다.
+    # 교차 면적은 지오메트리만 보므로 모든 시각의 셀 합집합으로 한 번만 계산함
     union_cells: dict[str, merge.GridCell] = {}
     for cells in cells_by_target.values():
         for cell_id, cell in cells.items():
@@ -432,52 +400,50 @@ def run(
     overlap_areas = merge.find_overlap_areas(list(union_cells.values()), list(poi_areas))
 
     observed_snapshots = _build_poi_snapshots(poi_areas, realtime_table)
-    written: dict[str, str] = {}
-    stale_generation_skipped: list[str] = []
-    if window_start in cells_by_target:
-        output_key = _write_normalized(
-            window_start,
-            window_start,
-            cells_by_target[window_start],
-            overlap_areas,
+    merge_plan = {
+        window_start: (
             {snapshot.area_cd: snapshot for snapshot in observed_snapshots},
             merge.merge_cell,
         )
-        if output_key is None:
-            stale_generation_skipped.append(window_start.isoformat())
-        else:
-            written[window_start.isoformat()] = output_key
-
+    }
     for target in targets:
-        if target not in cells_by_target:
-            continue
+        if target in cells_by_target:
+            merge_plan[target] = (
+                _build_forecast_snapshots(poi_areas, forecasts_by_code, target),
+                merge.merge_cell_total_only,
+            )
+
+    written: dict[str, str] = {}
+    stale_generation_skipped: list[str] = []
+    for target, (snapshots_by_code, merge_cell) in merge_plan.items():
         output_key = _write_normalized(
             target,
             window_start,
             cells_by_target[target],
             overlap_areas,
-            _build_forecast_snapshots(poi_areas, forecasts_by_code, target),
-            merge.merge_cell_total_only,
+            snapshots_by_code,
+            merge_cell,
         )
         if output_key is None:
             stale_generation_skipped.append(target.isoformat())
         else:
             written[target.isoformat()] = output_key
 
+    is_partial = realtime_snapshot.status.value == "partial"
     storage.write_manifest(
         window_start,
         {
             "input_status": realtime_snapshot.status.value,
             "input_freshness": realtime_snapshot.freshness.value,
             "partial_policy": "repair",
-            "resolution": (
-                "repaired"
-                if realtime_snapshot.status.value == "partial"
-                else "observed"
-            ),
-            "source_selection": source_selection.as_dict(),
+            "resolution": "repaired" if is_partial else "observed",
+            "source_selection": realtime_snapshot.selection_metadata(
+                POPULATION_REALTIME,
+                window_start,
+                partial_policy=storage.PARTIAL_POLICY,
+            ).as_dict(),
             "source_observed_at": realtime_snapshot.logical_dttm.isoformat(),
-            "baseline_dates": sorted(d.isoformat() for d in baseline_cache),
+            "baseline_dates": baseline_dates,
             "cell_count": len(union_cells),
             "poi_matched_count": len(observed_snapshots),
             "poi_forecast_count": len(forecasts_by_code),

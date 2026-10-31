@@ -8,7 +8,7 @@ import silver_gc
 import storage
 from compaction import compact_date
 from core.s3 import get_object_bytes, read_json
-from tests.test_compaction_run import DAY, TODAY, _config, _publish_succeeded, _window
+from tests.test_compaction_run import DAY, _config, _publish_succeeded, _window
 
 pytestmark = pytest.mark.usefixtures("s3_bucket")
 
@@ -27,7 +27,7 @@ def test_deletes_only_non_authority_after_archive_and_cold_are_verified():
     config = _config()
     first = _publish_succeeded(5, [1])
     latest = _publish_succeeded(5, [2, 3])
-    assert compact_date(config, DAY, today=TODAY).status == "compacted"
+    assert compact_date(config, DAY).status == "compacted"
     _prepare_cold()
 
     result = silver_gc.collect_date(
@@ -37,12 +37,12 @@ def test_deletes_only_non_authority_after_archive_and_cold_are_verified():
     assert result.status == "completed"
     assert result.deleted == 1
     assert result.retained == 1
-    assert get_object_bytes(first.key) is None
-    assert get_object_bytes(latest.key) is not None
+    assert get_object_bytes(first.silver_key) is None
+    assert get_object_bytes(latest.silver_key) is not None
     manifest = read_json("_silver_gc_manifest/t_source/dt=2026-08-12.json")
     assert manifest["status"] == "completed"
-    assert manifest["deleted_keys"] == [first.key]
-    assert manifest["retained_authority_keys"] == [latest.key]
+    assert [item["key"] for item in manifest["deletion_candidates"]] == [first.silver_key]
+    assert manifest["retained_authority_keys"] == [latest.silver_key]
     assert manifest["retention_days"] == 30
 
 
@@ -51,15 +51,15 @@ def test_retains_non_authority_during_thirty_day_grace_period():
     config = _config()
     first = _publish_succeeded(5, [1])
     latest = _publish_succeeded(5, [2])
-    assert compact_date(config, DAY, today=TODAY).status == "compacted"
+    assert compact_date(config, DAY).status == "compacted"
     _prepare_cold()
 
     result = silver_gc.collect_date(config, DAY)
 
     assert result.status == "skipped"
     assert result.reason == "nothing_to_delete"
-    assert get_object_bytes(first.key) is not None
-    assert get_object_bytes(latest.key) is not None
+    assert get_object_bytes(first.silver_key) is not None
+    assert get_object_bytes(latest.silver_key) is not None
 
 
 def test_refuses_deletion_without_verified_cold_bronze():
@@ -67,21 +67,21 @@ def test_refuses_deletion_without_verified_cold_bronze():
     config = _config()
     first = _publish_succeeded(5, [1])
     latest = _publish_succeeded(5, [2])
-    assert compact_date(config, DAY, today=TODAY).status == "compacted"
+    assert compact_date(config, DAY).status == "compacted"
 
     result = silver_gc.collect_date(config, DAY)
 
     assert result.status == "skipped"
     assert result.reason == "cold_unverified"
-    assert get_object_bytes(first.key) is not None
-    assert get_object_bytes(latest.key) is not None
+    assert get_object_bytes(first.silver_key) is not None
+    assert get_object_bytes(latest.silver_key) is not None
 
 
 def test_refuses_deletion_when_archive_signature_is_stale():
     """Archive 뒤 새 correction이 생기면 재compaction 전까지 아무것도 삭제하지 않는다."""
     config = _config()
     first = _publish_succeeded(5, [1])
-    assert compact_date(config, DAY, today=TODAY).status == "compacted"
+    assert compact_date(config, DAY).status == "compacted"
     latest = _publish_succeeded(5, [2])
     _prepare_cold()
 
@@ -89,8 +89,8 @@ def test_refuses_deletion_when_archive_signature_is_stale():
 
     assert result.status == "skipped"
     assert result.reason == "archive_authority_stale"
-    assert get_object_bytes(first.key) is not None
-    assert get_object_bytes(latest.key) is not None
+    assert get_object_bytes(first.silver_key) is not None
+    assert get_object_bytes(latest.silver_key) is not None
 
 
 def test_deletes_non_authority_without_archive_when_cold_is_verified():
@@ -108,8 +108,8 @@ def test_deletes_non_authority_without_archive_when_cold_is_verified():
     )
 
     assert result.status == "completed"
-    assert get_object_bytes(first.key) is None
-    assert get_object_bytes(latest.key) is not None
+    assert get_object_bytes(first.silver_key) is None
+    assert get_object_bytes(latest.silver_key) is not None
     manifest = read_json("_silver_gc_manifest/t_source/dt=2026-08-12.json")
     assert manifest["archive_required"] is False
     assert manifest["archive_key"] is None
@@ -129,5 +129,5 @@ def test_archive_free_gc_still_requires_verified_cold():
     )
 
     assert result.reason == "cold_unverified"
-    assert get_object_bytes(first.key) is not None
-    assert get_object_bytes(latest.key) is not None
+    assert get_object_bytes(first.silver_key) is not None
+    assert get_object_bytes(latest.silver_key) is not None
