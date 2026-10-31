@@ -232,6 +232,26 @@ def create_emr_cluster(
         logger.info("[Mock EMR] 클러스터 '%s' 생성 (Mock: %s)", cluster_name, mock_cluster_id)
         return mock_cluster_id
 
+    _require_network_config()
+    core_count = core_instance_count or EMR_CORE_INSTANCE_COUNT
+    flow_name = cluster_name or f"ml-monthly-retrain-{datetime.now(UTC):%Y%m%d-%H%M%S}"
+    emr = _get_boto3_client("emr")
+    logger.info("[EMR] 클러스터 '%s' 생성 요청(core=%d)", flow_name, core_count)
+    cluster_id = emr.run_job_flow(
+        **_job_flow_request(flow_name, core_count, core_instance_type or EMR_CORE_INSTANCE_TYPE)
+    )["JobFlowId"]
+    logger.info("[EMR] 클러스터 생성됨: %s", cluster_id)
+
+    if _wait_for_cluster_waiting(emr, cluster_id, timeout_seconds):
+        return cluster_id
+    # 예외로 끝나면 cluster_id가 XCom에 남지 않아 teardown이 찾지 못하므로 직접 종료함
+    terminate_emr_cluster(cluster_id, mock_override=mock_override)
+    raise TimeoutError(
+        f"EMR 클러스터 '{cluster_id}'가 {timeout_seconds}초 내에 WAITING 상태가 되지 못했습니다."
+    )
+
+
+def _require_network_config() -> None:
     if not EMR_SUBNET_ID:
         raise RuntimeError(
             "AWS_EMR_SUBNET_ID가 비어 있습니다. terraform output -raw subnet_id 값을 "
@@ -243,28 +263,26 @@ def create_emr_cluster(
             "aws_security_group.emr_master/emr_core의 ID를 config/prod.env에 채우세요."
         )
 
-    core_count = core_instance_count or EMR_CORE_INSTANCE_COUNT
-    flow_name = cluster_name or f"ml-monthly-retrain-{datetime.now(UTC):%Y%m%d-%H%M%S}"
-    job_flow = {
-        "Name": flow_name,
+
+def _instance_group(role: str, instance_type: str, count: int) -> dict[str, Any]:
+    return {
+        "Name": role.capitalize(),
+        "Market": "ON_DEMAND",
+        "InstanceRole": role,
+        "InstanceType": instance_type,
+        "InstanceCount": count,
+    }
+
+
+def _job_flow_request(name: str, core_count: int, core_instance_type: str) -> dict[str, Any]:
+    request: dict[str, Any] = {
+        "Name": name,
         "ReleaseLabel": EMR_RELEASE_LABEL,
         "Applications": [{"Name": "Spark"}, {"Name": "Hadoop"}],
         "Instances": {
             "InstanceGroups": [
-                {
-                    "Name": "Master",
-                    "Market": "ON_DEMAND",
-                    "InstanceRole": "MASTER",
-                    "InstanceType": EMR_MASTER_INSTANCE_TYPE,
-                    "InstanceCount": 1,
-                },
-                {
-                    "Name": "Core",
-                    "Market": "ON_DEMAND",
-                    "InstanceRole": "CORE",
-                    "InstanceType": core_instance_type or EMR_CORE_INSTANCE_TYPE,
-                    "InstanceCount": core_count,
-                },
+                _instance_group("MASTER", EMR_MASTER_INSTANCE_TYPE, 1),
+                _instance_group("CORE", core_instance_type, core_count),
             ],
             "Ec2SubnetId": EMR_SUBNET_ID,
             "EmrManagedMasterSecurityGroup": EMR_MASTER_SG_ID,
@@ -279,7 +297,7 @@ def create_emr_cluster(
         "Tags": [{"Key": "for-use-with-amazon-emr-managed-policies", "Value": "true"}],
     }
     if EMR_BOOTSTRAP_SCRIPT_S3_URI:
-        job_flow["BootstrapActions"] = [
+        request["BootstrapActions"] = [
             {
                 "Name": "install-training-env",
                 "ScriptBootstrapAction": {
@@ -288,19 +306,17 @@ def create_emr_cluster(
                 },
             }
         ]
+    return request
 
-    emr = _get_boto3_client("emr")
-    logger.info("[EMR] 클러스터 '%s' 생성 요청(core=%d)", flow_name, core_count)
-    cluster_id = emr.run_job_flow(**job_flow)["JobFlowId"]
-    logger.info("[EMR] 클러스터 생성됨: %s", cluster_id)
 
+def _wait_for_cluster_waiting(emr: Any, cluster_id: str, timeout_seconds: int) -> bool:
     start_time = time.time()
     while time.time() - start_time < timeout_seconds:
         status = emr.describe_cluster(ClusterId=cluster_id)["Cluster"]["Status"]
         state = status["State"]
         logger.info("[EMR] 클러스터 '%s' 상태: %s", cluster_id, state)
         if state == "WAITING":
-            return cluster_id
+            return True
         if state in ("TERMINATED", "TERMINATED_WITH_ERRORS"):
             reason = status.get("StateChangeReason", {})
             raise RuntimeError(
@@ -308,12 +324,7 @@ def create_emr_cluster(
                 f"(code={reason.get('Code')}, message={reason.get('Message')})"
             )
         time.sleep(30)
-
-    # 예외로 끝나면 cluster_id가 XCom에 남지 않아 teardown이 찾지 못하므로 직접 종료함
-    terminate_emr_cluster(cluster_id, mock_override=mock_override)
-    raise TimeoutError(
-        f"EMR 클러스터 '{cluster_id}'가 {timeout_seconds}초 내에 WAITING 상태가 되지 못했습니다."
-    )
+    return False
 
 
 def submit_emr_step(
