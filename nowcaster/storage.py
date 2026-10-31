@@ -34,6 +34,7 @@ from core.source_snapshot_io import (
 from core.sources import LIVING_POPULATION_GRID
 
 _HISTORICAL_CACHE_PREFIX = f"derived/{LIVING_POPULATION_GRID}/historical_avg_cache"
+_CACHE_INDEX = ["H_DNG_CD", "CELL_ID", "TT"]
 
 
 def read_real_grid_silver(logical_dttm: datetime) -> pa.Table | None:
@@ -104,9 +105,9 @@ def read_historical_cache(
     manifest = read_json(_historical_cache_key(pattern, "dates.json"))
     included = manifest["dates"] if manifest else []
     if sum_df is not None:
-        sum_df = sum_df.set_index(["H_DNG_CD", "CELL_ID", "TT"])
+        sum_df = sum_df.set_index(_CACHE_INDEX)
     if count_df is not None:
-        count_df = count_df.set_index(["H_DNG_CD", "CELL_ID", "TT"])
+        count_df = count_df.set_index(_CACHE_INDEX)
     return sum_df, count_df, included
 
 
