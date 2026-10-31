@@ -1,26 +1,13 @@
 """서울 열린데이터광장 공용 페이지네이션 규약 어댑터.
 
-RESULT.CODE → 실패 범주:
+서울 API는 대개 HTTP 200으로 응답하고 성공 여부를 본문 `RESULT.CODE`에 담는다.
+`INFO-000`·`INFO-200`(데이터 없음)은 성공, `INFO-100`(인증키 오류)은 `FATAL`,
+`ERROR-5xx`는 `TRANSIENT`, 그 외는 `PERMANENT`로 본다.
 
-| 코드 | 범주 | 근거 |
-| --- | --- | --- |
-| `INFO-000` | 성공 | |
-| `INFO-200` (해당 데이터 없음) | 성공(빈 결과) | 정상 상황을 누락으로 세면 완결도가 왜곡된다 |
-| `INFO-100` (인증키 오류) | `FATAL` | 모든 조각이 같은 키를 쓰므로 재시도가 무의미 |
-| `ERROR-500` 계열 (서버 오류) | `TRANSIENT` | 라운드로 회복 가능 |
-| 그 외 요청 오류 | `PERMANENT` | 그 조각만 누락 확정 |
-
-pagination:
-
-| 모드 | 소스 | 방식 |
-| --- | --- | --- |
-| `total` (기본) | 대부분 | 첫 페이지의 `list_total_count`로 페이지 목록을 만든다 |
-| `probe_until_empty` | `bikeList` | `list_total_count`가 현재 페이지 행 수라 빈 페이지까지 순차 탐색 |
-| (citydata_ppltn) | 실시간 인구 | 페이지 대신 POI 코드를 하나씩 요청 |
-
-주의:
-- 인증키(`SEOUL_OPENAPI_KEY`)는 URL 경로에 실리므로 로그에서 `logging_setup`이 가린다.
-- 응답 필드는 전부 문자열이다. 캐스팅은 검증 엔진의 `types`가 맡는다.
+요청 방식은 세 가지다. 기본 `total`은 첫 페이지의 `list_total_count`로 페이지 목록을
+만들고, `probe_until_empty`(`bikeList`)는 `list_total_count`가 현재 페이지 행 수라 빈
+페이지까지 순차 탐색하며, `citydata_ppltn`(실시간 인구)은 POI 코드를 하나씩 요청한다.
+인증키는 URL 경로에 실리므로 `logging_setup`이 로그에서 가린다.
 """
 
 from __future__ import annotations
@@ -70,8 +57,39 @@ class _PageOutcome:
     payload: bytes | None = None
     error: FetchErrorKind | None = None
     total: int | None = None
-    row_count: int | None = None
+    row_count: int = 0
     terminal: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _Pages:
+    """서비스 하나의 페이지 요청 규칙. 고정 폭 페이지 키와 요청을 만든다."""
+
+    client: httpx.Client
+    url_for: Callable[[int, int], str]
+    wrapper_key: str
+    row_path: str
+    size: int
+
+    def key(self, start: int) -> str:
+        """clamp하지 않은 고정 폭 페이지 키를 만든다."""
+        return _page_key(start, start + self.size - 1)
+
+    def fetch(self, start: int, end: int) -> _PageOutcome:
+        """`total` 모드 페이지 하나를 받는다."""
+        return _fetch_page(
+            self.client, self.url_for(start, end), self.wrapper_key, self.row_path
+        )
+
+    def probe(self, start: int) -> _PageOutcome:
+        """`list_total_count`를 무시하고 고정 폭 페이지 하나를 받는다."""
+        return _fetch_page(
+            self.client,
+            self.url_for(start, start + self.size - 1),
+            self.wrapper_key,
+            self.row_path,
+            read_total=False,
+        )
 
 
 def _api_key() -> str:
@@ -124,11 +142,6 @@ def _page_rows(body: dict, wrapper_key: str, row_path: str) -> list | None:
 def _page_key(start: int, end: int) -> str:
     """페이지 인덱스 범위로 조각 키를 만든다."""
     return f"page-{start:05d}-{end:05d}"
-
-
-def _full_page_key(start: int, page_size: int) -> str:
-    """clamp하지 않은 고정 폭 페이지 키를 만든다."""
-    return _page_key(start, start + page_size - 1)
 
 
 def _flatten_forecast(row: dict) -> dict:
@@ -184,44 +197,17 @@ def _parse_total(value: object) -> int | None:
 
 
 def _fetch_page(
-    client: httpx.Client, url: str, wrapper_key: str, row_path: str
+    client: httpx.Client,
+    url: str,
+    wrapper_key: str,
+    row_path: str,
+    *,
+    read_total: bool = True,
 ) -> _PageOutcome:
-    """`total` 모드 페이지 하나를 받아 실패 범주까지 판정한다."""
-    result = _request_json(client, url)
-    if isinstance(result, FetchErrorKind):
-        return _PageOutcome(error=result)
-    content, body = result
+    """페이지 하나를 받아 실패 범주와 종료 여부를 판정한다.
 
-    # 서울 API는 보통 HTTP 200으로 응답하고 논리적 성공/실패를 본문 코드에 담는다.
-    code = _result_code(body, wrapper_key)
-    category = _classify(code)
-    if category is not None:
-        return _PageOutcome(error=category)
-
-    rows = _page_rows(body, wrapper_key, row_path)
-    terminal = code == "INFO-200" or rows == []
-    if rows is None and not terminal:
-        return _PageOutcome(error=FetchErrorKind.PERMANENT)
-    wrapper = _extract(body, wrapper_key)
-    try:
-        total = _parse_total(
-            wrapper.get("list_total_count") if isinstance(wrapper, dict) else None
-        )
-    except ValueError:
-        return _PageOutcome(error=FetchErrorKind.PERMANENT)
-    return _PageOutcome(
-        payload=content,
-        total=total,
-        row_count=len(rows) if rows is not None else 0,
-        terminal=terminal,
-    )
-
-
-def _fetch_probe_page(client: httpx.Client, url: str, wrapper_key: str) -> _PageOutcome:
-    """`list_total_count`를 무시하고 행 수와 종료 여부만 판정한다.
-
-    INFO-000인데 row가 list가 아니면 빈 끝으로 오인해 수집을 조용히 자를 수 있으므로
-    영구 조각 오류로 돌린다.
+    성공 코드인데 row가 list가 아니면 빈 끝으로 오인해 수집을 조용히 자를 수 있으므로
+    영구 조각 오류로 돌린다. probe는 `list_total_count`를 쓰지 않아 `read_total=False`다.
     """
     result = _request_json(client, url)
     if isinstance(result, FetchErrorKind):
@@ -232,14 +218,27 @@ def _fetch_probe_page(client: httpx.Client, url: str, wrapper_key: str) -> _Page
     category = _classify(code)
     if category is not None:
         return _PageOutcome(error=category)
-    if code == "INFO-200":
-        return _PageOutcome(payload=content, row_count=0, terminal=True)
 
-    wrapper = _extract(body, wrapper_key)
-    rows = wrapper.get("row") if isinstance(wrapper, dict) else None
-    if not isinstance(rows, list):
+    rows = _page_rows(body, wrapper_key, row_path)
+    terminal = code == "INFO-200" or rows == []
+    if rows is None and not terminal:
         return _PageOutcome(error=FetchErrorKind.PERMANENT)
-    return _PageOutcome(payload=content, row_count=len(rows), terminal=not rows)
+
+    total = None
+    if read_total:
+        wrapper = _extract(body, wrapper_key)
+        try:
+            total = _parse_total(
+                wrapper.get("list_total_count") if isinstance(wrapper, dict) else None
+            )
+        except ValueError:
+            return _PageOutcome(error=FetchErrorKind.PERMANENT)
+    return _PageOutcome(
+        payload=content,
+        total=total,
+        row_count=0 if terminal else len(rows),
+        terminal=terminal,
+    )
 
 
 def _fetch_poi(client: httpx.Client, url: str) -> _PageOutcome:
@@ -291,6 +290,113 @@ def _validate_natural_key(
         )
 
 
+def _fetch_total_pages(
+    pages: _Pages,
+    concurrency: int,
+    skip: frozenset[str],
+    expected_total: int | None,
+) -> Iterator[FetchResult]:
+    """`list_total_count`로 페이지 목록을 만들어 받는다."""
+    total = expected_total
+    page_start = 1
+
+    # total을 모르면 페이지 목록을 만들 수 없으므로 한 페이지만 순차로 받는다. 범위를
+    # 넘겨 요청하면 래퍼 없는 INFO-200이 온다(`_result_code` 참고).
+    if total is None:
+        while pages.key(page_start) in skip:
+            page_start += pages.size
+        key = pages.key(page_start)
+        outcome = pages.fetch(page_start, page_start + pages.size - 1)
+        if outcome.error is not None:
+            yield FetchResult(key=key, error=outcome.error)
+            return
+        total = outcome.total or 0
+        yield FetchResult(
+            key=key,
+            payload=outcome.payload,
+            expected_total=total if page_start == 1 else None,
+        )
+        page_start += pages.size
+
+    # 마지막 페이지를 total로 clamp하므로 조각 키가 total에 의존한다. 라운드 사이에
+    # total이 흔들리지 않게 pipeline이 expected_total을 되돌려준다.
+    ranges: list[tuple[str, int, int]] = []
+    start = page_start
+    while start <= total:
+        end = min(start + pages.size - 1, total)
+        key = _page_key(start, end)
+        if key not in skip:
+            ranges.append((key, start, end))
+        start = end + 1
+
+    for (key, start, _end), outcome in run_concurrent(
+        ranges, concurrency, lambda item: pages.fetch(item[1], item[2]), "seoul-page"
+    ):
+        yield FetchResult(
+            key=key,
+            payload=outcome.payload,
+            error=outcome.error,
+            expected_total=total if start == 1 else None,
+        )
+
+
+def _discover_probe_pages(
+    pages: _Pages, max_probe_pages: int, skip: frozenset[str]
+) -> Iterator[FetchResult]:
+    """끝을 모르는 상태에서 빈 종료 페이지까지 순차 탐색한다.
+
+    종료 응답도 완결성 증거로 Bronze에 보존하며 실제 expected_total을 함께 전달한다.
+    max_probe_pages개 뒤 한 번 더 호출해 빈 끝을 확인하고, 거기에도 데이터가 있으면
+    설정 상한이 낮은 것이므로 조용히 자르지 않고 누락으로 실패시킨다.
+    """
+    page_start = 1
+    received_rows = 0
+    skipped_data_page = False
+    # 직전 페이지를 이번 라운드에 받았으면 그 페이지의 마지막 row 위치.
+    previous_end: int | None = None
+    while True:
+        key = pages.key(page_start)
+        is_boundary_probe = (page_start - 1) // pages.size == max_probe_pages
+        if key in skip and not is_boundary_probe:
+            skipped_data_page = True
+            previous_end = None
+            page_start += pages.size
+            continue
+
+        outcome = pages.probe(page_start)
+        if outcome.error is not None:
+            # 실패 page 너머를 탐색하면 중간 공백을 둔 채 뒤의 종료 페이지를 완결 증거로
+            # 오인할 수 있다. 다음 라운드가 이 page부터 이어받게 멈춘다.
+            yield FetchResult(key=key, error=outcome.error)
+            return
+
+        if outcome.terminal:
+            if page_start == 1:
+                total = 0
+            elif not skipped_data_page:
+                total = received_rows
+            elif previous_end is not None:
+                total = previous_end
+            else:
+                total = _recover_probe_total(pages, page_start, skip)
+            if total is None or total < _minimum_total_covered_by_probe_parts(skip):
+                # 더 작아진 snapshot의 종료 페이지를 확정하면 fetched>expected인 혼합
+                # Bronze가 정상 완료될 수 있다. transient로 남겨 fail-closed한다.
+                yield FetchResult(key=key, error=FetchErrorKind.TRANSIENT)
+                return
+            yield FetchResult(key=key, payload=outcome.payload, expected_total=total)
+            return
+
+        if is_boundary_probe:
+            yield FetchResult(key=key, error=FetchErrorKind.PERMANENT)
+            return
+
+        yield FetchResult(key=key, payload=outcome.payload)
+        received_rows += outcome.row_count
+        previous_end = page_start - 1 + outcome.row_count
+        page_start += pages.size
+
+
 def _minimum_total_covered_by_probe_parts(parts: frozenset[str]) -> int:
     """이미 저장된 probe page들이 보장하는 최소 row 위치를 반환한다.
 
@@ -309,67 +415,50 @@ def _minimum_total_covered_by_probe_parts(parts: frozenset[str]) -> int:
 
 
 def _recover_probe_total(
-    *,
-    page_start: int,
-    page_size: int,
-    skip: frozenset[str],
-    client: httpx.Client,
-    page_url: Callable[[int, int], str],
-    wrapper_key: str,
+    pages: _Pages, page_start: int, skip: frozenset[str]
 ) -> int | None:
     """종료 페이지만 재시도한 경우 직전 성공 페이지를 다시 읽어 실제 행 수를 복구한다.
 
     데이터 payload는 다시 yield하지 않으므로 Bronze가 중복 저장되지 않는다.
     """
-    previous_start = page_start - page_size
+    previous_start = page_start - pages.size
     if previous_start < 1:
         return 0
-    if _full_page_key(previous_start, page_size) not in skip:
+    if pages.key(previous_start) not in skip:
         return None
 
-    outcome = _fetch_probe_page(
-        client, page_url(previous_start, previous_start + page_size - 1), wrapper_key
-    )
-    if outcome.error is not None or outcome.terminal or outcome.row_count is None:
+    outcome = pages.probe(previous_start)
+    if outcome.error is not None or outcome.terminal:
         return None
     return previous_start - 1 + outcome.row_count
 
 
 def _refetch_known_probe_pages(
-    *,
-    page_size: int,
-    max_probe_pages: int,
-    client: httpx.Client,
-    page_url: Callable[[int, int], str],
-    wrapper_key: str,
-    skip: frozenset[str],
-    expected_total: int,
+    pages: _Pages, max_probe_pages: int, skip: frozenset[str], expected_total: int
 ) -> Iterator[FetchResult]:
     """이전 라운드가 확정한 total로 고정 폭 페이지를 복원해 실패 페이지만 다시 받는다."""
-    page_count = (expected_total + page_size - 1) // page_size
+    page_count = (expected_total + pages.size - 1) // pages.size
     if page_count > max_probe_pages:
-        start = max_probe_pages * page_size + 1
         yield FetchResult(
-            key=_full_page_key(start, page_size), error=FetchErrorKind.PERMANENT
+            key=pages.key(max_probe_pages * pages.size + 1),
+            error=FetchErrorKind.PERMANENT,
         )
         return
 
-    pages = [
-        (start, _full_page_key(start, page_size))
-        for start in range(1, page_count * page_size + 1, page_size)
-    ]
-    for index, (start, key) in enumerate(pages):
+    starts = range(1, page_count * pages.size + 1, pages.size)
+    for index, start in enumerate(starts):
+        key = pages.key(start)
         if key in skip:
             continue
-        outcome = _fetch_probe_page(
-            client, page_url(start, start + page_size - 1), wrapper_key
-        )
+        outcome = pages.probe(start)
         if outcome.terminal:
             # 확정한 범위 안에서 데이터 페이지가 사라졌으면 호출 사이에 snapshot이 바뀐
             # 것이다. 남은 범위를 transient로 남겨 부분 snapshot을 완결로 오인하지 않는다.
-            for _, missing_key in pages[index:]:
-                if missing_key not in skip:
-                    yield FetchResult(key=missing_key, error=FetchErrorKind.TRANSIENT)
+            for missing_start in starts[index:]:
+                if pages.key(missing_start) not in skip:
+                    yield FetchResult(
+                        key=pages.key(missing_start), error=FetchErrorKind.TRANSIENT
+                    )
             return
         yield FetchResult(key=key, payload=outcome.payload, error=outcome.error)
         if outcome.error is FetchErrorKind.FATAL:
@@ -377,170 +466,52 @@ def _refetch_known_probe_pages(
 
     # 재시도 사이에 뒤로 늘어난 행을 놓치지 않게 기존 범위 다음 페이지부터 종료 페이지까지
     # 다시 탐색한다. 정적 snapshot이면 추가 호출 한 번으로 끝난다.
-    page_start = page_count * page_size + 1
-    last_data_start: int | None = None
-    last_data_rows: int | None = None
+    yield from _probe_until_terminal(
+        pages, page_count * pages.size + 1, max_probe_pages, expected_total
+    )
+
+
+def _probe_until_terminal(
+    pages: _Pages, page_start: int, max_probe_pages: int, known_total: int
+) -> Iterator[FetchResult]:
+    """`page_start`부터 종료 페이지까지 받는다. 새 데이터가 없으면 `known_total`을 쓴다."""
+    previous_end: int | None = None
     while True:
-        page_number = ((page_start - 1) // page_size) + 1
-        key = _full_page_key(page_start, page_size)
-        outcome = _fetch_probe_page(
-            client, page_url(page_start, page_start + page_size - 1), wrapper_key
-        )
+        key = pages.key(page_start)
+        outcome = pages.probe(page_start)
         if outcome.error is not None:
             yield FetchResult(key=key, error=outcome.error)
             return
         if outcome.terminal:
-            total = (
-                expected_total
-                if last_data_start is None or last_data_rows is None
-                else last_data_start - 1 + last_data_rows
-            )
+            total = known_total if previous_end is None else previous_end
             yield FetchResult(key=key, payload=outcome.payload, expected_total=total)
             return
-        if page_number > max_probe_pages:
+        if (page_start - 1) // pages.size >= max_probe_pages:
             yield FetchResult(key=key, error=FetchErrorKind.PERMANENT)
             return
         yield FetchResult(key=key, payload=outcome.payload)
-        last_data_start = page_start
-        last_data_rows = outcome.row_count
-        page_start += page_size
+        previous_end = page_start - 1 + outcome.row_count
+        page_start += pages.size
 
 
-def _discover_probe_pages(
-    *,
-    page_size: int,
-    max_probe_pages: int,
-    client: httpx.Client,
-    page_url: Callable[[int, int], str],
-    wrapper_key: str,
-    skip: frozenset[str],
+def _fetch_population_pois(
+    client: httpx.Client, params: dict, skip: frozenset[str], concurrency: int
 ) -> Iterator[FetchResult]:
-    """끝을 모르는 상태에서 빈 종료 페이지까지 순차 탐색한다.
+    """실시간 인구 POI를 하나씩 받는다.
 
-    종료 응답도 완결성 증거로 Bronze에 보존하며 실제 expected_total을 함께 전달한다.
+    POI 수는 요청 조각 수이고 행 수가 아니므로 expected_total을 싣지 않는다. 완결도는
+    조각 기준으로 계산된다.
     """
-    page_start = 1
-    last_data_start: int | None = None
-    last_data_rows: int | None = None
-    received_rows = 0
-    skipped_data_page = False
-    while True:
-        page_number = ((page_start - 1) // page_size) + 1
-        key = _full_page_key(page_start, page_size)
-
-        # max_probe_pages개 뒤 한 번 더 호출해 빈 끝을 확인한다. 거기에도 데이터가 있으면
-        # 설정 상한이 낮은 것이므로 조용히 자르지 않고 누락으로 실패시킨다.
-        is_boundary_probe = page_number == max_probe_pages + 1
-        if key in skip and not is_boundary_probe:
-            skipped_data_page = True
-            page_start += page_size
-            continue
-
-        outcome = _fetch_probe_page(
-            client, page_url(page_start, page_start + page_size - 1), wrapper_key
-        )
-        if outcome.error is not None:
-            # 실패 page 너머를 탐색하면 중간 공백을 둔 채 뒤의 종료 페이지를 완결 증거로
-            # 오인할 수 있다. 다음 라운드가 이 page부터 이어받게 멈춘다.
-            yield FetchResult(key=key, error=outcome.error)
-            return
-
-        if outcome.terminal:
-            if page_start == 1:
-                total = 0
-            elif not skipped_data_page:
-                total = received_rows
-            elif (
-                last_data_start == page_start - page_size and last_data_rows is not None
-            ):
-                total = last_data_start - 1 + last_data_rows
-            else:
-                total = _recover_probe_total(
-                    page_start=page_start,
-                    page_size=page_size,
-                    skip=skip,
-                    client=client,
-                    page_url=page_url,
-                    wrapper_key=wrapper_key,
-                )
-            if total is None or total < _minimum_total_covered_by_probe_parts(skip):
-                # 더 작아진 snapshot의 종료 페이지를 확정하면 fetched>expected인 혼합
-                # Bronze가 정상 완료될 수 있다. transient로 남겨 fail-closed한다.
-                yield FetchResult(key=key, error=FetchErrorKind.TRANSIENT)
-                return
-            yield FetchResult(key=key, payload=outcome.payload, expected_total=total)
-            return
-
-        if is_boundary_probe:
-            yield FetchResult(key=key, error=FetchErrorKind.PERMANENT)
-            return
-
-        yield FetchResult(key=key, payload=outcome.payload)
-        last_data_start = page_start
-        last_data_rows = outcome.row_count
-        received_rows += outcome.row_count or 0
-        page_start += page_size
-
-
-def _fetch_total_pages(
-    *,
-    page_size: int,
-    concurrency: int,
-    client: httpx.Client,
-    page_url: Callable[[int, int], str],
-    wrapper_key: str,
-    row_path: str,
-    skip: frozenset[str],
-    expected_total: int | None,
-) -> Iterator[FetchResult]:
-    """`list_total_count`로 페이지 목록을 만들어 받는다."""
-    total = expected_total
-    page_start = 1
-
-    # total을 모르면 페이지 목록을 만들 수 없으므로 한 페이지만 순차로 받는다. 범위를
-    # 넘겨 요청하면 래퍼 없는 INFO-200이 온다(`_result_code` 참고).
-    if total is None:
-        while _full_page_key(page_start, page_size) in skip:
-            page_start += page_size
-        key = _full_page_key(page_start, page_size)
-        outcome = _fetch_page(
-            client, page_url(page_start, page_start + page_size - 1), wrapper_key, row_path
-        )
-        if outcome.error is not None:
-            yield FetchResult(key=key, error=outcome.error)
-            return
-        total = outcome.total or 0
-        yield FetchResult(
-            key=key,
-            payload=outcome.payload,
-            expected_total=total if page_start == 1 else None,
-        )
-        page_start += page_size
-
-    # 마지막 페이지를 total로 clamp하므로 조각 키가 total에 의존한다. 라운드 사이에
-    # total이 흔들리지 않게 pipeline이 expected_total을 되돌려준다.
-    pages: list[tuple[str, int, int]] = []
-    start = page_start
-    while start <= total:
-        end = min(start + page_size - 1, total)
-        key = _page_key(start, end)
-        if key not in skip:
-            pages.append((key, start, end))
-        start = end + 1
-
-    def fetch_one_page(item: tuple[str, int, int]) -> _PageOutcome:
-        _, start, end = item
-        return _fetch_page(client, page_url(start, end), wrapper_key, row_path)
-
-    for (key, start, _end), outcome in run_concurrent(
-        pages, concurrency, fetch_one_page, "seoul-page"
+    service = params["service"]
+    pois = [
+        (f"poi-{code}", f"{_BASE_URL}/{_api_key()}/json/{service}/1/5/{code}/")
+        for code in _population_poi_codes(params)
+        if f"poi-{code}" not in skip
+    ]
+    for (key, _url), outcome in run_concurrent(
+        pois, concurrency, lambda item: _fetch_poi(client, item[1]), "seoul-poi"
     ):
-        yield FetchResult(
-            key=key,
-            payload=outcome.payload,
-            error=outcome.error,
-            expected_total=total if start == 1 else None,
-        )
+        yield FetchResult(key=key, payload=outcome.payload, error=outcome.error)
 
 
 def _population_poi_codes(params: dict) -> tuple[str, ...]:
@@ -560,18 +531,35 @@ def _population_poi_codes(params: dict) -> tuple[str, ...]:
     )
 
 
+def _root_location(params: dict) -> tuple[str, str]:
+    """설정에 따라 응답 wrapper 키와 그 아래 row 경로를 분리한다."""
+    root_key = params["root_key"]
+    if params.get("root_key_literal", False):
+        return root_key, ""
+    wrapper_key, _, row_path = root_key.partition(".")
+    return wrapper_key, row_path
+
+
+def _page_url_builder(params: dict, window) -> Callable[[int, int], str]:
+    """페이지 시작·끝 인덱스로 요청 URL을 만드는 함수를 반환한다."""
+    service = params["service"]
+    suffix = ""
+    if params.get("path_suffix"):
+        # 19:00 window가 window_start의 시를 쓰면 19시대를 요청해 18:55~19:00 데이터를
+        # 아무도 가져가지 않는다. 직전 순간(`window_last`)으로 18시대를 완결시킨다.
+        suffix = params["path_suffix"].format(
+            window_start=window.window_start,
+            window_end=window.window_end,
+            window_last=window.window_start - timedelta(seconds=1),
+        )
+    return lambda start, end: (
+        f"{_BASE_URL}/{_api_key()}/json/{service}/{start}/{end}{suffix}/"
+    )
+
+
 @adapter("seoul_openapi")
 class SeoulOpenApiAdapter:
     """서울 열린데이터광장 공용 페이지네이션 규약 어댑터."""
-
-    @staticmethod
-    def _root_location(params: dict) -> tuple[str, str]:
-        """설정에 따라 응답 wrapper 키와 그 아래 row 경로를 분리한다."""
-        root_key = params["root_key"]
-        if params.get("root_key_literal", False):
-            return root_key, ""
-        wrapper_key, _, row_path = root_key.partition(".")
-        return wrapper_key, row_path
 
     @staticmethod
     def planned_parts(config: SourceConfig, window) -> frozenset[str] | None:
@@ -591,71 +579,35 @@ class SeoulOpenApiAdapter:
         expected_total: int | None = None,
     ) -> Iterator[FetchResult]:
         params = config.adapter_params
-        service = params["service"]
         concurrency = int(params.get("concurrency", 1))
-        wrapper_key, row_path = SeoulOpenApiAdapter._root_location(params)
-
-        if service == "citydata_ppltn":
-            # POI 범위 크기는 요청 조각 수이고 행 수가 아니므로 expected_total을 싣지
-            # 않는다. 완결도는 조각 기준으로 계산된다.
-            pois = [
-                (f"poi-{code}", f"{_BASE_URL}/{_api_key()}/json/{service}/1/5/{code}/")
-                for code in _population_poi_codes(params)
-                if f"poi-{code}" not in skip
-            ]
-            for (key, _url), outcome in run_concurrent(
-                pois, concurrency, lambda item: _fetch_poi(client, item[1]), "seoul-poi"
-            ):
-                yield FetchResult(key=key, payload=outcome.payload, error=outcome.error)
+        if params["service"] == "citydata_ppltn":
+            yield from _fetch_population_pois(client, params, skip, concurrency)
             return
 
-        suffix = ""
-        if params.get("path_suffix"):
-            # 19:00 window가 window_start의 시를 쓰면 19시대를 요청해 18:55~19:00 데이터를
-            # 아무도 가져가지 않는다. 직전 순간(`window_last`)으로 18시대를 완결시킨다.
-            suffix = params["path_suffix"].format(
-                window_start=window.window_start,
-                window_end=window.window_end,
-                window_last=window.window_start - timedelta(seconds=1),
-            )
-
-        def page_url(start: int, end: int) -> str:
-            return f"{_BASE_URL}/{_api_key()}/json/{service}/{start}/{end}{suffix}/"
-
-        page_size = params["page_size"]
+        wrapper_key, row_path = _root_location(params)
+        pages = _Pages(
+            client=client,
+            url_for=_page_url_builder(params, window),
+            wrapper_key=wrapper_key,
+            row_path=row_path,
+            size=int(params["page_size"]),
+        )
         if params.get("pagination") != "probe_until_empty":
-            yield from _fetch_total_pages(
-                page_size=page_size,
-                concurrency=concurrency,
-                client=client,
-                page_url=page_url,
-                wrapper_key=wrapper_key,
-                row_path=row_path,
-                skip=skip,
-                expected_total=expected_total,
+            yield from _fetch_total_pages(pages, concurrency, skip, expected_total)
+        elif expected_total is None:
+            yield from _discover_probe_pages(
+                pages, int(params["max_probe_pages"]), skip
             )
-            return
-
-        probe_args = {
-            "page_size": int(page_size),
-            "max_probe_pages": int(params["max_probe_pages"]),
-            "client": client,
-            "page_url": page_url,
-            "wrapper_key": wrapper_key,
-            "skip": skip,
-        }
-        if expected_total is None:
-            yield from _discover_probe_pages(**probe_args)
         else:
             yield from _refetch_known_probe_pages(
-                **probe_args, expected_total=expected_total
+                pages, int(params["max_probe_pages"]), skip, expected_total
             )
 
     @staticmethod
     def normalize(chunks: list[bytes], config: SourceConfig) -> list[dict]:
         """조각들을 순서대로 이어붙여 행 목록으로 만든다."""
         params = config.adapter_params
-        wrapper_key, row_path = SeoulOpenApiAdapter._root_location(params)
+        wrapper_key, row_path = _root_location(params)
 
         rows: list[dict] = []
         for chunk in chunks:
