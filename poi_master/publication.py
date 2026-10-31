@@ -196,7 +196,17 @@ def refresh_poi_master(
 
     build = build_registry(assets)
     _validate_drop_guard(previous_count, build.table.num_rows, max_drop_ratio)
+    return RefreshResult(
+        status="published",
+        ref=_publish(build, assets, activated_at),
+        row_count=build.table.num_rows,
+        list_sha256=build.list_sha256,
+        areas_sha256=build.areas_sha256,
+    )
 
+
+def _publish(build: RegistryBuild, assets: SourceAssets, activated_at: datetime) -> PoiMasterRef:
+    """원천 raw, Silver Parquet, source manifest를 불변 객체로 쓴 뒤 마지막에 활성화한다."""
     table, list_key, areas_key = _raw_metadata_table(build)
     parquet_payload = _parquet_bytes(table)
     parquet_sha256 = hashlib.sha256(parquet_payload).hexdigest()
@@ -231,15 +241,8 @@ def refresh_poi_master(
         manifest.canonical_bytes,
         require_canonical_json=True,
     )
-    ref = activate_poi_master(
+    return activate_poi_master(
         manifest_uri=object_uri(manifest_key),
         manifest_sha256=manifest.sha256,
         activated_at=activated_at,
-    )
-    return RefreshResult(
-        status="published",
-        ref=ref,
-        row_count=table.num_rows,
-        list_sha256=build.list_sha256,
-        areas_sha256=build.areas_sha256,
     )

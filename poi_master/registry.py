@@ -116,8 +116,8 @@ def _row_cell(
     return raw_row[position] if position < len(raw_row) else None
 
 
-def _read_list_rows(payload: bytes) -> tuple[_ListRow, ...]:
-    """XLSX 첫 worksheet를 읽어 exact 필드의 고유 POI 목록으로 변환한다."""
+def _xlsx_rows(payload: bytes) -> list[tuple[object, ...]]:
+    """XLSX 첫 worksheet의 모든 행 값을 읽는다."""
     try:
         # 공식 파일의 data-validation extension은 기준정보 셀과 무관하고 read-only
         # openpyxl이 지원하지 않는다는 경고만 낸다. 다른 경고는 숨기지 않는다.
@@ -131,60 +131,56 @@ def _read_list_rows(payload: bytes) -> tuple[_ListRow, ...]:
             workbook = load_workbook(
                 io.BytesIO(payload), read_only=True, data_only=True, keep_links=False
             )
-            worksheet = workbook.worksheets[0]
-            all_rows = list(worksheet.iter_rows(values_only=True))
-        raw_header = all_rows[0]
-        rows = iter(all_rows[1:])
-    except (
-        OSError,
-        ValueError,
-        KeyError,
-        IndexError,
-        StopIteration,
-        zipfile.BadZipFile,
-    ) as exc:
+            try:
+                rows = list(workbook.worksheets[0].iter_rows(values_only=True))
+            finally:
+                workbook.close()
+    except (OSError, ValueError, KeyError, IndexError, zipfile.BadZipFile) as exc:
         raise PoiRegistryError("서울시 POI 목록 XLSX를 읽을 수 없습니다.") from exc
-    try:
-        header_values = list(raw_header)
-        while header_values and header_values[-1] is None:
-            header_values.pop()
-        header = tuple(_required_text(value, "XLSX header") for value in header_values)
-        if len(header) != len(set(header)):
-            raise PoiRegistryError("POI 목록 XLSX header에 중복 컬럼이 있습니다.")
-        missing = [column for column in _REQUIRED_XLSX_COLUMNS if column not in header]
-        if missing:
-            raise PoiRegistryError(
-                f"POI 목록 XLSX에 필수 컬럼이 없습니다: missing={missing}"
-            )
-        positions = {name: header.index(name) for name in _REQUIRED_XLSX_COLUMNS}
-        parsed: list[_ListRow] = []
-        for raw_row in rows:
-            if not any(value is not None and str(value).strip() for value in raw_row):
-                continue
+    if not rows:
+        raise PoiRegistryError("서울시 POI 목록 XLSX를 읽을 수 없습니다.")
+    return rows
 
-            area_cd = _required_text(
-                _row_cell(raw_row, positions, "AREA_CD"), "AREA_CD"
-            )
-            if _AREA_CODE.fullmatch(area_cd) is None:
-                raise PoiRegistryError(f"POI AREA_CD 형식이 잘못됐습니다: {area_cd!r}")
-            parsed.append(
-                _ListRow(
-                    area_cd=area_cd,
-                    area_nm=_required_text(
-                        _row_cell(raw_row, positions, "AREA_NM"), "AREA_NM"
-                    ),
-                    category=_required_text(
-                        _row_cell(raw_row, positions, "CATEGORY"), "CATEGORY"
-                    ),
-                    eng_nm=_required_text(
-                        _row_cell(raw_row, positions, "ENG_NM"), "ENG_NM"
-                    ),
-                    source_no=_source_number(_row_cell(raw_row, positions, "NO")),
-                )
-            )
-    finally:
-        workbook.close()
 
+def _header_positions(raw_header: tuple[object, ...]) -> dict[str, int]:
+    """Header를 검증하고 필수 컬럼의 위치를 반환한다. 끝의 빈 header 셀은 무시한다."""
+    header_values = list(raw_header)
+    while header_values and header_values[-1] is None:
+        header_values.pop()
+    header = tuple(_required_text(value, "XLSX header") for value in header_values)
+    if len(header) != len(set(header)):
+        raise PoiRegistryError("POI 목록 XLSX header에 중복 컬럼이 있습니다.")
+    missing = [column for column in _REQUIRED_XLSX_COLUMNS if column not in header]
+    if missing:
+        raise PoiRegistryError(
+            f"POI 목록 XLSX에 필수 컬럼이 없습니다: missing={missing}"
+        )
+    return {name: header.index(name) for name in _REQUIRED_XLSX_COLUMNS}
+
+
+def _list_row(raw_row: tuple[object, ...], positions: dict[str, int]) -> _ListRow:
+    """XLSX 데이터 행 하나를 정규화된 기준정보로 변환한다."""
+    area_cd = _required_text(_row_cell(raw_row, positions, "AREA_CD"), "AREA_CD")
+    if _AREA_CODE.fullmatch(area_cd) is None:
+        raise PoiRegistryError(f"POI AREA_CD 형식이 잘못됐습니다: {area_cd!r}")
+    return _ListRow(
+        area_cd=area_cd,
+        area_nm=_required_text(_row_cell(raw_row, positions, "AREA_NM"), "AREA_NM"),
+        category=_required_text(_row_cell(raw_row, positions, "CATEGORY"), "CATEGORY"),
+        eng_nm=_required_text(_row_cell(raw_row, positions, "ENG_NM"), "ENG_NM"),
+        source_no=_source_number(_row_cell(raw_row, positions, "NO")),
+    )
+
+
+def _read_list_rows(payload: bytes) -> tuple[_ListRow, ...]:
+    """XLSX 첫 worksheet를 읽어 exact 필드의 고유 POI 목록으로 변환한다."""
+    rows = _xlsx_rows(payload)
+    positions = _header_positions(rows[0])
+    parsed = [
+        _list_row(raw_row, positions)
+        for raw_row in rows[1:]
+        if any(value is not None and str(value).strip() for value in raw_row)
+    ]
     if not parsed:
         raise PoiRegistryError("POI 목록 XLSX에 데이터 행이 없습니다.")
     codes = [row.area_cd for row in parsed]
@@ -399,6 +395,34 @@ def _metadata(
     return {key.encode("utf-8"): value.encode("utf-8") for key, value in values.items()}
 
 
+def _master_row(list_row: _ListRow, shape_row: _ShapeRow) -> tuple[dict[str, object], bool]:
+    """같은 AREA_CD의 목록·영역 행을 교차 검증해 Master 행과 geometry 복구 여부를 만든다."""
+    area_cd = list_row.area_cd
+    if list_row.area_nm != shape_row.area_nm:
+        raise PoiRegistryError(
+            f"{area_cd}: 목록과 영역의 AREA_NM이 다릅니다: "
+            f"list={list_row.area_nm!r}, areas={shape_row.area_nm!r}"
+        )
+    if list_row.category != shape_row.category:
+        raise PoiRegistryError(
+            f"{area_cd}: 목록과 영역의 CATEGORY가 다릅니다: "
+            f"list={list_row.category!r}, areas={shape_row.category!r}"
+        )
+    projected, repaired = _validated_geometry(shape_row.geometry, area_cd)
+    row = {
+        "AREA_CD": area_cd,
+        "AREA_NM": list_row.area_nm,
+        "CATEGORY": list_row.category,
+        "ENG_NM": list_row.eng_nm,
+        "SOURCE_NO": list_row.source_no,
+        "GEOMETRY_WKB": shapely.to_wkb(
+            projected, byte_order=1, output_dimension=2, include_srid=False
+        ),
+        "AREA_M2": float(projected.area),
+    }
+    return row, repaired
+
+
 def build_registry(assets: SourceAssets) -> RegistryBuild:
     """두 공식 첨부를 교차 검증해 정렬된 EPSG:5179 POI Master를 만든다."""
     list_sha256 = hashlib.sha256(assets.list_bytes).hexdigest()
@@ -414,37 +438,11 @@ def build_registry(assets: SourceAssets) -> RegistryBuild:
             f"areas_only={sorted(shape_by_code.keys() - list_by_code.keys())}"
         )
 
-    output_rows: list[dict[str, object]] = []
-    repaired_count = 0
-    for area_cd in sorted(list_by_code):
-        list_row = list_by_code[area_cd]
-        shape_row = shape_by_code[area_cd]
-        if list_row.area_nm != shape_row.area_nm:
-            raise PoiRegistryError(
-                f"{area_cd}: 목록과 영역의 AREA_NM이 다릅니다: "
-                f"list={list_row.area_nm!r}, areas={shape_row.area_nm!r}"
-            )
-        if list_row.category != shape_row.category:
-            raise PoiRegistryError(
-                f"{area_cd}: 목록과 영역의 CATEGORY가 다릅니다: "
-                f"list={list_row.category!r}, areas={shape_row.category!r}"
-            )
-        projected, repaired = _validated_geometry(shape_row.geometry, area_cd)
-        repaired_count += int(repaired)
-        output_rows.append(
-            {
-                "AREA_CD": area_cd,
-                "AREA_NM": list_row.area_nm,
-                "CATEGORY": list_row.category,
-                "ENG_NM": list_row.eng_nm,
-                "SOURCE_NO": list_row.source_no,
-                "GEOMETRY_WKB": shapely.to_wkb(
-                    projected, byte_order=1, output_dimension=2, include_srid=False
-                ),
-                "AREA_M2": float(projected.area),
-            }
-        )
-    table = pa.Table.from_pylist(output_rows, schema=POI_MASTER_SCHEMA)
+    merged = [
+        _master_row(list_by_code[area_cd], shape_by_code[area_cd])
+        for area_cd in sorted(list_by_code)
+    ]
+    table = pa.Table.from_pylist([row for row, _ in merged], schema=POI_MASTER_SCHEMA)
     place_counts = {
         "list_filename": assets.list_attachment.declared_place_count,
         "areas_filename": assets.areas_attachment.declared_place_count,
@@ -457,10 +455,9 @@ def build_registry(assets: SourceAssets) -> RegistryBuild:
             "POI 첨부 선언과 실제 장소 수가 일치하지 않습니다: "
             f"counts={place_counts}"
         )
-    table = table.replace_schema_metadata(_metadata(assets, list_sha256, areas_sha256))
     return RegistryBuild(
-        table=table,
-        repaired_count=repaired_count,
+        table=table.replace_schema_metadata(_metadata(assets, list_sha256, areas_sha256)),
+        repaired_count=sum(repaired for _, repaired in merged),
         list_sha256=list_sha256,
         areas_sha256=areas_sha256,
     )
