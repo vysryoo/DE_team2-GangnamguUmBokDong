@@ -20,7 +20,9 @@
 
 | 파일 | 역할 |
 |---|---|
-| `main.py` | CLI 진입점, 보정 대상 시각 결정(현재 + `FCST_n_TIME`), 시간대(`TT`) 필터링 및 파이프라인 실행 |
+| `main.py` | CLI 진입점, 실시간 POI 코드 계약 검증, 시각별 보정 결과 쓰기 및 파이프라인 실행 |
+| `baseline.py` | 시각별 nowcaster 추정 격자 읽기와 시간대(`TT`) 필터링 |
+| `forecast.py` | 보정 대상 미래 시각 결정(`FCST_n_TIME`)과 시각별 예측 POI 스냅샷 생성 |
 | `grid.py` | 국가지점번호 `CELL_ID`를 EPSG:5179 좌표로 변환하고 250m 정사각 격자 폴리곤 생성 |
 | `poi.py` | 실행에 고정된 S3 POI Master 로딩, 최초 activation 전 repository Shapefile fallback, 메모리 캐싱 |
 | `merge.py` | `STRtree` 공간 조인(지오메트리 기준 1회, 전 시각 재사용), 면적 가중 밀도 합성, 연령·성별 재분배(현재) / 총량 스케일(미래), 면적 내림차순 순차 갱신 |
