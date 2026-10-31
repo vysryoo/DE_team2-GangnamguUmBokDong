@@ -104,23 +104,20 @@ def build_module_task(
         ValueError: venv 이름이 lowercase 영숫자와 하이픈 형식이 아닌 경우
     """
     project_environment = _module_project_environment(module_dir, uv_environment_name)
-    arguments: dict[str, Any] = {
-        "task_id": task_id,
-        "bash_command": (
+    optional_arguments = {"env": env, "output_processor": output_processor}
+    return BashOperator(
+        task_id=task_id,
+        bash_command=(
             f"env -u VIRTUAL_ENV UV_PROJECT_ENVIRONMENT={project_environment} {bash_command}"
         ),
-        "cwd": module_dir,
-        "retries": retries,
-        "retry_delay": retry_delay,
-        "execution_timeout": execution_timeout,
-        "trigger_rule": trigger_rule,
-        "append_env": True,
-        "on_success_callback": on_success_callback,
-        "on_failure_callback": on_failure_callback,
-        "dag": dag,
-    }
-    if env is not None:
-        arguments["env"] = env
-    if output_processor is not None:
-        arguments["output_processor"] = output_processor
-    return BashOperator(**arguments)
+        cwd=module_dir,
+        retries=retries,
+        retry_delay=retry_delay,
+        execution_timeout=execution_timeout,
+        trigger_rule=trigger_rule,
+        append_env=True,
+        on_success_callback=on_success_callback,
+        on_failure_callback=on_failure_callback,
+        dag=dag,
+        **{name: value for name, value in optional_arguments.items() if value is not None},
+    )
