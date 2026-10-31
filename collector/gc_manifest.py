@@ -6,10 +6,15 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 
 from core.kst import KST
 from core.s3 import delete_objects, list_keys, write_json
+
+
+def gc_manifest_key(target: str, source_id: str, day: date) -> str:
+    """GC 대상(`hot`·`silver`)별 날짜 GC manifest key를 반환한다."""
+    return f"_{target}_gc_manifest/{source_id}/dt={day.isoformat()}.json"
 
 
 def delete_with_manifest(

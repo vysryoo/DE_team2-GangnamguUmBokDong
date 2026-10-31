@@ -18,7 +18,7 @@ import cold_bronze
 import compaction
 import storage
 from config.schema import SourceConfig
-from gc_manifest import delete_with_manifest
+from gc_manifest import delete_with_manifest, gc_manifest_key
 
 NON_AUTHORITY_RETENTION_DAYS = 30
 
@@ -82,7 +82,7 @@ def collect_date(
         return SilverGcResult("skipped", 0, len(retained_keys), "nothing_to_delete")
 
     delete_with_manifest(
-        f"_silver_gc_manifest/{source_id}/dt={day.isoformat()}.json",
+        gc_manifest_key("silver", source_id, day),
         {
             "source_id": source_id,
             "date": day.isoformat(),

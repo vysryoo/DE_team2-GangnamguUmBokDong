@@ -16,7 +16,7 @@ from core.kst import KST
 from core.s3 import list_keys, list_objects, read_json
 
 import cold_bronze
-from gc_manifest import delete_with_manifest
+from gc_manifest import delete_with_manifest, gc_manifest_key
 
 _COLD_MANIFEST_DAY = re.compile(r"/dt=(\d{4}-\d{2}-\d{2})\.json\Z")
 
@@ -28,10 +28,6 @@ class HotGcResult:
     dates: int
     deleted: int
     retained: int
-
-
-def _gc_manifest_key(source_id: str, day: date) -> str:
-    return f"_hot_gc_manifest/{source_id}/dt={day.isoformat()}.json"
 
 
 def _read_cold_inventory(source_id: str, day: date) -> tuple[dict, set[str]]:
@@ -78,7 +74,7 @@ def collect_date(
     candidates = sorted(obj.key for obj in hot_objects if obj.last_modified <= cutoff)
     retained = len(hot_objects) - len(candidates)
     delete_with_manifest(
-        _gc_manifest_key(source_id, day),
+        gc_manifest_key("hot", source_id, day),
         {
             "source_id": source_id,
             "date": day.isoformat(),
@@ -99,7 +95,7 @@ def collect_date(
 
 def _uncollected_days(source_id: str, cutoff_day: date) -> Iterator[date]:
     """보존기한이 지난 Cold 날짜 중 현재 Cold로 GC를 끝내지 않은 날짜를 낸다."""
-    for key in list_keys(f"bronze/cold_manifest/{source_id}/"):
+    for key in list_keys(cold_bronze.manifest_prefix(source_id)):
         matched = _COLD_MANIFEST_DAY.search(key)
         if matched is None:
             raise RuntimeError(f"Cold manifest key 형식이 잘못됐다: {key}")
@@ -108,7 +104,7 @@ def _uncollected_days(source_id: str, cutoff_day: date) -> Iterator[date]:
             continue
         # Cold key는 content-addressed라 늦은 revision으로 Cold가 바뀌면 key도 바뀜
         cold = read_json(key) or {}
-        completed = read_json(_gc_manifest_key(source_id, day)) or {}
+        completed = read_json(gc_manifest_key("hot", source_id, day)) or {}
         if completed.get("status") == "completed" and completed.get("cold_key") == cold.get("cold_key"):
             continue
         yield day

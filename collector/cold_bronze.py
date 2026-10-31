@@ -22,6 +22,7 @@ from core.gold_publication.storage import (
     S3ImmutableObjectStore,
 )
 from core.s3 import (
+    S3Object,
     delete_objects,
     get_object_bytes,
     list_keys,
@@ -95,7 +96,27 @@ def manifest_key(source_id: str, day: date) -> str:
     Returns:
         `bronze/cold_manifest/{source_id}/dt=YYYY-MM-DD.json`
     """
-    return f"bronze/cold_manifest/{source_id}/dt={day.isoformat()}.json"
+    return f"{manifest_prefix(source_id)}dt={day.isoformat()}.json"
+
+
+def manifest_prefix(source_id: str) -> str:
+    """소스의 Cold manifest prefix를 반환한다."""
+    return f"bronze/cold_manifest/{source_id}/"
+
+
+def _cold_key(source_id: str, day: date, cold_sha256: str) -> str:
+    return f"bronze/cold/{source_id}/dt={day.isoformat()}/sha256={cold_sha256}.parquet"
+
+
+def _pending_prefix(source_id: str) -> str:
+    return f"_cold_pending/{source_id}/"
+
+
+def _pending_marker_key(source_id: str, day: date, revision_prefix: str) -> str:
+    return (
+        f"{_pending_prefix(source_id)}dt={day.isoformat()}/"
+        f"sha256={_sha256(revision_prefix.encode())}.json"
+    )
 
 
 def read_manifest(source_id: str, day: date) -> dict | None:
@@ -137,8 +158,7 @@ def write_pending_marker(source_id: str, day: date, hot_key: str) -> None:
     """
     revision_prefix = hot_key.rsplit("/part=", 1)[0]
     write_json(
-        f"_cold_pending/{source_id}/dt={day.isoformat()}/"
-        f"sha256={_sha256(revision_prefix.encode())}.json",
+        _pending_marker_key(source_id, day, revision_prefix),
         {
             "source_id": source_id,
             "date": day.isoformat(),
@@ -177,13 +197,25 @@ def _previous_rows(previous: dict | None) -> dict[str, dict]:
     return {row["original_key"]: row for row in table.to_pylist()}
 
 
+def _merge_hot_rows(
+    source_id: str, day: date, hot_objects: list[S3Object], rows_by_key: dict[str, dict]
+) -> None:
+    """Hot object를 Cold row로 만들어 기존 row에 합친다. 이미 담긴 key의 내용 변경은 거부한다."""
+    for obj in hot_objects:
+        row = _cold_row(source_id, day, obj)
+        previous_row = rows_by_key.get(obj.key)
+        if previous_row and previous_row["stored_sha256"] != row["stored_sha256"]:
+            raise RuntimeError(f"immutable Hot Bronze key 내용이 변경됐다: {obj.key}")
+        rows_by_key[obj.key] = row
+
+
 def _write_cold(source_id: str, day: date, rows: list[dict]) -> tuple[str, str]:
     """Cold row를 content-addressed Parquet으로 쓰고 key와 checksum을 반환한다."""
     buffer = io.BytesIO()
     pq.write_table(pa.Table.from_pylist(rows, schema=_SCHEMA), buffer, compression="zstd")
     cold_payload = buffer.getvalue()
     cold_sha256 = _sha256(cold_payload)
-    cold_key = f"bronze/cold/{source_id}/dt={day.isoformat()}/sha256={cold_sha256}.parquet"
+    cold_key = _cold_key(source_id, day, cold_sha256)
     S3ImmutableObjectStore().put_verified(object_uri(cold_key), cold_payload)
     return cold_key, cold_sha256
 
@@ -209,13 +241,7 @@ def compact_date(source_id: str, day: date) -> ColdBronzeResult:
     hot_objects = list_objects(hot_day_prefix(source_id, day))
     if not hot_objects and not rows_by_key:
         return ColdBronzeResult(status="empty", objects=0, cold_key=None)
-
-    for obj in hot_objects:
-        row = _cold_row(source_id, day, obj)
-        previous_row = rows_by_key.get(obj.key)
-        if previous_row and previous_row["stored_sha256"] != row["stored_sha256"]:
-            raise RuntimeError(f"immutable Hot Bronze key 내용이 변경됐다: {obj.key}")
-        rows_by_key[obj.key] = row
+    _merge_hot_rows(source_id, day, hot_objects, rows_by_key)
 
     # Python 문자열 정렬은 code point 기준이라 S3 LIST 순서(UTF-8 bytes)와 맞추려 encode함
     inventory_keys = sorted(rows_by_key, key=str.encode)
@@ -244,7 +270,7 @@ def _due_marker_keys(
 ) -> dict[date, list[str]]:
     """안정화 기간이 지난 pending marker key를 날짜별로 묶는다."""
     due: dict[date, list[str]] = {}
-    for key in list_keys(f"_cold_pending/{source_id}/"):
+    for key in list_keys(_pending_prefix(source_id)):
         matched = _PENDING_MARKER_DAY.search(key)
         if matched is None:
             raise RuntimeError(f"Cold pending marker key 형식이 잘못됐다: {key}")

@@ -7,6 +7,20 @@
     uv run --frozen python maintenance.py gc-silver --source X --date D [--require-archive]
 
 각 명령은 결과를 JSON 한 줄로 출력한다. 실패한 날짜가 있으면 non-zero로 끝난다.
+
+- `compact`(`compaction.py`): 날짜의 authority Silver를 Archive parquet 하나로 묶음.
+  authority는 window마다 최신 source snapshot이 가리키는 Silver이고, 그 목록으로 만든
+  `silver_signature`가 archive manifest와 같으면 다시 쓰지 않음
+- `cold-compact`(`cold_bronze.py`): Hot Bronze를 쓸 때 남긴 pending marker 중 기한이 된
+  날짜의 모든 Hot revision을 원본 bytes 그대로 Cold Bronze parquet 하나에 보관함.
+  Cold manifest가 그 날짜의 최신 Cold를 가리킴
+- `gc-hot-bronze`(`hot_bronze_gc.py`): Cold inventory에 들어 있고 보존기한이 지난 Hot
+  Bronze만 삭제함
+- `gc-silver`(`silver_gc.py`): Cold가 있고 Archive가 현재 authority와 같은 날짜에서 보존기한이
+  지난 non-authority Silver만 삭제함
+
+두 GC는 삭제 전후로 GC manifest(`gc_manifest.py`)를 남긴다. Airflow는 source마다
+`cold-compact` → `gc-hot-bronze` → `gc-silver` 순서로 실행한다.
 """
 
 from __future__ import annotations
