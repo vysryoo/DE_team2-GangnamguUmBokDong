@@ -15,15 +15,7 @@ from validation.types import Action, Issue, IssueKind, RowVerdict, RunContext
 
 
 def _parse_bool(value: Any) -> bool:
-    """문자열 "true"/"false"(대소문자 무관)만 bool로 인정한다.
-
-    args:
-        value: 캐스팅할 원시값. 이미 bool이면 그대로 반환한다.
-    returns:
-        캐스팅된 bool 값.
-    raises:
-        ValueError: value가 bool도 아니고 "true"/"false" 문자열도 아닐 때.
-    """
+    """문자열 "true"/"false"(대소문자 무관)만 bool로 인정한다."""
     if isinstance(value, bool):
         return value
     if isinstance(value, str) and value.strip().lower() in ("true", "false"):
@@ -44,14 +36,7 @@ _CASTERS: dict[str, Callable[[Any], Any]] = {
 
 
 def _try_cast(raw_value: Any, types: tuple[str, ...]) -> tuple[Any, bool]:
-    """`types` 선언 순서대로 캐스팅을 시도해 첫 성공을 채택한다.
-
-    args:
-        raw_value: 캐스팅할 원시값.
-        types: 시도할 타입 이름을 선언 순서대로 담은 튜플
-    returns:
-        (캐스팅된 값, 성공 여부). 전부 실패하면 (raw_value, False)를 반환한다.
-    """
+    """`types` 선언 순서대로 캐스팅해 첫 성공을 채택한다. 전부 실패하면 (원시값, False)."""
     for type_name in types:
         try:
             return _CASTERS[type_name](raw_value), True
@@ -138,41 +123,31 @@ def _process_columns(
     Raises:
         BatchValidationFailed: 컬럼 정책이 FAIL_BATCH를 반환했을 때.
     """
-    resolved: dict[str, Any] = {}
-    issues: list[Issue] = []
-    issue_entries: list[dict[str, Any]] = []
-    repaired = False
-    dropped_by_column = False
-
+    result = _RowResult(
+        resolved={}, issues=[], issue_entries=[], repaired=False, dropped_by_column=False
+    )
     for column, spec in config.columns.items():
-        raw_value = row.get(column)
-        value, issue = _judge_column(raw_value, column, spec)
+        value, issue = _judge_column(row.get(column), column, spec)
         if issue is None:
-            resolved[column] = value
+            result.resolved[column] = value
             continue
 
-        issues.append(issue)
+        result.issues.append(issue)
         counts = column_issue_counts.setdefault(
             column, {"missing": 0, "outlier": 0, "type_error": 0}
         )
         counts[issue.kind.value] += 1
 
-        policy_name = _resolve_policy_name(issue, config.policies)
-        new_value, action = get_policy(policy_name)(value, issue, row, ctx)
-        policy_action_counts[policy_name] = policy_action_counts.get(policy_name, 0) + 1
-
-        if action is Action.FAIL_BATCH:
-            raise BatchValidationFailed(
-                f"컬럼 '{column}'에서 정책 '{policy_name}'이 FAIL_BATCH를 반환했다"
-            )
-
+        new_value, action = _apply_column_policy(
+            value, issue, row, config, ctx, policy_action_counts
+        )
         if action is Action.DROP_ROW:
-            dropped_by_column = True
+            result.dropped_by_column = True
         if new_value != value:
-            repaired = True
+            result.repaired = True
 
-        resolved[column] = new_value
-        issue_entries.append(
+        result.resolved[column] = new_value
+        result.issue_entries.append(
             {
                 "column": column,
                 "kind": issue.kind.value,
@@ -180,14 +155,26 @@ def _process_columns(
                 "action": action.value,
             }
         )
+    return result
 
-    return _RowResult(
-        resolved=resolved,
-        issues=issues,
-        issue_entries=issue_entries,
-        repaired=repaired,
-        dropped_by_column=dropped_by_column,
-    )
+
+def _apply_column_policy(
+    value: Any,
+    issue: Issue,
+    row: dict,
+    config: SourceConfig,
+    ctx: RunContext,
+    policy_action_counts: dict[str, int],
+) -> tuple[Any, Action]:
+    """이슈에 맞는 컬럼 정책을 실행해 (교정값, action)을 반환하고 정책 호출 수를 센다."""
+    policy_name = _resolve_policy_name(issue, config.policies)
+    new_value, action = get_policy(policy_name)(value, issue, row, ctx)
+    policy_action_counts[policy_name] = policy_action_counts.get(policy_name, 0) + 1
+    if action is Action.FAIL_BATCH:
+        raise BatchValidationFailed(
+            f"컬럼 '{issue.column}'에서 정책 '{policy_name}'이 FAIL_BATCH를 반환했다"
+        )
+    return new_value, action
 
 
 def _resolve_row_params(policies: Policies) -> Any:
