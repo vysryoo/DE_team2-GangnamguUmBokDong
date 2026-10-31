@@ -17,7 +17,7 @@ import time
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Protocol, TypeVar
@@ -240,13 +240,11 @@ def fetch_with_rounds(
     Raises:
         ValueError: 저장 대상 성공 조각의 payload가 None일 때.
     """
-    collected: dict[str, bytes] = {}
-    permanent: dict[str, FetchErrorKind] = {}
-    transient: dict[str, FetchErrorKind] = {}
+    state = _RoundState(expected_total=expected_total)
     deadline = now_fn() + config.effective_fetch_budget().total_seconds()
 
     for round_index in range(MAX_ROUNDS):
-        if round_index > 0 and not transient:
+        if round_index > 0 and not state.transient:
             break
         if now_fn() >= deadline:
             break
@@ -255,45 +253,44 @@ def fetch_with_rounds(
             config,
             window,
             client=client,
-            skip=frozenset(skip) | collected.keys() | permanent.keys(),
-            expected_total=expected_total,
+            skip=frozenset(skip) | state.collected.keys() | state.permanent.keys(),
+            expected_total=state.expected_total,
         )
-        transient = {}
-        aborted, expected_total = _run_round(
-            results,
-            deadline=deadline,
-            now_fn=now_fn,
-            on_chunk=on_chunk,
-            collected=collected,
-            permanent=permanent,
-            transient=transient,
-            expected_total=expected_total,
-        )
-        if aborted:
+        state.transient = {}
+        if _run_round(results, state, deadline=deadline, now_fn=now_fn, on_chunk=on_chunk):
             break
-        if round_index < len(ROUND_WAITS_SECONDS) and transient:
+        if round_index < len(ROUND_WAITS_SECONDS) and state.transient:
             sleep_fn(ROUND_WAITS_SECONDS[round_index])
 
-    missing = {**permanent, **transient}
+    missing = {**state.permanent, **state.transient}
     if planned_parts is not None:
-        covered = frozenset(skip) | collected.keys() | missing.keys()
+        covered = frozenset(skip) | state.collected.keys() | missing.keys()
         for key in planned_parts - covered:
             missing[key] = FetchErrorKind.TRANSIENT
-    return FetchRoundResult(chunks=collected, missing=missing, expected_total=expected_total)
+    return FetchRoundResult(
+        chunks=state.collected, missing=missing, expected_total=state.expected_total
+    )
+
+
+@dataclass(slots=True)
+class _RoundState:
+    """라운드를 거치며 누적되는 조각 분류와 전체 행 수."""
+
+    expected_total: int | None
+    collected: dict[str, bytes] = field(default_factory=dict)
+    permanent: dict[str, FetchErrorKind] = field(default_factory=dict)
+    transient: dict[str, FetchErrorKind] = field(default_factory=dict)
 
 
 def _run_round(
     results: Iterator[FetchResult],
+    state: _RoundState,
     *,
     deadline: float,
     now_fn: Callable[[], float],
     on_chunk: Callable[[str, bytes], None] | None,
-    collected: dict[str, bytes],
-    permanent: dict[str, FetchErrorKind],
-    transient: dict[str, FetchErrorKind],
-    expected_total: int | None,
-) -> tuple[bool, int | None]:
-    """라운드 하나의 결과를 세 dict에 나눠 담고 (중단 여부, 전체 행 수)를 반환한다.
+) -> bool:
+    """라운드 하나의 결과를 `state`에 나눠 담고 중단 여부를 반환한다.
 
     budget이 끝났거나 FATAL을 만나면 중단으로 보고 남은 라운드를 돌지 않게 한다.
     """
@@ -301,25 +298,25 @@ def _run_round(
         try:
             result = next(results)
         except StopIteration:
-            return False, expected_total
+            return False
 
-        # probe 소스가 재시도 중 늘어난 total을 발견하면 갱신하되, 더 작은 값으로
-        # 줄여 기존 Bronze payload를 정상으로 오인하지 않는다.
+        # probe 소스가 재시도 중 늘어난 total을 발견하면 갱신한다. 더 작은 값으로는 줄이지
+        # 않아 기존 Bronze payload를 정상으로 오인하지 않는다.
         if result.expected_total is not None:
-            expected_total = max(expected_total or 0, result.expected_total)
+            state.expected_total = max(state.expected_total or 0, result.expected_total)
 
         if result.error is None:
             if not result.persist:
                 continue
             if result.payload is None:
                 raise ValueError("저장할 성공 조각의 payload는 None일 수 없습니다")
-            collected[result.key] = result.payload
+            state.collected[result.key] = result.payload
             if on_chunk is not None:
                 on_chunk(result.key, result.payload)
         elif result.error is FetchErrorKind.TRANSIENT:
-            transient[result.key] = result.error
+            state.transient[result.key] = result.error
         else:
-            permanent[result.key] = result.error
+            state.permanent[result.key] = result.error
             if result.error is FetchErrorKind.FATAL:
-                return True, expected_total
-    return True, expected_total
+                return True
+    return True
