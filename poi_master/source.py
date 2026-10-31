@@ -49,12 +49,7 @@ class Attachment:
         """역할별 파일명과 파일명이 선언한 장소 수가 정확히 같은지 검증한다."""
         pattern = {"list": _LIST_FILENAME, "areas": _AREAS_FILENAME}.get(self.role)
         matched = pattern.fullmatch(self.filename) if pattern is not None else None
-        if (
-            matched is None
-            or type(self.declared_place_count) is not int
-            or self.declared_place_count <= 0
-            or int(matched.group("count")) != self.declared_place_count
-        ):
+        if matched is None or int(matched.group("count")) != self.declared_place_count:
             raise PoiSourceError(
                 "POI 첨부 역할·파일명·선언 장소 수가 일치하지 않습니다: "
                 f"role={self.role!r}, filename={self.filename!r}, "
@@ -144,7 +139,7 @@ def parse_attachments(page_html: str) -> tuple[Attachment, Attachment]:
     사용하지 않는다. 장소 수가 늘어 파일명의 숫자가 바뀌어도 역할을 찾을 수 있게
     파일명 패턴과 같은 행의 ``downloadFile('<seq>')``를 결합한다.
     """
-    if not isinstance(page_html, str) or not page_html.strip():
+    if not page_html.strip():
         raise PoiSourceError("서울시 데이터셋 페이지 HTML이 비어 있습니다.")
     parser = _AttachmentTableParser()
     parser.feed(page_html)
@@ -203,11 +198,10 @@ def parse_attachments(page_html: str) -> tuple[Attachment, Attachment]:
 
 def _require_zip_payload(payload: bytes, attachment: Attachment) -> None:
     """XLSX와 ZIP이 공통으로 사용하는 ZIP container signature를 검증한다."""
-    if not isinstance(payload, bytes) or not payload.startswith(_ZIP_SIGNATURES):
-        prefix = payload[:32] if isinstance(payload, bytes) else b""
+    if not payload.startswith(_ZIP_SIGNATURES):
         raise PoiSourceError(
             f"서울시 {attachment.filename} 응답이 ZIP 계열 파일이 아닙니다: "
-            f"prefix={prefix!r}"
+            f"prefix={payload[:32]!r}"
         )
 
 
