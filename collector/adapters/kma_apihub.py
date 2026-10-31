@@ -184,32 +184,25 @@ def _fetch_grid_page(
 
     httpx 요청 로그 대신 endpoint·격자·페이지·소요시간을 담은 로그를 한 줄 남긴다.
     """
-    started_at = time.monotonic()
-    try:
-        response = client.get(url)
-    except httpx.RequestError as exc:
+
+    def log_request(outcome: str) -> None:
         logger.info(
-            "stage=kma_http_request endpoint=%s grid=%03dx%03d page=%d "
-            "outcome=request_error error_type=%s elapsed_ms=%.1f",
+            "stage=kma_http_request endpoint=%s grid=%03dx%03d page=%d %s elapsed_ms=%.1f",
             endpoint,
             nx,
             ny,
             page_no,
-            type(exc).__name__,
+            outcome,
             (time.monotonic() - started_at) * 1000,
         )
-        return FetchErrorKind.TRANSIENT
 
-    logger.info(
-        "stage=kma_http_request endpoint=%s grid=%03dx%03d page=%d "
-        "outcome=response status_code=%d elapsed_ms=%.1f",
-        endpoint,
-        nx,
-        ny,
-        page_no,
-        response.status_code,
-        (time.monotonic() - started_at) * 1000,
-    )
+    started_at = time.monotonic()
+    try:
+        response = client.get(url)
+    except httpx.RequestError as exc:
+        log_request(f"outcome=request_error error_type={type(exc).__name__}")
+        return FetchErrorKind.TRANSIENT
+    log_request(f"outcome=response status_code={response.status_code}")
 
     category = classify_http_status(response.status_code)
     if category is not None:
