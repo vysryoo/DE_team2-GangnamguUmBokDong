@@ -183,8 +183,7 @@ def read_available_source_snapshot(
     PARTIAL은 기본적으로 거부하며, ``REPAIR``를 명시한 consumer에만 반환한다.
     반환된 PARTIAL의 누락 보정은 source 의미를 아는 호출자가 책임진다.
     """
-    if type(lookback) is not timedelta or lookback <= timedelta(0):
-        raise ValueError("lookback은 양수 timedelta여야 합니다.")
+    _require_positive_lookback(lookback)
     if type(partial_policy) is not PartialConsumptionPolicy:
         raise TypeError("partial_policy는 PartialConsumptionPolicy여야 합니다.")
     logical = _aware_utc(logical_dttm)
@@ -220,10 +219,6 @@ def read_available_source_snapshot(
         lookback=lookback,
         columns=columns,
     )
-    if stale.table is None:  # read_latest는 non-empty만 반환하지만 계약을 방어한다.
-        raise SourceSnapshotNotFoundError(
-            f"{source_id} 사용 가능한 과거 성공 snapshot이 없습니다."
-        )
     return AvailableSourceSnapshot(
         SourceDataStatus.SUCCESS,
         SourceFreshness.STALE,
@@ -284,12 +279,7 @@ def read_exact_source_snapshot_manifest(
         raise SourceSnapshotReadError(
             f"고정한 source manifest key와 본문 identity가 다릅니다: {manifest_uri}"
         )
-    if manifest.status is SourceSnapshotStatus.EMPTY:
-        return SourceSnapshotData(manifest=manifest, table=None)
-    return SourceSnapshotData(
-        manifest=manifest,
-        table=_read_manifest_parquet(manifest, columns=columns),
-    )
+    return _snapshot_data(manifest, columns)
 
 
 def read_exact_source_snapshot(
@@ -307,44 +297,13 @@ def read_exact_source_snapshot(
             f"{source} exact source authority window가 없습니다: {format_utc_dttm(logical)}"
         )
 
-    revisions: list[int] = []
-    manifests: list[SourceSnapshotManifest] = []
-    for key in keys:
-        try:
-            revision = layout.parse_source_snapshot_manifest_key(key).revision_no
-        except ValueError as exc:
-            raise SourceSnapshotReadError(
-                f"source authority revision key가 잘못됐습니다: {key}"
-            ) from exc
-        payload = get_object_bytes(key)
-        if payload is None:
-            raise SourceSnapshotReadError(
-                f"LIST된 source authority를 읽을 수 없습니다: {key}"
-            )
-        manifest = parse_source_snapshot_manifest(payload)
-        if (
-            manifest.source_id != source
-            or manifest.logical_dttm.astimezone(UTC) != logical
-            or manifest.revision_no != revision
-            or key != _manifest_key(manifest)
-        ):
-            raise SourceSnapshotReadError(
-                f"source authority key와 manifest identity가 다릅니다: {key}"
-            )
-        revisions.append(revision)
-        manifests.append(manifest)
-
+    manifests = [_read_listed_manifest(key, source, logical) for key in keys]
+    revisions = [manifest.revision_no for manifest in manifests]
     if revisions != list(range(len(revisions))):
         raise SourceSnapshotReadError(
             f"source authority revision chain이 0부터 연속되지 않습니다: {revisions}"
         )
-    manifest = manifests[-1]
-    if manifest.status is SourceSnapshotStatus.EMPTY:
-        return SourceSnapshotData(manifest=manifest, table=None)
-    return SourceSnapshotData(
-        manifest=manifest,
-        table=_read_manifest_parquet(manifest, columns=columns),
-    )
+    return _snapshot_data(manifests[-1], columns)
 
 
 def read_latest_source_snapshot(
@@ -355,8 +314,7 @@ def read_latest_source_snapshot(
     columns: list[str] | None = None,
 ) -> SourceSnapshotData:
     """기준 시각 이전 bounded 범위의 최신 SUCCEEDED snapshot을 읽는다."""
-    if type(lookback) is not timedelta or lookback <= timedelta(0):
-        raise ValueError("lookback은 양수 timedelta여야 합니다.")
+    _require_positive_lookback(lookback)
     source = _validated_source_id(source_id)
     cutoff = _aware_utc(logical_dttm)
     lower = cutoff - lookback
@@ -402,6 +360,26 @@ def read_partial_source_snapshot(
         raise SourceSnapshotNotFoundError(
             f"{source} partial diagnostic manifest가 없습니다: {manifest_key}"
         )
+    silver_key, kept = _completed_partial_silver(payload, manifest_key, source, logical)
+    match = _SILVER_CHECKSUM.search(silver_key)
+    if match is None or silver_key != layout.silver_content_key(
+        source, logical, match.group(1)
+    ):
+        raise SourceSnapshotReadError(
+            f"partial Silver key가 logical window 또는 content address와 다릅니다: {silver_key}"
+        )
+    return _read_content_addressed_parquet(
+        silver_key,
+        checksum=match.group(1),
+        expected_rows=kept,
+        columns=columns,
+    )
+
+
+def _completed_partial_silver(
+    payload: bytes, manifest_key: str, source: str, logical: datetime
+) -> tuple[str, int]:
+    """Diagnostic manifest가 completed PARTIAL인지 확인하고 Silver key와 행 수를 반환한다."""
     try:
         document = json.loads(payload)
         manifest_logical = datetime.fromisoformat(document["window_start"])
@@ -430,19 +408,50 @@ def read_partial_source_snapshot(
         raise SourceSnapshotReadError(
             f"partial diagnostic manifest가 completed PARTIAL 계약을 위반했습니다: {manifest_key}"
         )
-    match = _SILVER_CHECKSUM.search(silver_key)
-    if match is None or silver_key != layout.silver_content_key(
-        source, logical, match.group(1)
+    return silver_key, kept
+
+
+def _read_listed_manifest(key: str, source: str, logical: datetime) -> SourceSnapshotManifest:
+    """LIST로 찾은 revision key의 manifest를 읽고 key와 본문 identity가 같은지 확인한다."""
+    try:
+        revision = layout.parse_source_snapshot_manifest_key(key).revision_no
+    except ValueError as exc:
+        raise SourceSnapshotReadError(
+            f"source authority revision key가 잘못됐습니다: {key}"
+        ) from exc
+    payload = get_object_bytes(key)
+    if payload is None:
+        raise SourceSnapshotReadError(
+            f"LIST된 source authority를 읽을 수 없습니다: {key}"
+        )
+    manifest = parse_source_snapshot_manifest(payload)
+    if (
+        manifest.source_id != source
+        or manifest.logical_dttm.astimezone(UTC) != logical
+        or manifest.revision_no != revision
+        or key != _manifest_key(manifest)
     ):
         raise SourceSnapshotReadError(
-            f"partial Silver key가 logical window 또는 content address와 다릅니다: {silver_key}"
+            f"source authority key와 manifest identity가 다릅니다: {key}"
         )
-    return _read_content_addressed_parquet(
-        silver_key,
-        checksum=match.group(1),
-        expected_rows=kept,
-        columns=columns,
+    return manifest
+
+
+def _snapshot_data(
+    manifest: SourceSnapshotManifest, columns: list[str] | None
+) -> SourceSnapshotData:
+    """EMPTY는 table 없이, SUCCEEDED는 검증한 Silver와 함께 반환한다."""
+    if manifest.status is SourceSnapshotStatus.EMPTY:
+        return SourceSnapshotData(manifest=manifest, table=None)
+    return SourceSnapshotData(
+        manifest=manifest,
+        table=_read_manifest_parquet(manifest, columns=columns),
     )
+
+
+def _require_positive_lookback(lookback: timedelta) -> None:
+    if type(lookback) is not timedelta or lookback <= timedelta(0):
+        raise ValueError("lookback은 양수 timedelta여야 합니다.")
 
 
 def _read_manifest_parquet(
