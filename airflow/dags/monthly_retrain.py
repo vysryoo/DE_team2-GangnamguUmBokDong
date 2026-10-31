@@ -6,7 +6,6 @@ import json
 import logging
 import subprocess
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from typing import Any
 
 import pendulum
@@ -35,7 +34,6 @@ from config.schedules import (
 from orchestration.aws_infra_task import (
     EMR_CORE_INSTANCE_TYPE,
     MOCK_OVERRIDE_FORCE_MOCK,
-    MODELS_PREFIX,
     TRAINING_RUNS_PREFIX,
     create_emr_cluster,
     read_s3_json,
@@ -47,6 +45,7 @@ from orchestration.emr_steps import (
     wait_for_yarn_nodes_step,
     yarn_python_module_step,
 )
+from orchestration.feature_mart import champion_profile_name, is_feature_mart_fresh
 
 logger = logging.getLogger(__name__)
 
@@ -225,68 +224,6 @@ def _cluster_id(ti: Any) -> str | None:
     return ti.xcom_pull(task_ids="create_cluster", key="cluster_id")
 
 
-def _champion_profile_name(model_name: str) -> str | None:
-    pointer = read_s3_json(f"{MODELS_PREFIX}/champion/{model_name}.json")
-    archive_prefix = (pointer or {}).get("archive_prefix")
-    if not archive_prefix:
-        return None
-    payload = read_s3_json(f"{archive_prefix}/{model_name}_profile.json")
-    return (payload or {}).get("profile_name")
-
-
-def _first_profile_value(profile_data: dict, keys: tuple[str, ...], default: int) -> int:
-    return next((profile_data[key] for key in keys if profile_data.get(key)), default)
-
-
-def _extract_profile_feature_params(profile_data: dict) -> tuple[str, int]:
-    # 프로필 JSON은 대문자 키와 소문자 키가 섞여 있음
-    window = _first_profile_value(
-        profile_data, ("ROLLING_WINDOW_MINUTES", "rolling_window_minutes"), 60
-    )
-    embargo = _first_profile_value(
-        profile_data, ("ROLLING_EMBARGO_MINUTES", "rolling_embargo_minutes"), 40
-    )
-    tick = _first_profile_value(
-        profile_data, ("ROLLING_TICK_MINUTES", "rolling_tick_minutes"), 20
-    )
-    anchor_tick = _first_profile_value(
-        profile_data,
-        (
-            "TRAIN_ANCHOR_TICK_MINUTES",
-            "train_anchor_tick_minutes",
-            "GRID_TICK_MINUTES",
-            "grid_tick_minutes",
-        ),
-        20,
-    )
-    return f"w{window}_e{embargo}_t{tick}", int(anchor_tick)
-
-
-def _is_feature_mart_fresh(profile: str, model_name: str, max_age_hours: float = 24.0) -> bool:
-    try:
-        profile_data = (
-            read_s3_json(f"profiles/{profile}.json")
-            or read_s3_json(f"{MODELS_PREFIX}/profiles/{profile}.json")
-            or {}
-        )
-        combo_id, anchor_tick = _extract_profile_feature_params(profile_data)
-        base_wm = read_s3_json(f"processed/features/{combo_id}/_watermark.json")
-        model_wm = read_s3_json(
-            f"processed/features/{combo_id}/training_anchor_a{anchor_tick}/"
-            f"_multi_horizon_{model_name}_watermark.json"
-        )
-        watermarks = (base_wm or {}, model_wm or {})
-        if not all(wm.get("updated_at") for wm in watermarks):
-            return False
-        now = datetime.now(UTC)
-        for wm in watermarks:
-            if (now - datetime.fromisoformat(wm["updated_at"])).total_seconds() > max_age_hours * 3600:
-                return False
-        return base_wm.get("max_hour_ts") == model_wm.get("max_hour_ts")
-    except Exception:  # noqa: BLE001 - 판정에 실패하면 피처마트를 다시 만듦
-        return False
-
-
 def _create_cluster(**context: Any) -> str:
     run = _RunParams.from_context(context)
     cluster_id = create_emr_cluster(
@@ -314,8 +251,8 @@ def _refresh_feature_mart(model_name: str, **context: Any) -> None:
         logger.info("[%s] test_profile_only — 챔피언 피처마트 갱신 스킵", model_name)
         return
 
-    profile = _champion_profile_name(model_name) or _DEFAULT_PROFILE
-    if not run.force_refresh and _is_feature_mart_fresh(profile, model_name):
+    profile = champion_profile_name(model_name) or _DEFAULT_PROFILE
+    if not run.force_refresh and is_feature_mart_fresh(profile, model_name):
         logger.info("[%s] 프로필 '%s' 피처마트가 24시간 이내 갱신됨 — Spark 스텝 스킵", model_name, profile)
     else:
         logger.info(
@@ -341,11 +278,15 @@ def _evaluate(model_name: str, **context: Any) -> dict[str, Any]:
     if run.test_profile_only:
         logger.info("[%s] test_profile_only — 평가 없이 '%s' 프로필로 재학습", model_name, TEST_ONLY_PROFILE_NAME)
         summary = {"needs_retrain": True, "candidate_profiles": [TEST_ONLY_PROFILE_NAME]}
-        ti.xcom_push(key="needs_retrain", value=True)
-        ti.xcom_push(key="candidate_profiles", value=[TEST_ONLY_PROFILE_NAME])
-        return summary
+    else:
+        summary = _run_evaluation(model_name, ti, run, context["run_id"])
+    ti.xcom_push(key="needs_retrain", value=summary.get("needs_retrain", False))
+    ti.xcom_push(key="candidate_profiles", value=summary.get("candidate_profiles") or [_DEFAULT_PROFILE])
+    return summary
 
-    result_key = _result_s3_key(context["run_id"], f"eval-{model_name}")
+
+def _run_evaluation(model_name: str, ti: Any, run: _RunParams, run_id: str) -> dict[str, Any]:
+    result_key = _result_s3_key(run_id, f"eval-{model_name}")
     eval_num_workers = _resolve_wrapper_worker_count(run.core_instance_count)
     profile = (
         ti.xcom_pull(task_ids=_task_id(model_name, "refresh_feature_mart"), key="profile")
@@ -362,14 +303,11 @@ def _evaluate(model_name: str, **context: Any) -> dict[str, Any]:
     )
     submit_emr_step(_cluster_id(ti), name, command, mock_override=run.mock_override)
 
-    summary = read_s3_json(result_key) or {
+    return read_s3_json(result_key) or {
         "needs_retrain": True,
         "retrain_models": [model_name],
         "candidate_profiles": [_DEFAULT_PROFILE],
     }
-    ti.xcom_push(key="needs_retrain", value=summary.get("needs_retrain", False))
-    ti.xcom_push(key="candidate_profiles", value=summary.get("candidate_profiles") or [_DEFAULT_PROFILE])
-    return summary
 
 
 def _choose_retrain_branch(model_name: str, **context: Any) -> str:
