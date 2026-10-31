@@ -356,23 +356,10 @@ def compact_date(config: SourceConfig, day: date, *, force: bool = False) -> Dat
         authority, signature = resolve_date_authority(config, day)
         if not authority.markers:
             return DateResult(day=day, status="empty")
-
         previous = storage.read_archive_manifest(config.source_id, day)
-        previous_key = previous.get("archive_key") if previous else None
-        if not authority.selected and authority.completed_windows == 0:
-            # 게시 전 Silver만 남은 상태로 기존 archive를 빈 파일로 덮어쓰지 않음
-            if previous is None:
-                return DateResult(day=day, status="empty")
-            if not force:
-                logger.warning(
-                    "stage=compaction status=skipped "
-                    f"source={config.source_id} date={day} "
-                    "reason=authority_regressed_to_zero_completed_windows"
-                )
-                return DateResult(day=day, status="skipped", archive_key=previous_key)
-        if not force and previous and previous.get("silver_signature") == signature:
-            return DateResult(day=day, status="skipped", archive_key=previous_key)
-
+        unchanged = _result_without_rewrite(config, day, authority, signature, previous, force)
+        if unchanged is not None:
+            return unchanged
         table = _build_archive_table(config, authority)
     except Exception as exc:  # noqa: BLE001 — 어느 예외든 이 날짜만 실패로 격리한다
         logger.error(
@@ -380,6 +367,46 @@ def compact_date(config: SourceConfig, day: date, *, force: bool = False) -> Dat
         )
         return DateResult(day=day, status="failed", error=str(exc))
 
+    archive_key = _write_archive(config, day, authority, signature, table)
+    return DateResult(
+        day=day, status="compacted", rows=table.num_rows, archive_key=archive_key
+    )
+
+
+def _result_without_rewrite(
+    config: SourceConfig,
+    day: date,
+    authority: DateAuthority,
+    signature: str,
+    previous: dict | None,
+    force: bool,
+) -> DateResult | None:
+    """Archive를 다시 쓰지 않아도 되는 날짜면 그 결과를, 다시 써야 하면 None을 반환한다."""
+    previous_key = previous.get("archive_key") if previous else None
+    if not authority.selected and authority.completed_windows == 0:
+        # 게시 전 Silver만 남은 상태로 기존 archive를 빈 파일로 덮어쓰지 않음
+        if previous is None:
+            return DateResult(day=day, status="empty")
+        if not force:
+            logger.warning(
+                "stage=compaction status=skipped "
+                f"source={config.source_id} date={day} "
+                "reason=authority_regressed_to_zero_completed_windows"
+            )
+            return DateResult(day=day, status="skipped", archive_key=previous_key)
+    if not force and previous and previous.get("silver_signature") == signature:
+        return DateResult(day=day, status="skipped", archive_key=previous_key)
+    return None
+
+
+def _write_archive(
+    config: SourceConfig,
+    day: date,
+    authority: DateAuthority,
+    signature: str,
+    table: pa.Table,
+) -> str:
+    """Archive와 변경 감지 서명을 담은 archive manifest를 쓰고 archive key를 반환한다."""
     archive_key = storage.write_archive(config.source_id, day, table)
     expected = _expected_windows(config)
     storage.write_archive_manifest(
@@ -402,6 +429,4 @@ def compact_date(config: SourceConfig, day: date, *, force: bool = False) -> Dat
         f"stage=compaction status=compacted source={config.source_id} date={day} "
         f"parts={authority.completed_windows}/{expected} rows={table.num_rows} key={archive_key}"
     )
-    return DateResult(
-        day=day, status="compacted", rows=table.num_rows, archive_key=archive_key
-    )
+    return archive_key
