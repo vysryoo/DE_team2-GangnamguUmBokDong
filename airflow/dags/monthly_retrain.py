@@ -65,6 +65,124 @@ _YARN_AM_VCORES = 1
 _MLFLOW_COMPOSE_SERVICE_LABEL = "com.docker.compose.service=mlflow"
 
 
+_DAG_PARAMS = {
+    "mock_mode": Param(
+        "auto",
+        type="string",
+        enum=["auto", "force_mock", "force_real"],
+        description=(
+            "auto: 환경변수로 자동 판별. "
+            "force_mock: EMR 호출 없이 mock. "
+            "force_real: 실제 AWS EMR 호출."
+        ),
+    ),
+    "emr_core_instance_type": Param(
+        EMR_CORE_INSTANCE_TYPE,
+        type="string",
+        description="EMR core 노드 인스턴스 타입.",
+    ),
+    "emr_core_instance_count": Param(
+        CORE_INSTANCE_COUNT,
+        type="integer",
+        minimum=_WRAPPER_NODE_RESERVATION + 1,
+        maximum=10,
+        description="클러스터 Core 노드 수.",
+    ),
+    "force_refresh_feature_mart": Param(
+        False,
+        type="boolean",
+        description="피처마트 강제 전체 재생성 여부.",
+    ),
+    "test_profile_only": Param(
+        False,
+        type="boolean",
+        description=f"스모크 테스트용 프로필({TEST_ONLY_PROFILE_NAME}) 단독 실행 여부.",
+    ),
+}
+
+
+def _build_monthly_retrain_dag() -> DAG:
+    """mlflow와 EMR 클러스터를 setup/teardown으로 감싸고 모델 체인을 순서대로 잇는다."""
+    with DAG(
+        dag_id="monthly_retrain",
+        schedule=CronTriggerTimetable(MONTHLY_RETRAIN_CRON, timezone=TIMEZONE),
+        start_date=pendulum.datetime(2026, 8, 1, tz=TIMEZONE),
+        catchup=CATCHUP,
+        max_active_runs=MAX_ACTIVE_RUNS,
+        dagrun_timeout=MONTHLY_RETRAIN_TOTAL_TIMEOUT,
+        tags=["ml", "monthly", "retrain", "emr", "yarn", "rental", "return"],
+        params=_DAG_PARAMS,
+    ) as dag:
+        start_mlflow = PythonOperator(task_id="start_mlflow", python_callable=_start_mlflow)
+        stop_mlflow = PythonOperator(
+            task_id="stop_mlflow",
+            python_callable=_stop_mlflow,
+            trigger_rule=TriggerRule.ALL_DONE,
+        )
+        stop_mlflow.as_teardown(setups=start_mlflow)
+
+        create_cluster = PythonOperator(
+            task_id="create_cluster",
+            python_callable=_create_cluster,
+            execution_timeout=MONTHLY_CLUSTER_CREATE_TIMEOUT,
+        )
+        # DAG run을 수동으로 실패 처리해도 실행되도록 teardown으로 둠. evaluate 등을
+        # setup에 넣으면 그 태스크가 실패했을 때 teardown이 실행되지 않음
+        terminate_cluster = PythonOperator(
+            task_id="terminate_cluster",
+            python_callable=_terminate_cluster,
+            trigger_rule=TriggerRule.ALL_DONE,
+        )
+        terminate_cluster.as_teardown(setups=create_cluster)
+
+        start_mlflow >> create_cluster
+        previous_ends: list = [create_cluster]
+        for index, model_name in enumerate(MODEL_EXECUTION_ORDER):
+            chain_start, chain_ends = _build_model_chain(
+                model_name,
+                TriggerRule.ALL_SUCCESS if index == 0 else TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
+            )
+            previous_ends >> chain_start
+            previous_ends = chain_ends
+        previous_ends >> terminate_cluster
+        terminate_cluster >> stop_mlflow
+    return dag
+
+
+def _build_model_chain(model_name: str, trigger_rule: str) -> tuple[PythonOperator, list]:
+    """피처마트 갱신 → 평가 → 재학습 분기로 이어지는 모델 하나의 체인을 만든다."""
+    model_kwargs = {"model_name": model_name}
+    refresh_feature_mart = PythonOperator(
+        task_id=_task_id(model_name, "refresh_feature_mart"),
+        python_callable=_refresh_feature_mart,
+        op_kwargs=model_kwargs,
+        execution_timeout=MONTHLY_FEATURE_REFRESH_TIMEOUT,
+        trigger_rule=trigger_rule,
+    )
+    evaluate = PythonOperator(
+        task_id=_task_id(model_name, "evaluate"),
+        python_callable=_evaluate,
+        op_kwargs=model_kwargs,
+        execution_timeout=MONTHLY_EVALUATION_TIMEOUT,
+    )
+    check_retrain_branch = BranchPythonOperator(
+        task_id=_task_id(model_name, "check_retrain_branch"),
+        python_callable=_choose_retrain_branch,
+        op_kwargs=model_kwargs,
+    )
+    orchestrate_retrain_loop = PythonOperator(
+        task_id=_task_id(model_name, "orchestrate_retrain_loop"),
+        python_callable=_orchestrate_retrain_loop,
+        op_kwargs=model_kwargs,
+        execution_timeout=MONTHLY_RETRAIN_ORCHESTRATION_TIMEOUT,
+    )
+    skip_monthly_retrain = EmptyOperator(task_id=_task_id(model_name, "skip_monthly_retrain"))
+
+    ends = [orchestrate_retrain_loop, skip_monthly_retrain]
+    refresh_feature_mart >> evaluate >> check_retrain_branch >> ends
+    return refresh_feature_mart, ends
+
+
 def _mock_override(context: dict[str, Any]) -> str | None:
     return context["params"].get("mock_mode")
 
@@ -297,11 +415,17 @@ def _refresh_feature_mart(model_name: str, **context: Any) -> None:
         logger.info("[%s] 프로필 '%s' 피처마트가 24시간 이내 갱신됨 — Spark 스텝 스킵", model_name, profile)
     else:
         logger.info("[%s] 프로필 '%s' 피처마트 %s", model_name, profile, "전체 재생성" if force else "증분 갱신")
-        for step_name, spark_args in _feature_mart_spark_steps(
-            profile, core_count, model_name=model_name, force=force
-        ):
-            submit_emr_step(cluster_id, step_name, spark_args, mock_override=mock_override)
+        _submit_feature_mart_steps(cluster_id, profile, model_name, force=force, context=context)
     ti.xcom_push(key="profile", value=profile)
+
+
+def _submit_feature_mart_steps(
+    cluster_id: str, profile: str, model_name: str, *, force: bool, context: dict[str, Any]
+) -> None:
+    for step_name, spark_args in _feature_mart_spark_steps(
+        profile, _core_instance_count(context), model_name=model_name, force=force
+    ):
+        submit_emr_step(cluster_id, step_name, spark_args, mock_override=_mock_override(context))
 
 
 def _evaluate(model_name: str, **context: Any) -> dict[str, Any]:
@@ -351,15 +475,8 @@ def _train_profile(
     model_name: str, profile: str, cluster_id: str, context: dict[str, Any]
 ) -> bool:
     params = context["params"]
-    mock_override = _mock_override(context)
-    core_count = _core_instance_count(context)
-    for step_name, spark_args in _feature_mart_spark_steps(
-        profile,
-        core_count,
-        model_name=model_name,
-        force=bool(params.get("force_refresh_feature_mart", False)),
-    ):
-        submit_emr_step(cluster_id, step_name, spark_args, mock_override=mock_override)
+    force = bool(params.get("force_refresh_feature_mart", False))
+    _submit_feature_mart_steps(cluster_id, profile, model_name, force=force, context=context)
 
     result_key = _result_s3_key(context["run_id"], f"train-{model_name}-{profile}")
     train_args = [
@@ -377,7 +494,7 @@ def _train_profile(
         "training.scripts.monthly_retrain_check",
         train_args,
         env={
-            "LGB_NUM_MACHINES": str(_resolve_wrapper_worker_count(core_count)),
+            "LGB_NUM_MACHINES": str(_resolve_wrapper_worker_count(_core_instance_count(context))),
             "LGB_TREE_LEARNER": "data",
         },
     )
@@ -386,7 +503,7 @@ def _train_profile(
         name,
         command,
         timeout_seconds=int(MONTHLY_TRAINING_TIMEOUT.total_seconds()),
-        mock_override=mock_override,
+        mock_override=_mock_override(context),
     )
     summary = read_s3_json(result_key) or {"promoted": {model_name: False}}
     return bool(summary.get("promoted", {}).get(model_name))
@@ -462,112 +579,4 @@ def _stop_mlflow(**context: Any) -> None:
         logger.exception("[mlflow] 정지 실패")
 
 
-def _build_model_chain(model_name: str, trigger_rule: str) -> tuple[PythonOperator, list]:
-    model_kwargs = {"model_name": model_name}
-    refresh_feature_mart = PythonOperator(
-        task_id=_task_id(model_name, "refresh_feature_mart"),
-        python_callable=_refresh_feature_mart,
-        op_kwargs=model_kwargs,
-        execution_timeout=MONTHLY_FEATURE_REFRESH_TIMEOUT,
-        trigger_rule=trigger_rule,
-    )
-    evaluate = PythonOperator(
-        task_id=_task_id(model_name, "evaluate"),
-        python_callable=_evaluate,
-        op_kwargs=model_kwargs,
-        execution_timeout=MONTHLY_EVALUATION_TIMEOUT,
-    )
-    check_retrain_branch = BranchPythonOperator(
-        task_id=_task_id(model_name, "check_retrain_branch"),
-        python_callable=_choose_retrain_branch,
-        op_kwargs=model_kwargs,
-    )
-    orchestrate_retrain_loop = PythonOperator(
-        task_id=_task_id(model_name, "orchestrate_retrain_loop"),
-        python_callable=_orchestrate_retrain_loop,
-        op_kwargs=model_kwargs,
-        execution_timeout=MONTHLY_RETRAIN_ORCHESTRATION_TIMEOUT,
-    )
-    skip_monthly_retrain = EmptyOperator(task_id=_task_id(model_name, "skip_monthly_retrain"))
-
-    ends = [orchestrate_retrain_loop, skip_monthly_retrain]
-    refresh_feature_mart >> evaluate >> check_retrain_branch >> ends
-    return refresh_feature_mart, ends
-
-
-with DAG(
-    dag_id="monthly_retrain",
-    schedule=CronTriggerTimetable(MONTHLY_RETRAIN_CRON, timezone=TIMEZONE),
-    start_date=pendulum.datetime(2026, 8, 1, tz=TIMEZONE),
-    catchup=CATCHUP,
-    max_active_runs=MAX_ACTIVE_RUNS,
-    dagrun_timeout=MONTHLY_RETRAIN_TOTAL_TIMEOUT,
-    tags=["ml", "monthly", "retrain", "emr", "yarn", "rental", "return"],
-    params={
-        "mock_mode": Param(
-            "auto",
-            type="string",
-            enum=["auto", "force_mock", "force_real"],
-            description=(
-                "auto: 환경변수로 자동 판별. "
-                "force_mock: EMR 호출 없이 mock. "
-                "force_real: 실제 AWS EMR 호출."
-            ),
-        ),
-        "emr_core_instance_type": Param(
-            EMR_CORE_INSTANCE_TYPE,
-            type="string",
-            description="EMR core 노드 인스턴스 타입.",
-        ),
-        "emr_core_instance_count": Param(
-            CORE_INSTANCE_COUNT,
-            type="integer",
-            minimum=_WRAPPER_NODE_RESERVATION + 1,
-            maximum=10,
-            description="클러스터 Core 노드 수.",
-        ),
-        "force_refresh_feature_mart": Param(
-            False,
-            type="boolean",
-            description="피처마트 강제 전체 재생성 여부.",
-        ),
-        "test_profile_only": Param(
-            False,
-            type="boolean",
-            description=f"스모크 테스트용 프로필({TEST_ONLY_PROFILE_NAME}) 단독 실행 여부.",
-        ),
-    },
-) as dag:
-    start_mlflow = PythonOperator(task_id="start_mlflow", python_callable=_start_mlflow)
-    stop_mlflow = PythonOperator(
-        task_id="stop_mlflow",
-        python_callable=_stop_mlflow,
-        trigger_rule=TriggerRule.ALL_DONE,
-    )
-    stop_mlflow.as_teardown(setups=start_mlflow)
-
-    create_cluster = PythonOperator(
-        task_id="create_cluster",
-        python_callable=_create_cluster,
-        execution_timeout=MONTHLY_CLUSTER_CREATE_TIMEOUT,
-    )
-    # DAG run을 수동으로 실패 처리해도 실행되도록 teardown으로 둠. evaluate 등을
-    # setup에 넣으면 그 태스크가 실패했을 때 teardown이 실행되지 않음
-    terminate_cluster = PythonOperator(
-        task_id="terminate_cluster",
-        python_callable=_terminate_cluster,
-        trigger_rule=TriggerRule.ALL_DONE,
-    )
-    terminate_cluster.as_teardown(setups=create_cluster)
-
-    start_mlflow >> create_cluster
-    previous_ends: list = [create_cluster]
-    for index, model_name in enumerate(MODEL_EXECUTION_ORDER):
-        chain_start, chain_ends = _build_model_chain(
-            model_name,
-            TriggerRule.ALL_SUCCESS if index == 0 else TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
-        )
-        previous_ends >> chain_start
-        previous_ends = chain_ends
-    previous_ends >> terminate_cluster
-    terminate_cluster >> stop_mlflow
+dag = _build_monthly_retrain_dag()
