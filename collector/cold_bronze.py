@@ -95,7 +95,27 @@ def manifest_key(source_id: str, day: date) -> str:
     Returns:
         `bronze/cold_manifest/{source_id}/dt=YYYY-MM-DD.json`
     """
-    return f"bronze/cold_manifest/{source_id}/dt={day.isoformat()}.json"
+    return f"{manifest_prefix(source_id)}dt={day.isoformat()}.json"
+
+
+def manifest_prefix(source_id: str) -> str:
+    """소스의 Cold manifest prefix를 반환한다."""
+    return f"bronze/cold_manifest/{source_id}/"
+
+
+def _cold_key(source_id: str, day: date, cold_sha256: str) -> str:
+    return f"bronze/cold/{source_id}/dt={day.isoformat()}/sha256={cold_sha256}.parquet"
+
+
+def _pending_prefix(source_id: str) -> str:
+    return f"_cold_pending/{source_id}/"
+
+
+def _pending_marker_key(source_id: str, day: date, revision_prefix: str) -> str:
+    return (
+        f"{_pending_prefix(source_id)}dt={day.isoformat()}/"
+        f"sha256={_sha256(revision_prefix.encode())}.json"
+    )
 
 
 def read_manifest(source_id: str, day: date) -> dict | None:
@@ -137,8 +157,7 @@ def write_pending_marker(source_id: str, day: date, hot_key: str) -> None:
     """
     revision_prefix = hot_key.rsplit("/part=", 1)[0]
     write_json(
-        f"_cold_pending/{source_id}/dt={day.isoformat()}/"
-        f"sha256={_sha256(revision_prefix.encode())}.json",
+        _pending_marker_key(source_id, day, revision_prefix),
         {
             "source_id": source_id,
             "date": day.isoformat(),
@@ -183,7 +202,7 @@ def _write_cold(source_id: str, day: date, rows: list[dict]) -> tuple[str, str]:
     pq.write_table(pa.Table.from_pylist(rows, schema=_SCHEMA), buffer, compression="zstd")
     cold_payload = buffer.getvalue()
     cold_sha256 = _sha256(cold_payload)
-    cold_key = f"bronze/cold/{source_id}/dt={day.isoformat()}/sha256={cold_sha256}.parquet"
+    cold_key = _cold_key(source_id, day, cold_sha256)
     S3ImmutableObjectStore().put_verified(object_uri(cold_key), cold_payload)
     return cold_key, cold_sha256
 
@@ -244,7 +263,7 @@ def _due_marker_keys(
 ) -> dict[date, list[str]]:
     """안정화 기간이 지난 pending marker key를 날짜별로 묶는다."""
     due: dict[date, list[str]] = {}
-    for key in list_keys(f"_cold_pending/{source_id}/"):
+    for key in list_keys(_pending_prefix(source_id)):
         matched = _PENDING_MARKER_DAY.search(key)
         if matched is None:
             raise RuntimeError(f"Cold pending marker key 형식이 잘못됐다: {key}")
