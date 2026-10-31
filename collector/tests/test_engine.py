@@ -11,6 +11,7 @@ from validation.engine import (
     _process_columns,
     _resolve_policy_name,
     _resolve_row_params,
+    _Tally,
     _try_cast,
     validate_batch,
 )
@@ -226,7 +227,7 @@ class TestProcessColumns:
     def test_no_issues_resolved_matches_casted_values(self, ctx):
         config = _config({"rackTotCnt": {"types": ["int"], "range": {"min": 0, "max": 200}}})
         row = {"rackTotCnt": "15"}
-        result = _process_columns(row, config, ctx, {}, {})
+        result = _process_columns(row, config, ctx, _Tally())
         assert result.resolved == {"rackTotCnt": 15}
         assert result.issues == []
         assert result.repaired is False
@@ -234,19 +235,19 @@ class TestProcessColumns:
 
     def test_optional_missing_keep_null_not_repaired(self, ctx):
         config = _config({"note": {"types": ["str"], "required": False}})
-        result = _process_columns({"note": ""}, config, ctx, {}, {})
+        result = _process_columns({"note": ""}, config, ctx, _Tally())
         assert result.resolved == {"note": None}
         assert result.repaired is False  # keep_null은 값을 바꾸지 않는다
 
     def test_optional_outlier_set_null_is_repaired(self, ctx):
         config = _config({"temp": {"types": ["int"], "range": {"min": -50, "max": 50}}})
-        result = _process_columns({"temp": "999"}, config, ctx, {}, {})
+        result = _process_columns({"temp": "999"}, config, ctx, _Tally())
         assert result.resolved == {"temp": None}
         assert result.repaired is True  # set_null이 999 -> None으로 값을 바꿨다
 
     def test_required_missing_drop_row_marks_dropped(self, ctx):
         config = _config({"stationId": {"types": ["str"], "required": True}})
-        result = _process_columns({"stationId": ""}, config, ctx, {}, {})
+        result = _process_columns({"stationId": ""}, config, ctx, _Tally())
         assert result.dropped_by_column is True
 
     def test_dropped_column_does_not_stop_remaining_columns(self, ctx):
@@ -257,35 +258,35 @@ class TestProcessColumns:
                 "rackTotCnt": {"types": ["int"], "range": {"min": 0, "max": 200}},
             }
         )
-        result = _process_columns({"stationId": "", "rackTotCnt": "999"}, config, ctx, {}, {})
+        result = _process_columns({"stationId": "", "rackTotCnt": "999"}, config, ctx, _Tally())
         assert result.dropped_by_column is True
         assert len(result.issues) == 2
         assert {entry["column"] for entry in result.issue_entries} == {"stationId", "rackTotCnt"}
 
     def test_issue_entry_shape(self, ctx):
         config = _config({"stationId": {"types": ["str"], "required": True}})
-        result = _process_columns({"stationId": ""}, config, ctx, {}, {})
+        result = _process_columns({"stationId": ""}, config, ctx, _Tally())
         assert result.issue_entries == [
             {"column": "stationId", "kind": "missing", "required": True, "action": "drop_row"}
         ]
 
     def test_column_issue_counts_accumulate(self, ctx):
         config = _config({"stationId": {"types": ["str"], "required": True}})
-        column_issue_counts = {}
-        _process_columns({"stationId": ""}, config, ctx, column_issue_counts, {})
-        assert column_issue_counts == {"stationId": {"missing": 1, "outlier": 0, "type_error": 0}}
+        tally = _Tally()
+        _process_columns({"stationId": ""}, config, ctx, tally)
+        assert tally.column_issues == {"stationId": {"missing": 1, "outlier": 0, "type_error": 0}}
 
     def test_type_error_counted_separately_from_outlier(self, ctx):
         config = _config({"rackTotCnt": {"types": ["int"], "range": {"min": 0, "max": 200}}})
-        column_issue_counts = {}
-        _process_columns({"rackTotCnt": "abc"}, config, ctx, column_issue_counts, {})
-        assert column_issue_counts == {"rackTotCnt": {"missing": 0, "outlier": 0, "type_error": 1}}
+        tally = _Tally()
+        _process_columns({"rackTotCnt": "abc"}, config, ctx, tally)
+        assert tally.column_issues == {"rackTotCnt": {"missing": 0, "outlier": 0, "type_error": 1}}
 
     def test_policy_action_counts_accumulate(self, ctx):
         config = _config({"stationId": {"types": ["str"], "required": True}})
-        policy_action_counts = {}
-        _process_columns({"stationId": ""}, config, ctx, {}, policy_action_counts)
-        assert policy_action_counts == {"drop_row": 1}
+        tally = _Tally()
+        _process_columns({"stationId": ""}, config, ctx, tally)
+        assert tally.policy_actions == {"drop_row": 1}
 
     def test_fail_batch_raises(self, ctx):
         config = _config(
@@ -293,12 +294,12 @@ class TestProcessColumns:
             required_missing="fail_batch",
         )
         with pytest.raises(BatchValidationFailed):
-            _process_columns({"stationId": ""}, config, ctx, {}, {})
+            _process_columns({"stationId": ""}, config, ctx, _Tally())
 
     def test_original_row_not_mutated(self, ctx):
         config = _config({"rackTotCnt": {"types": ["int"], "range": {"min": 0, "max": 200}}})
         row = {"rackTotCnt": "15"}
-        _process_columns(row, config, ctx, {}, {})
+        _process_columns(row, config, ctx, _Tally())
         assert row == {"rackTotCnt": "15"}
 
     def test_policy_receives_original_raw_row_not_partially_resolved(self, ctx, monkeypatch):
@@ -326,7 +327,7 @@ class TestProcessColumns:
             return _wrapped
 
         monkeypatch.setattr(engine_module, "get_policy", _spy)
-        _process_columns(row, config, ctx, {}, {})
+        _process_columns(row, config, ctx, _Tally())
 
         assert seen_rows == [
             {"temp": "999", "rackTotCnt": "250"},

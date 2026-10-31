@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from config.schema import ColumnSpec, Policies, SourceConfig
@@ -98,6 +98,17 @@ class BatchValidationFailed(RuntimeError):
 
 
 @dataclass(slots=True)
+class _Tally:
+    """배치 전체에 누적하는 집계. 키는 manifest의 Counts·ColumnIssueCount 필드명과 같다."""
+
+    column_issues: dict[str, dict[str, int]] = field(default_factory=dict)
+    policy_actions: dict[str, int] = field(default_factory=dict)
+    kept: int = 0
+    repaired: int = 0
+    dropped: int = 0
+
+
+@dataclass(slots=True)
 class _RowResult:
     """한 행의 컬럼 처리 결과. validate_batch가 행 정책과 결합해 유지·폐기를 정한다."""
 
@@ -109,11 +120,7 @@ class _RowResult:
 
 
 def _process_columns(
-    row: dict,
-    config: SourceConfig,
-    ctx: RunContext,
-    column_issue_counts: dict[str, dict[str, int]],
-    policy_action_counts: dict[str, int],
+    row: dict, config: SourceConfig, ctx: RunContext, tally: _Tally
 ) -> _RowResult:
     """행 하나의 컬럼을 전부 판정·디스패치하고 집계를 누적한다.
 
@@ -133,13 +140,13 @@ def _process_columns(
             continue
 
         result.issues.append(issue)
-        counts = column_issue_counts.setdefault(
+        counts = tally.column_issues.setdefault(
             column, {"missing": 0, "outlier": 0, "type_error": 0}
         )
         counts[issue.kind.value] += 1
 
         new_value, action = _apply_column_policy(
-            value, issue, row, config, ctx, policy_action_counts
+            value, issue, row, config, ctx, tally.policy_actions
         )
         if action is Action.DROP_ROW:
             result.dropped_by_column = True
@@ -230,14 +237,12 @@ def validate_batch(rows: list[dict], config: SourceConfig, ctx: RunContext) -> B
             순회를 즉시 중단하므로 이후 행은 처리되지 않는다.
     """
     row_params = _resolve_row_params(config.policies)
-    column_issue_counts: dict[str, dict[str, int]] = {}
-    policy_action_counts: dict[str, int] = {}
+    tally = _Tally()
     silver_rows: list[dict] = []
     quarantine_records: list[dict] = []
-    kept = repaired_count = dropped = 0
 
     for row_index, row in enumerate(rows):
-        result = _process_columns(row, config, ctx, column_issue_counts, policy_action_counts)
+        result = _process_columns(row, config, ctx, tally)
 
         verdict = RowVerdict.DROP if result.dropped_by_column else RowVerdict.KEEP
         if verdict is RowVerdict.KEEP and config.policies.row is not None:
@@ -245,15 +250,15 @@ def validate_batch(rows: list[dict], config: SourceConfig, ctx: RunContext) -> B
             verdict = row_policy(row, result.issues, ctx, row_params)
 
         if verdict is RowVerdict.DROP:
-            dropped += 1
+            tally.dropped += 1
             quarantine_records.append(
                 _build_quarantine_record(row, result.issue_entries, row_index)
             )
             continue
 
-        kept += 1
+        tally.kept += 1
         if result.repaired:
-            repaired_count += 1
+            tally.repaired += 1
         result.resolved["_row_status"] = "repaired" if result.repaired else "ok"
         silver_rows.append(result.resolved)
 
@@ -261,8 +266,13 @@ def validate_batch(rows: list[dict], config: SourceConfig, ctx: RunContext) -> B
     return BatchOutcome(
         silver_rows=silver_rows,
         quarantine_records=quarantine_records,
-        counts={"fetched": fetched, "kept": kept, "repaired": repaired_count, "dropped": dropped},
-        drop_ratio=(dropped / fetched) if fetched else 0.0,
-        column_issues=column_issue_counts,
-        policy_actions=policy_action_counts,
+        counts={
+            "fetched": fetched,
+            "kept": tally.kept,
+            "repaired": tally.repaired,
+            "dropped": tally.dropped,
+        },
+        drop_ratio=(tally.dropped / fetched) if fetched else 0.0,
+        column_issues=tally.column_issues,
+        policy_actions=tally.policy_actions,
     )
