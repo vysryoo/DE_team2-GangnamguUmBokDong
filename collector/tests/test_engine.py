@@ -11,6 +11,7 @@ from validation.engine import (
     _process_columns,
     _resolve_policy_name,
     _resolve_row_params,
+    _Tally,
     _try_cast,
     validate_batch,
 )
@@ -50,30 +51,18 @@ def _config(columns: dict, **policy_overrides):
 
 
 class TestParseBool:
-    def test_true_string(self):
-        assert _parse_bool("true") is True
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [("true", True), ("false", False), ("True", True), ("FALSE", False), (True, True), (False, False)],
+    )
+    def test_accepts_true_false_strings_case_insensitive_and_bools(self, raw, expected):
+        assert _parse_bool(raw) is expected
 
-    def test_false_string(self):
-        assert _parse_bool("false") is False
-
-    def test_case_insensitive(self):
-        assert _parse_bool("True") is True
-        assert _parse_bool("FALSE") is False
-
-    def test_actual_bool_passthrough(self):
-        assert _parse_bool(True) is True
-        assert _parse_bool(False) is False
-
-    def test_zero_one_rejected(self):
-        # 내장 bool()과 달리 "0"/"1"은 인정하지 않는다 — 오직 "true"/"false" 문자열만.
+    # 내장 bool()과 달리 "0"/"1"은 인정하지 않는다 — 오직 "true"/"false" 문자열만.
+    @pytest.mark.parametrize("raw", ["0", "1", "yes"])
+    def test_rejects_other_strings(self, raw):
         with pytest.raises(ValueError):
-            _parse_bool("0")
-        with pytest.raises(ValueError):
-            _parse_bool("1")
-
-    def test_garbage_rejected(self):
-        with pytest.raises(ValueError):
-            _parse_bool("yes")
+            _parse_bool(raw)
 
 
 class TestTryCast:
@@ -180,53 +169,42 @@ class TestJudgeColumn:
 
 
 class TestResolvePolicyName:
-    def test_required_missing_uses_quadrant_default(self, make_spec, make_issue, policies):
-        spec = make_spec(required=True)
-        issue = make_issue(IssueKind.MISSING, spec=spec)
-        assert _resolve_policy_name(issue, policies) == "drop_row"
-
-    def test_optional_missing_uses_quadrant_default(self, make_spec, make_issue, policies):
-        spec = make_spec(required=False)
-        issue = make_issue(IssueKind.MISSING, spec=spec)
-        assert _resolve_policy_name(issue, policies) == "keep_null"
-
-    def test_required_outlier_uses_quadrant_default(self, make_spec, make_issue, policies):
-        spec = make_spec(required=True)
-        issue = make_issue(IssueKind.OUTLIER, spec=spec)
-        assert _resolve_policy_name(issue, policies) == "drop_row"
-
-    def test_optional_outlier_uses_quadrant_default(self, make_spec, make_issue, policies):
-        spec = make_spec(required=False)
-        issue = make_issue(IssueKind.OUTLIER, spec=spec)
-        assert _resolve_policy_name(issue, policies) == "set_null"
-
-    def test_on_missing_override_wins(self, make_spec, make_issue, policies):
-        spec = make_spec(required=True, on_missing="fill_zero")
-        issue = make_issue(IssueKind.MISSING, spec=spec)
-        assert _resolve_policy_name(issue, policies) == "fill_zero"
-
-    def test_on_outlier_override_wins_for_outlier(self, make_spec, make_issue, policies):
-        spec = make_spec(required=False, on_outlier="clip_to_range")
-        issue = make_issue(IssueKind.OUTLIER, spec=spec)
-        assert _resolve_policy_name(issue, policies) == "clip_to_range"
-
-    def test_type_error_ignores_on_outlier_override_required(self, make_spec, make_issue, policies):
-        # TYPE_ERROR는 컬럼 오버라이드를 무시하고 4분면 기본값만 쓴다.
-        spec = make_spec(required=True, on_outlier="clip_to_range")
-        issue = make_issue(IssueKind.TYPE_ERROR, spec=spec)
-        assert _resolve_policy_name(issue, policies) == "drop_row"
-
-    def test_type_error_ignores_on_outlier_override_optional(self, make_spec, make_issue, policies):
-        spec = make_spec(required=False, on_outlier="clip_to_range")
-        issue = make_issue(IssueKind.TYPE_ERROR, spec=spec)
-        assert _resolve_policy_name(issue, policies) == "set_null"
+    # TYPE_ERROR는 컬럼 오버라이드를 무시하고 4분면 기본값만 쓴다.
+    @pytest.mark.parametrize(
+        ("kind", "spec_kwargs", "expected"),
+        [
+            (IssueKind.MISSING, {"required": True}, "drop_row"),
+            (IssueKind.MISSING, {"required": False}, "keep_null"),
+            (IssueKind.OUTLIER, {"required": True}, "drop_row"),
+            (IssueKind.OUTLIER, {"required": False}, "set_null"),
+            (IssueKind.MISSING, {"required": True, "on_missing": "fill_zero"}, "fill_zero"),
+            (IssueKind.OUTLIER, {"required": False, "on_outlier": "clip_to_range"}, "clip_to_range"),
+            (IssueKind.TYPE_ERROR, {"required": True, "on_outlier": "clip_to_range"}, "drop_row"),
+            (IssueKind.TYPE_ERROR, {"required": False, "on_outlier": "clip_to_range"}, "set_null"),
+        ],
+        ids=[
+            "required_missing_default",
+            "optional_missing_default",
+            "required_outlier_default",
+            "optional_outlier_default",
+            "on_missing_override",
+            "on_outlier_override",
+            "type_error_ignores_override_required",
+            "type_error_ignores_override_optional",
+        ],
+    )
+    def test_resolves_quadrant_default_or_column_override(
+        self, make_spec, make_issue, policies, kind, spec_kwargs, expected
+    ):
+        issue = make_issue(kind, spec=make_spec(**spec_kwargs))
+        assert _resolve_policy_name(issue, policies) == expected
 
 
 class TestProcessColumns:
     def test_no_issues_resolved_matches_casted_values(self, ctx):
         config = _config({"rackTotCnt": {"types": ["int"], "range": {"min": 0, "max": 200}}})
         row = {"rackTotCnt": "15"}
-        result = _process_columns(row, config, ctx, {}, {})
+        result = _process_columns(row, config, ctx, _Tally())
         assert result.resolved == {"rackTotCnt": 15}
         assert result.issues == []
         assert result.repaired is False
@@ -234,19 +212,19 @@ class TestProcessColumns:
 
     def test_optional_missing_keep_null_not_repaired(self, ctx):
         config = _config({"note": {"types": ["str"], "required": False}})
-        result = _process_columns({"note": ""}, config, ctx, {}, {})
+        result = _process_columns({"note": ""}, config, ctx, _Tally())
         assert result.resolved == {"note": None}
         assert result.repaired is False  # keep_null은 값을 바꾸지 않는다
 
     def test_optional_outlier_set_null_is_repaired(self, ctx):
         config = _config({"temp": {"types": ["int"], "range": {"min": -50, "max": 50}}})
-        result = _process_columns({"temp": "999"}, config, ctx, {}, {})
+        result = _process_columns({"temp": "999"}, config, ctx, _Tally())
         assert result.resolved == {"temp": None}
         assert result.repaired is True  # set_null이 999 -> None으로 값을 바꿨다
 
     def test_required_missing_drop_row_marks_dropped(self, ctx):
         config = _config({"stationId": {"types": ["str"], "required": True}})
-        result = _process_columns({"stationId": ""}, config, ctx, {}, {})
+        result = _process_columns({"stationId": ""}, config, ctx, _Tally())
         assert result.dropped_by_column is True
 
     def test_dropped_column_does_not_stop_remaining_columns(self, ctx):
@@ -257,35 +235,35 @@ class TestProcessColumns:
                 "rackTotCnt": {"types": ["int"], "range": {"min": 0, "max": 200}},
             }
         )
-        result = _process_columns({"stationId": "", "rackTotCnt": "999"}, config, ctx, {}, {})
+        result = _process_columns({"stationId": "", "rackTotCnt": "999"}, config, ctx, _Tally())
         assert result.dropped_by_column is True
         assert len(result.issues) == 2
         assert {entry["column"] for entry in result.issue_entries} == {"stationId", "rackTotCnt"}
 
     def test_issue_entry_shape(self, ctx):
         config = _config({"stationId": {"types": ["str"], "required": True}})
-        result = _process_columns({"stationId": ""}, config, ctx, {}, {})
+        result = _process_columns({"stationId": ""}, config, ctx, _Tally())
         assert result.issue_entries == [
             {"column": "stationId", "kind": "missing", "required": True, "action": "drop_row"}
         ]
 
     def test_column_issue_counts_accumulate(self, ctx):
         config = _config({"stationId": {"types": ["str"], "required": True}})
-        column_issue_counts = {}
-        _process_columns({"stationId": ""}, config, ctx, column_issue_counts, {})
-        assert column_issue_counts == {"stationId": {"missing": 1, "outlier": 0, "type_error": 0}}
+        tally = _Tally()
+        _process_columns({"stationId": ""}, config, ctx, tally)
+        assert tally.column_issues == {"stationId": {"missing": 1, "outlier": 0, "type_error": 0}}
 
     def test_type_error_counted_separately_from_outlier(self, ctx):
         config = _config({"rackTotCnt": {"types": ["int"], "range": {"min": 0, "max": 200}}})
-        column_issue_counts = {}
-        _process_columns({"rackTotCnt": "abc"}, config, ctx, column_issue_counts, {})
-        assert column_issue_counts == {"rackTotCnt": {"missing": 0, "outlier": 0, "type_error": 1}}
+        tally = _Tally()
+        _process_columns({"rackTotCnt": "abc"}, config, ctx, tally)
+        assert tally.column_issues == {"rackTotCnt": {"missing": 0, "outlier": 0, "type_error": 1}}
 
     def test_policy_action_counts_accumulate(self, ctx):
         config = _config({"stationId": {"types": ["str"], "required": True}})
-        policy_action_counts = {}
-        _process_columns({"stationId": ""}, config, ctx, {}, policy_action_counts)
-        assert policy_action_counts == {"drop_row": 1}
+        tally = _Tally()
+        _process_columns({"stationId": ""}, config, ctx, tally)
+        assert tally.policy_actions == {"drop_row": 1}
 
     def test_fail_batch_raises(self, ctx):
         config = _config(
@@ -293,12 +271,12 @@ class TestProcessColumns:
             required_missing="fail_batch",
         )
         with pytest.raises(BatchValidationFailed):
-            _process_columns({"stationId": ""}, config, ctx, {}, {})
+            _process_columns({"stationId": ""}, config, ctx, _Tally())
 
     def test_original_row_not_mutated(self, ctx):
         config = _config({"rackTotCnt": {"types": ["int"], "range": {"min": 0, "max": 200}}})
         row = {"rackTotCnt": "15"}
-        _process_columns(row, config, ctx, {}, {})
+        _process_columns(row, config, ctx, _Tally())
         assert row == {"rackTotCnt": "15"}
 
     def test_policy_receives_original_raw_row_not_partially_resolved(self, ctx, monkeypatch):
@@ -326,7 +304,7 @@ class TestProcessColumns:
             return _wrapped
 
         monkeypatch.setattr(engine_module, "get_policy", _spy)
-        _process_columns(row, config, ctx, {}, {})
+        _process_columns(row, config, ctx, _Tally())
 
         assert seen_rows == [
             {"temp": "999", "rackTotCnt": "250"},

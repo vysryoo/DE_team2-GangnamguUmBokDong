@@ -256,30 +256,18 @@ def test_fetch_classifies_401_and_403_as_fatal_and_stops():
     assert len(calls) == 1  # FATAL 뒤 나머지 격자는 호출하지 않는다
 
 
-def test_fetch_classifies_5xx_as_transient_and_continues():
+@pytest.mark.parametrize(
+    ("status_code", "expected"),
+    [(503, FetchErrorKind.TRANSIENT), (404, FetchErrorKind.PERMANENT)],
+)
+def test_fetch_classifies_non_fatal_status_and_continues(status_code, expected):
     def handler(request):
-        return httpx.Response(503, content=b"")
+        return httpx.Response(status_code, content=b"")
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
     results = list(KmaApiHubAdapter.fetch(_config(), _window(), client=client))
 
-    assert [r.error for r in results] == [
-        FetchErrorKind.TRANSIENT,
-        FetchErrorKind.TRANSIENT,
-    ]
-
-
-def test_fetch_classifies_404_as_permanent_and_continues():
-    def handler(request):
-        return httpx.Response(404, content=b"")
-
-    client = httpx.Client(transport=httpx.MockTransport(handler))
-    results = list(KmaApiHubAdapter.fetch(_config(), _window(), client=client))
-
-    assert [r.error for r in results] == [
-        FetchErrorKind.PERMANENT,
-        FetchErrorKind.PERMANENT,
-    ]
+    assert [r.error for r in results] == [expected, expected]
 
 
 def test_fetch_yields_raw_response_unmodified():
@@ -592,73 +580,27 @@ def test_classify_result_code():
     assert _classify_result_code(None) is FetchErrorKind.PERMANENT
 
 
-def test_adjust_base_time_hourly():
-    # 40분 전에는 이전 시각 (14:39 -> 13:00)
-    dt = datetime(2026, 8, 12, 14, 39, tzinfo=KST)
-    assert adjust_base_time(dt, "hourly") == datetime(2026, 8, 12, 13, 0, tzinfo=KST)
-
-    # 40분 이후는 현재 시각 (14:40 -> 14:00)
-    dt = datetime(2026, 8, 12, 14, 40, tzinfo=KST)
-    assert adjust_base_time(dt, "hourly") == datetime(2026, 8, 12, 14, 0, tzinfo=KST)
+def _kst(day: int, hour: int, minute: int) -> datetime:
+    return datetime(2026, 8, day, hour, minute, tzinfo=KST)
 
 
-def test_adjust_base_time_half_hourly():
-    # 30분 전에는 이전 시각 30분 (14:29 -> 13:30)
-    dt = datetime(2026, 8, 12, 14, 29, tzinfo=KST)
-    assert adjust_base_time(dt, "half_hourly") == datetime(
-        2026, 8, 12, 13, 30, tzinfo=KST
-    )
-
-    # 30분 이후는 현재 시각 30분 (14:30 -> 14:30)
-    dt = datetime(2026, 8, 12, 14, 30, tzinfo=KST)
-    assert adjust_base_time(dt, "half_hourly") == datetime(
-        2026, 8, 12, 14, 30, tzinfo=KST
-    )
-
-
-def test_adjust_base_time_ten_minutely():
-    # 10분 단위로 내림만 한다(발표 지연 보정 없음) — freshness 전용
-    dt = datetime(2026, 8, 12, 14, 37, tzinfo=KST)
-    assert adjust_base_time(dt, "ten_minutely") == datetime(
-        2026, 8, 12, 14, 30, tzinfo=KST
-    )
-
-    dt = datetime(2026, 8, 12, 14, 0, tzinfo=KST)
-    assert adjust_base_time(dt, "ten_minutely") == datetime(
-        2026, 8, 12, 14, 0, tzinfo=KST
-    )
-
-
-def test_adjust_base_time_thirty_minutely():
-    # 30분 단위로 내림만 한다(시간당 2슬롯: :00, :30) — half_hourly(시간당
-    # 1슬롯, 매시 30분)와 다르다
-    dt = datetime(2026, 8, 12, 14, 5, tzinfo=KST)
-    assert adjust_base_time(dt, "thirty_minutely") == datetime(
-        2026, 8, 12, 14, 0, tzinfo=KST
-    )
-
-    dt = datetime(2026, 8, 12, 14, 37, tzinfo=KST)
-    assert adjust_base_time(dt, "thirty_minutely") == datetime(
-        2026, 8, 12, 14, 30, tzinfo=KST
-    )
-
-
-def test_adjust_base_time_vilage_fcst():
-    # 02, 05, 08, 11, 14, 17, 20, 23시 + 10분 발표
-    # 05:09 -> 02:00
-    dt = datetime(2026, 8, 12, 5, 9, tzinfo=KST)
-    assert adjust_base_time(dt, "vilage_fcst") == datetime(
-        2026, 8, 12, 2, 0, tzinfo=KST
-    )
-
-    # 05:10 -> 05:00
-    dt = datetime(2026, 8, 12, 5, 10, tzinfo=KST)
-    assert adjust_base_time(dt, "vilage_fcst") == datetime(
-        2026, 8, 12, 5, 0, tzinfo=KST
-    )
-
-    # 01:00 -> 전날 23:00
-    dt = datetime(2026, 8, 12, 1, 0, tzinfo=KST)
-    assert adjust_base_time(dt, "vilage_fcst") == datetime(
-        2026, 8, 11, 23, 0, tzinfo=KST
-    )
+# hourly·half_hourly·vilage_fcst는 발표 지연을 반영하고, ten_minutely·thirty_minutely는
+# freshness 판정용 단순 내림이다. thirty_minutely(:00·:30)는 half_hourly(매시 30분)와 다르다.
+@pytest.mark.parametrize(
+    ("rule", "now", "expected"),
+    [
+        ("hourly", _kst(12, 14, 39), _kst(12, 13, 0)),
+        ("hourly", _kst(12, 14, 40), _kst(12, 14, 0)),
+        ("half_hourly", _kst(12, 14, 29), _kst(12, 13, 30)),
+        ("half_hourly", _kst(12, 14, 30), _kst(12, 14, 30)),
+        ("ten_minutely", _kst(12, 14, 37), _kst(12, 14, 30)),
+        ("ten_minutely", _kst(12, 14, 0), _kst(12, 14, 0)),
+        ("thirty_minutely", _kst(12, 14, 5), _kst(12, 14, 0)),
+        ("thirty_minutely", _kst(12, 14, 37), _kst(12, 14, 30)),
+        ("vilage_fcst", _kst(12, 5, 9), _kst(12, 2, 0)),
+        ("vilage_fcst", _kst(12, 5, 10), _kst(12, 5, 0)),
+        ("vilage_fcst", _kst(12, 1, 0), _kst(11, 23, 0)),
+    ],
+)
+def test_adjust_base_time(rule, now, expected):
+    assert adjust_base_time(now, rule) == expected

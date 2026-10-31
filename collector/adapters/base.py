@@ -52,14 +52,12 @@ class FetchResult:
     payload: 성공 시 원본 응답
     error: 실패 시 범주
     expected_total: 전체 행 수. 알 수 있는 소스가 처음 알아낸 조각에만 싣는다
-    persist: False면 payload를 Bronze에 저장하지 않고 expected_total만 전달한다
     """
 
     key: str
     payload: bytes | None = None
     error: FetchErrorKind | None = None
     expected_total: int | None = None
-    persist: bool = True
 
 
 class Adapter(Protocol):
@@ -206,18 +204,18 @@ MAX_ROUNDS = len(ROUND_WAITS_SECONDS) + 1
 
 
 def fetch_with_rounds(
-    fetch_fn,
-    config,
-    window,
+    fetch_fn: Callable[..., Iterator[FetchResult]],
+    config: SourceConfig,
+    window: Window,
     *,
-    client,
-    skip=frozenset(),
-    expected_total=None,
-    sleep_fn=time.sleep,
-    now_fn=time.monotonic,
-    on_chunk=None,
+    client: httpx.Client,
+    skip: frozenset[str] = frozenset(),
+    expected_total: int | None = None,
+    sleep_fn: Callable[[float], None] = time.sleep,
+    now_fn: Callable[[], float] = time.monotonic,
+    on_chunk: Callable[[str, bytes], None] | None = None,
     planned_parts: frozenset[str] | None = None,
-):
+) -> FetchRoundResult:
     """TRANSIENT 조각만 모아 대기 후 다시 요청하는 라운드 루프를 돈다.
 
     fetch budget이 끝나면 새 요청을 시작하지 않는다. FATAL이 나오면 남은 라운드를 돌지
@@ -253,7 +251,7 @@ def fetch_with_rounds(
             config,
             window,
             client=client,
-            skip=frozenset(skip) | state.collected.keys() | state.permanent.keys(),
+            skip=frozenset(skip) | state.settled_keys(),
             expected_total=state.expected_total,
         )
         state.transient = {}
@@ -262,13 +260,10 @@ def fetch_with_rounds(
         if round_index < len(ROUND_WAITS_SECONDS) and state.transient:
             sleep_fn(ROUND_WAITS_SECONDS[round_index])
 
-    missing = {**state.permanent, **state.transient}
-    if planned_parts is not None:
-        covered = frozenset(skip) | state.collected.keys() | missing.keys()
-        for key in planned_parts - covered:
-            missing[key] = FetchErrorKind.TRANSIENT
     return FetchRoundResult(
-        chunks=state.collected, missing=missing, expected_total=state.expected_total
+        chunks=state.collected,
+        missing=state.missing(skip, planned_parts),
+        expected_total=state.expected_total,
     )
 
 
@@ -280,6 +275,21 @@ class _RoundState:
     collected: dict[str, bytes] = field(default_factory=dict)
     permanent: dict[str, FetchErrorKind] = field(default_factory=dict)
     transient: dict[str, FetchErrorKind] = field(default_factory=dict)
+
+    def settled_keys(self) -> frozenset[str]:
+        """다음 라운드에서 다시 요청하지 않을 조각 키를 반환한다."""
+        return frozenset(self.collected.keys() | self.permanent.keys())
+
+    def missing(
+        self, skip: frozenset[str], planned_parts: frozenset[str] | None
+    ) -> dict[str, FetchErrorKind]:
+        """끝내 받지 못한 조각을 반환한다. 계획에 있지만 요청하지 못한 키도 포함한다."""
+        missing = {**self.permanent, **self.transient}
+        if planned_parts is not None:
+            covered = frozenset(skip) | self.collected.keys() | missing.keys()
+            for key in planned_parts - covered:
+                missing[key] = FetchErrorKind.TRANSIENT
+        return missing
 
 
 def _run_round(
@@ -306,8 +316,6 @@ def _run_round(
             state.expected_total = max(state.expected_total or 0, result.expected_total)
 
         if result.error is None:
-            if not result.persist:
-                continue
             if result.payload is None:
                 raise ValueError("저장할 성공 조각의 payload는 None일 수 없습니다")
             state.collected[result.key] = result.payload

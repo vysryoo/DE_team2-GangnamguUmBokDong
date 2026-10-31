@@ -94,19 +94,26 @@ def _check_adapter_params(config: SourceConfig) -> list[str]:
         return errors + _check_population_params(params, pagination)
 
     if pagination == "probe_until_empty":
-        if config.natural_key is None:
-            errors.append(
-                "adapter_params.pagination: probe pagination에는 natural_key가 필수입니다."
-            )
-        max_probe_pages = params.get("max_probe_pages")
-        if not _is_int(max_probe_pages) or max_probe_pages < 1:
-            errors.append(
-                "adapter_params.max_probe_pages: probe pagination이면 "
-                "1 이상의 정수가 필수입니다."
-            )
-    elif "max_probe_pages" in params:
+        return errors + _check_probe_params(config)
+    if "max_probe_pages" in params:
         errors.append(
             "adapter_params.max_probe_pages: probe pagination에서만 사용할 수 있습니다."
+        )
+    return errors
+
+
+def _check_probe_params(config: SourceConfig) -> list[str]:
+    """빈 페이지까지 탐색하는 probe pagination 설정을 검증한다."""
+    errors: list[str] = []
+    if config.natural_key is None:
+        errors.append(
+            "adapter_params.pagination: probe pagination에는 natural_key가 필수입니다."
+        )
+    max_probe_pages = config.adapter_params.get("max_probe_pages")
+    if not _is_int(max_probe_pages) or max_probe_pages < 1:
+        errors.append(
+            "adapter_params.max_probe_pages: probe pagination이면 "
+            "1 이상의 정수가 필수입니다."
         )
     return errors
 
@@ -174,33 +181,31 @@ def _check_natural_key(config: SourceConfig) -> list[str]:
 
 def _check_policy_names(config: SourceConfig) -> list[str]:
     """기본 컬럼 정책, 개별 컬럼 오버라이드 정책, 행 정책 이름이 등록됐는지 확인한다."""
-    errors: list[str] = []
-    quadrants = {
-        "policies.required_missing": config.policies.required_missing,
-        "policies.required_outlier": config.policies.required_outlier,
-        "policies.optional_missing": config.policies.optional_missing,
-        "policies.optional_outlier": config.policies.optional_outlier,
-    }
-    for location, name in quadrants.items():
-        if not is_policy_registered(name):
-            errors.append(_unregistered_message(location, name, policy_names()))
-
-    for column_name, spec in config.columns.items():
-        for field in ("on_missing", "on_outlier"):
-            name = getattr(spec, field)
-            if name is not None and not is_policy_registered(name):
-                location = f"columns.{column_name}.{field}"
-                errors.append(_unregistered_message(location, name, policy_names()))
-
-    if config.policies.row is not None and not is_row_policy_registered(
-        config.policies.row
-    ):
-        errors.append(
-            _unregistered_message(
-                "policies.row", config.policies.row, row_policy_names()
-            )
+    policies = config.policies
+    column_policies = [
+        (f"policies.{field}", getattr(policies, field))
+        for field in (
+            "required_missing",
+            "required_outlier",
+            "optional_missing",
+            "optional_outlier",
         )
-
+    ]
+    column_policies += [
+        (f"columns.{column_name}.{field}", getattr(spec, field))
+        for column_name, spec in config.columns.items()
+        for field in ("on_missing", "on_outlier")
+        if getattr(spec, field) is not None
+    ]
+    errors = [
+        _unregistered_message(location, name, policy_names())
+        for location, name in column_policies
+        if not is_policy_registered(name)
+    ]
+    if policies.row is not None and not is_row_policy_registered(policies.row):
+        errors.append(
+            _unregistered_message("policies.row", policies.row, row_policy_names())
+        )
     return errors
 
 

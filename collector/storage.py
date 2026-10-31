@@ -258,12 +258,12 @@ def list_source_snapshot_windows(source_id: str, day: date) -> list[datetime]:
     manifest 경로는 UTC 날짜 partition이라 KST 하루가 걸치는 두 partition을 나열한다.
     revision이 여러 개인 window는 한 번만 반환하며, revision chain 검증은 manifest가 맡는다.
 
-    args:
+    Args:
         source_id: 대상 Collector source ID
         day: archive가 표현하는 KST 날짜
-    returns:
+    Returns:
         오름차순 KST aware datetime 목록
-    raises:
+    Raises:
         ValueError: 전용 namespace에 canonical하지 않은 manifest key가 있을 때
     """
     start_kst = datetime(day.year, day.month, day.day, tzinfo=KST)
@@ -294,17 +294,20 @@ def latest_source_snapshot_logical_dttm(
     freshness gate용이다. 자정 직후를 위해 전날까지만 보며, 그보다 오래 비었다면 다른
     방식으로 감지해야 할 장애다.
 
-    args:
+    Args:
         source_id: 대상 Collector source ID
         as_of: 기준 시각(aware) — 이 시각 이후의 window는 무시한다
-    returns:
+    Returns:
         가장 최근 logical 시각(KST aware) 또는 None
     """
     as_of_kst = as_of.astimezone(KST)
-    candidates = [w for w in list_source_snapshot_windows(source_id, as_of_kst.date()) if w <= as_of_kst]
-    if not candidates:
-        yesterday = (as_of_kst - timedelta(days=1)).date()
-        candidates = [w for w in list_source_snapshot_windows(source_id, yesterday) if w <= as_of_kst]
+
+    def windows_until_as_of(day: date) -> list[datetime]:
+        return [w for w in list_source_snapshot_windows(source_id, day) if w <= as_of_kst]
+
+    candidates = windows_until_as_of(as_of_kst.date()) or windows_until_as_of(
+        (as_of_kst - timedelta(days=1)).date()
+    )
     return max(candidates) if candidates else None
 
 
