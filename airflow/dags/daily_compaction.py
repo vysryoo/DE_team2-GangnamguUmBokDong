@@ -9,28 +9,32 @@ source마다 Cold Bronze → Hot Bronze GC → Silver GC 순서로 실행해, �
 """
 
 import pendulum
+from airflow import DAG
 from airflow.task.trigger_rule import TriggerRule
 from airflow.timetables.trigger import CronTriggerTimetable
+
 from config.schedules import CATCHUP, COMPACTION_CRON, MAX_ACTIVE_RUNS, TIMEZONE
 from config.sources import (
     COLD_BRONZE_SOURCES,
     COMPACTION_SOURCES,
     DAILY_ARCHIVE_DELAY_DAYS,
+    RENTAL_HISTORY_SOURCE,
 )
-from orchestration.collector_task import build_daily_history_replay_task
+from orchestration.collector_task import build_collector_task
 from orchestration.compaction_task import (
     build_cold_bronze_compaction_task,
     build_compaction_task,
     build_hot_bronze_gc_task,
     build_silver_gc_task,
 )
-from orchestration.templates import KST_DATE, kst_date_days_ago
-
-from airflow import DAG
+from orchestration.templates import (
+    KST_DATE,
+    kst_date_days_ago,
+    kst_day_hour_replay_days_ago,
+)
 
 SILVER_GC_RETENTION_DAYS = 30
 HOT_BRONZE_RETENTION_DAYS = 30
-RENTAL_HISTORY_SOURCE = "bike_rental_history"
 
 with DAG(
     dag_id="daily_compaction",
@@ -40,10 +44,16 @@ with DAG(
     max_active_runs=MAX_ACTIVE_RUNS,
     tags=["daily", "archive"],
 ) as dag:
+    # 시간대 하나의 실패가 나머지 시간대를 막지 않도록 ALL_DONE으로 순차 실행함
     replay_chain = None
     for hour in range(24):
-        replay = build_daily_history_replay_task(
-            dag, hour, DAILY_ARCHIVE_DELAY_DAYS
+        replay = build_collector_task(
+            dag,
+            RENTAL_HISTORY_SOURCE,
+            task_id=f"replay_bike_rental_history_{hour:02d}h",
+            window_start=kst_day_hour_replay_days_ago(DAILY_ARCHIVE_DELAY_DAYS, hour),
+            force=True,
+            trigger_rule=TriggerRule.ALL_DONE,
         )
         if replay_chain is not None:
             replay_chain >> replay

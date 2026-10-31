@@ -28,7 +28,7 @@ from orchestration.task_builder import (
     module_subprocess_env,
     uv_python_command,
 )
-from orchestration.templates import KST_WINDOW_START, kst_day_hour_replay_days_ago
+from orchestration.templates import KST_WINDOW_START
 
 COLLECTOR_DIR = str(REPO_ROOT / "collector")
 _FRESHNESS_CHECK_TIMEOUT_SECONDS = 30
@@ -82,28 +82,6 @@ def build_collector_task(
         retry_delay=retry_delay,
         trigger_rule=trigger_rule,
         env=env,
-    )
-
-
-def build_daily_history_replay_task(dag, hour: int, days_back: int) -> BashOperator:
-    """``days_back``일 전 대여이력 한 시간대를 ``--force``로 다시 수집하는 태스크를 만든다.
-
-    시간대 하나의 실패가 나머지 시간대를 막지 않도록 ``ALL_DONE``으로 실행함.
-
-    Args:
-        dag: 태스크를 붙일 DAG
-        hour: 대상 시(0~23)
-        days_back: 며칠 전 날짜인지. 양수
-    Returns:
-        구성된 BashOperator
-    """
-    return build_collector_task(
-        dag,
-        "bike_rental_history",
-        task_id=f"replay_bike_rental_history_{hour:02d}h",
-        window_start=kst_day_hour_replay_days_ago(days_back, hour),
-        force=True,
-        trigger_rule=TriggerRule.ALL_DONE,
     )
 
 

@@ -83,6 +83,7 @@ class TestDag:
             assert "--source bike_rental_history" in task.bash_command
             assert "--force" in task.bash_command
             assert "macros.timedelta(days=6)" in task.bash_command
+            assert f"hour={hour}, minute=55" in task.bash_command
             assert task.trigger_rule == TriggerRule.ALL_DONE
 
     def test_replay_tasks_are_sequential(self):
