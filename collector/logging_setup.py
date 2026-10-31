@@ -15,10 +15,8 @@ from datetime import datetime
 _FIXED_FIELDS = ("source_id", "window", "attempt")
 _STANDARD_ATTRS = frozenset(vars(logging.LogRecord("", 0, "", 0, "", (), None)).keys()) | {"message", "asctime"}
 
-# 기상청 API는 인증키를 쿼리 파라미터로 받고, 서울 API는 경로 세그먼트로 받는다.
-# 1. 쿼리 파라미터 형태 (?key=..., &ServiceKey=...)
+# 기상청 API는 인증키를 쿼리 파라미터(?authKey=...)로, 서울 API는 경로 세그먼트로 받는다.
 _SECRET_QUERY_RE = re.compile(r"(?i)([?&](?:service|auth)?key=)[^&\s'\"]+")
-# 2. 경로 파라미터 형태 (openapi.seoul.go.kr:8088/{key}/...)
 _SECRET_PATH_RE = re.compile(r"(?i)(openapi\.seoul\.go\.kr:8088/)[^/\s'\"]+")
 
 
@@ -29,32 +27,16 @@ def _redact(text: str) -> str:
     return text
 
 
-class _ContextFilter(logging.Filter):
-    """모든 레코드에 source_id·window·attempt를 주입한다."""
+class _FixedFieldsFilter(logging.Filter):
+    """모든 레코드에 고정 필드를 주입한다. 레코드를 걸러내지는 않는다."""
 
-    def __init__(self, source_id: str, window_start: datetime, attempt: int):
+    def __init__(self, **fields):
         super().__init__()
-        self._source_id = source_id
-        self._window = window_start.isoformat()
-        self._attempt = attempt
+        self._fields = fields
 
     def filter(self, record: logging.LogRecord) -> bool:
-        """레코드에 고정 필드 3개를 얹고 항상 통과시킨다(걸러내는 필터가 아니다)."""
-        record.source_id = self._source_id
-        record.window = self._window
-        record.attempt = self._attempt
-        return True
-
-
-class _SourceOnlyFilter(logging.Filter):
-    """source_id만 주입한다. window·attempt가 없는 배치 작업용이다."""
-
-    def __init__(self, source_id: str):
-        super().__init__()
-        self._source_id = source_id
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        record.source_id = self._source_id
+        for name, value in self._fields.items():
+            setattr(record, name, value)
         return True
 
 
@@ -103,24 +85,17 @@ def configure_logging(
     returns:
         설정이 끝난 root 로거.
     """
-    root = logging.getLogger()
-    root.handlers.clear()
-    root.setLevel(level)
-
-    handler = logging.StreamHandler(stream if stream is not None else sys.stdout)
-    handler.setFormatter(_KeyValueFormatter())
-    handler.addFilter(_ContextFilter(source_id, window_start, attempt))
-    root.addHandler(handler)
-
-    return root
+    fields = _FixedFieldsFilter(
+        source_id=source_id, window=window_start.isoformat(), attempt=attempt
+    )
+    return _install_root_handler(fields, level, stream)
 
 
 def configure_httpx_request_logging(adapter_name: str) -> None:
     """KMA의 elapsed 로그와 중복되는 httpx 요청 로그만 끈다.
 
-    KMA 어댑터는 기존 httpx INFO 로그를 endpoint·격자·페이지·소요시간이 포함된
-    자체 로그로 일대일 대체한다. 다른 어댑터는 기존 동작을 유지하며, 한 프로세스에서
-    설정 함수를 여러 번 호출하는 테스트를 위해 NOTSET으로 원복할 수도 있게 한다.
+    다른 어댑터는 기존 동작을 유지한다. 한 프로세스에서 여러 번 호출하는 테스트를 위해
+    NOTSET으로 원복할 수도 있게 한다.
     """
     level = logging.WARNING if adapter_name == "kma_apihub" else logging.NOTSET
     logging.getLogger("httpx").setLevel(level)
@@ -131,10 +106,8 @@ def configure_batch_logging(
 ) -> logging.Logger:
     """source_id만 고정 필드로 붙이는 root 로거를 설정한다.
 
-    compaction처럼 날짜 범위를 처리하는 배치는 window·attempt라는 개념이 없다. 없는
-    값을 억지로 채우면(실행 시각을 window로 넣는 등) 로그를 읽는 사람이 그것을 실제
-    수집 윈도우로 오해한다. 포매터는 `configure_logging`과 같은 것을 쓰므로 출력
-    형식은 동일하고, 없는 필드만 빠진다.
+    compaction처럼 날짜 범위를 처리하는 배치에는 window·attempt가 없다. 실행 시각 등으로
+    억지로 채우면 실제 수집 window로 오해하므로, 같은 포매터를 쓰되 없는 필드만 뺀다.
 
     args:
         source_id: 이번 실행의 소스 id.
@@ -143,13 +116,18 @@ def configure_batch_logging(
     returns:
         설정이 끝난 root 로거.
     """
+    return _install_root_handler(_FixedFieldsFilter(source_id=source_id), level, stream)
+
+
+def _install_root_handler(
+    fields: logging.Filter, level: int, stream
+) -> logging.Logger:
     root = logging.getLogger()
     root.handlers.clear()
     root.setLevel(level)
 
     handler = logging.StreamHandler(stream if stream is not None else sys.stdout)
     handler.setFormatter(_KeyValueFormatter())
-    handler.addFilter(_SourceOnlyFilter(source_id))
+    handler.addFilter(fields)
     root.addHandler(handler)
-
     return root
