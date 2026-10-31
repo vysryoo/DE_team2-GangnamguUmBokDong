@@ -80,7 +80,6 @@ def test_refresh_feature_mart_runs_between_create_cluster_and_evaluate() -> None
     assert refresh_return.downstream_task_ids == {"evaluate_return"}
 
 
-
 def test_check_retrain_branch_decisions() -> None:
     """needs_retrain 값에 따라 올바른(모델 접미사가 붙은) 다운스트림 태스크로 분기한다."""
     mock_ti = MagicMock()
@@ -173,14 +172,6 @@ def test_refresh_feature_mart_waits_for_yarn_nodes_before_spark_steps(monkeypatc
 
     assert submitted_names[0] == "Wait-YARN-Nodes"
     assert submitted_names.index("Wait-YARN-Nodes") < submitted_names.index("Spark-RunPipeline-leaves127")
-
-
-def test_wait_for_yarn_nodes_step_checks_running_count() -> None:
-    name, command = monthly_dag._wait_for_yarn_nodes_step(3)
-    assert name == "Wait-YARN-Nodes"
-    assert command[:2] == ["bash", "-c"]
-    assert "yarn node -list -all" in command[2]
-    assert "-ge 3" in command[2]
 
 
 def test_refresh_feature_mart_falls_back_to_builtin_default_when_no_champion(monkeypatch) -> None:
@@ -558,72 +549,6 @@ def test_stop_mlflow_does_not_raise_when_docker_action_fails(monkeypatch) -> Non
     monkeypatch.setattr(monthly_dag, "_docker_mlflow_container_action", _boom)
 
     monthly_dag._stop_mlflow(params={})  # raise하지 않아야 한다
-
-
-def test_feature_mart_spark_steps_use_runpy_launcher_not_raw_script_path() -> None:
-    """패키지 상대 import를 쓰는 스크립트라 파일 경로 대신 runpy launcher로 제출한다."""
-    run_pipeline_step, multi_horizon_step = monthly_dag._feature_mart_spark_steps("some-profile")
-
-    for _name, command in (run_pipeline_step, multi_horizon_step):
-        assert command[:2] == ["bash", "-c"]
-        script = command[2]
-        # spark-submit의 마지막 인자(primary python file)는 launcher(/tmp/_spark_entry*.py)여야
-        # 한다 — feature_engine 안의 실제 스크립트 경로를 직접 넘기면 안 된다.
-        primary_file = script.strip().splitlines()[-1].split()[-1]
-        assert primary_file.startswith("/tmp/_spark_entry")
-        assert "feature_engine/spark/run_pipeline.py" not in script
-        assert "feature_engine/spark/build_multi_horizon_features.py" not in script
-
-    assert 'runpy.run_module("feature_engine.spark.run_pipeline"' in run_pipeline_step[1][2]
-    assert 'runpy.run_module("feature_engine.spark.build_multi_horizon_features"' in multi_horizon_step[1][2]
-    # 이 두 모듈은 자기 코드 안에서 get_spark()로 SparkSession을 직접 만드므로,
-    # launcher가 대신 더미 SparkSession을 끼워 넣을 필요가 없다(그건
-    # _yarn_python_module_step()처럼 Spark를 전혀 안 쓰는 모듈에만 필요하다).
-    assert "SparkSession.builder.getOrCreate()" not in run_pipeline_step[1][2]
-    assert "SparkSession.builder.getOrCreate()" not in multi_horizon_step[1][2]
-
-
-def test_feature_mart_spark_steps_num_executors_scales_with_core_count() -> None:
-    """`--num-executors`는 실제 클러스터 core 노드 수를 따라간다."""
-    default_step, _ = monthly_dag._feature_mart_spark_steps("some-profile")
-    scaled_step, _ = monthly_dag._feature_mart_spark_steps("some-profile", core_instance_count=8)
-
-    assert f"--num-executors {monthly_dag.CORE_INSTANCE_COUNT - 1}" in default_step[1][2]
-    assert "--num-executors 7" in scaled_step[1][2]
-
-
-def test_yarn_python_module_step_wraps_in_distributed_shell_with_small_am_heap() -> None:
-    """master OOM을 피해 YARN distributed-shell로 실행하고, 기본 AM 힙이 부족하므로 명시한다."""
-    name, command = monthly_dag._yarn_python_module_step(
-        "Evaluate-rental",
-        "training.scripts.monthly_retrain_check",
-        ["--check-only", "--models", "rental", "--result-s3-key", "some/key.json"],
-    )
-    assert name == "Evaluate-rental"
-    assert command[:2] == ["bash", "-c"]
-    script = command[2]
-    assert "org.apache.hadoop.yarn.applications.distributedshell.Client" in script
-    assert "-num_containers 1" in script
-    assert f"-master_memory {monthly_dag._YARN_AM_MEMORY_MB}" in script
-    assert f"-master_vcores {monthly_dag._YARN_AM_VCORES}" in script
-    assert "-shell_command 'cd /opt/gng && PYTHONPATH=/opt/gng python3.11 -m training.scripts.monthly_retrain_check --check-only --models rental --result-s3-key some/key.json'" in script
-
-
-def test_yarn_python_module_step_passes_env_via_shell_env() -> None:
-    """학습 스텝의 LGB_NUM_MACHINES/LGB_TREE_LEARNER는 distributed-shell
-    컨테이너가 부모 프로세스 환경을 상속하지 않으므로 -shell_env로 명시해야
-    한다(training/scripts/monthly_retrain_check.py의 같은 제약과 동일)."""
-    _name, command = monthly_dag._yarn_python_module_step(
-        "Train-rental-profile-a",
-        "training.scripts.monthly_retrain_check",
-        ["--execute"],
-        env={"LGB_NUM_MACHINES": "8", "LGB_TREE_LEARNER": "data"},
-    )
-    script = command[2]
-    assert "-shell_env LGB_NUM_MACHINES=8" in script
-    assert "-shell_env LGB_TREE_LEARNER=data" in script
-    assert f"-shell_env S3_BUCKET={monthly_dag.S3_BUCKET}" in script
-    assert f"-shell_env PYTHONPATH={monthly_dag._EMR_PYTHONPATH}" in script
 
 
 def test_extract_profile_feature_params_handles_uppercase_and_defaults() -> None:

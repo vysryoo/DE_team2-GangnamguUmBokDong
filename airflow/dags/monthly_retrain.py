@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
@@ -33,15 +34,18 @@ from config.schedules import (
 )
 from orchestration.aws_infra_task import (
     EMR_CORE_INSTANCE_TYPE,
-    EMR_MLFLOW_TRACKING_URI,
     MOCK_OVERRIDE_FORCE_MOCK,
     MODELS_PREFIX,
-    S3_BUCKET,
     TRAINING_RUNS_PREFIX,
     create_emr_cluster,
     read_s3_json,
     submit_emr_step,
     terminate_emr_cluster,
+)
+from orchestration.emr_steps import (
+    feature_mart_steps,
+    wait_for_yarn_nodes_step,
+    yarn_python_module_step,
 )
 
 logger = logging.getLogger(__name__)
@@ -52,15 +56,9 @@ MODEL_EXECUTION_ORDER = ("rental", "return")
 CORE_INSTANCE_COUNT = 8
 # YARN distributed-shell의 outer AM, outer worker, inner AM이 차지하는 노드 수
 _WRAPPER_NODE_RESERVATION = 3
-_EMR_PYTHONPATH = "/opt/gng"
 _DEFAULT_PROFILE = "builtin-default"
 # 스모크 테스트용 프로필. 격리된 S3 경로를 사용함
 TEST_ONLY_PROFILE_NAME = "a-test-sparse-flat"
-
-_YARN_DISTRIBUTED_SHELL_JAR_SEARCH_ROOTS = ("/usr/lib/hadoop-yarn", "/usr/lib/hadoop", "/opt/hadoop")
-# 기본 AM 힙(100MB)으로는 distributed-shell AM이 죽음
-_YARN_AM_MEMORY_MB = 1024
-_YARN_AM_VCORES = 1
 
 _MLFLOW_COMPOSE_SERVICE_LABEL = "com.docker.compose.service=mlflow"
 
@@ -183,12 +181,26 @@ def _build_model_chain(model_name: str, trigger_rule: str) -> tuple[PythonOperat
     return refresh_feature_mart, ends
 
 
-def _mock_override(context: dict[str, Any]) -> str | None:
-    return context["params"].get("mock_mode")
+@dataclass(frozen=True)
+class _RunParams:
+    """DAG run params를 태스크마다 다시 해석하지 않도록 한 번에 읽은 값이다."""
 
+    mock_override: str | None
+    core_instance_count: int
+    core_instance_type: str | None
+    force_refresh: bool
+    test_profile_only: bool
 
-def _core_instance_count(context: dict[str, Any]) -> int:
-    return context["params"].get("emr_core_instance_count") or CORE_INSTANCE_COUNT
+    @classmethod
+    def from_context(cls, context: dict[str, Any]) -> _RunParams:
+        params = context["params"]
+        return cls(
+            mock_override=params.get("mock_mode"),
+            core_instance_count=params.get("emr_core_instance_count") or CORE_INSTANCE_COUNT,
+            core_instance_type=params.get("emr_core_instance_type") or None,
+            force_refresh=bool(params.get("force_refresh_feature_mart", False)),
+            test_profile_only=bool(params.get("test_profile_only")),
+        )
 
 
 def _resolve_wrapper_worker_count(core_instance_count: int) -> int:
@@ -211,111 +223,6 @@ def _result_s3_key(run_id: str, name: str) -> str:
 
 def _cluster_id(ti: Any) -> str | None:
     return ti.xcom_pull(task_ids="create_cluster", key="cluster_id")
-
-
-def _spark_module_launcher_command(
-    module: str, spark_args: list[str], app_args: list[str]
-) -> list[str]:
-    # feature_engine 스크립트는 패키지 상대 import를 쓰므로 파일 경로로 제출하면
-    # __main__으로 실행돼 실패함. runpy launcher로 python -m과 같게 실행함
-    entry_path = f"/tmp/_spark_entry_{module.rsplit('.', 1)[-1]}.py"
-    launcher = (
-        f"cat > {entry_path} <<'PYEOF'\n"
-        "import runpy\n"
-        f'runpy.run_module("{module}", run_name="__main__")\n'
-        "PYEOF\n"
-    )
-    spark_submit = " ".join(
-        ["spark-submit", "--deploy-mode", "cluster", "--master", "yarn", *spark_args, entry_path, *app_args]
-    )
-    return ["bash", "-c", launcher + spark_submit]
-
-
-def _yarn_python_module_step(
-    name: str, module: str, app_args: list[str], env: dict[str, str] | None = None
-) -> tuple[str, list[str]]:
-    # master 노드에서 직접 실행하면 EMR 데몬과 메모리를 다퉈 OOM이 나므로 core 노드의
-    # YARN 컨테이너에서 실행함. 컨테이너는 부모 환경을 상속하지 않아 -shell_env로 넘김
-    shell_env = {"S3_BUCKET": S3_BUCKET, "PYTHONPATH": _EMR_PYTHONPATH, **(env or {})}
-    if EMR_MLFLOW_TRACKING_URI:
-        shell_env["MLFLOW_TRACKING_URI"] = EMR_MLFLOW_TRACKING_URI
-    shell_env_args = " ".join(f"-shell_env {key}={value}" for key, value in shell_env.items())
-    shell_command = (
-        f"cd {_EMR_PYTHONPATH} && PYTHONPATH={_EMR_PYTHONPATH} "
-        f"python3.11 -m {module} {' '.join(app_args)}"
-    )
-    search_roots = " ".join(_YARN_DISTRIBUTED_SHELL_JAR_SEARCH_ROOTS)
-    script = (
-        f"JAR=$(find {search_roots} -iname '*distributedshell*.jar' 2>/dev/null | head -1); "
-        'if [ -z "$JAR" ]; then echo "distributed-shell jar를 찾을 수 없습니다" >&2; exit 1; fi; '
-        "yarn org.apache.hadoop.yarn.applications.distributedshell.Client "
-        f'-jar "$JAR" -shell_command \'{shell_command}\' '
-        "-num_containers 1 -container_memory 6144 -container_vcores 2 "
-        f"-master_memory {_YARN_AM_MEMORY_MB} -master_vcores {_YARN_AM_VCORES} "
-        "-timeout 345600000 "
-        f"{shell_env_args}"
-    )
-    return name, ["bash", "-c", script]
-
-
-def _feature_mart_spark_steps(
-    profile: str,
-    core_instance_count: int = CORE_INSTANCE_COUNT,
-    model_name: str | None = None,
-    force: bool = False,
-) -> tuple[tuple[str, list[str]], tuple[str, list[str]]]:
-    # run_pipeline은 watermark 기반 증분이라 반복 호출해도 안전함
-    spark_args = [
-        # get_spark()가 YARN 실행임을 판단하는 유일한 신호
-        "--conf", "spark.yarn.appMasterEnv.SPARK_ON_YARN=1",
-        "--conf", "spark.executorEnv.SPARK_ON_YARN=1",
-        "--conf", f"spark.yarn.appMasterEnv.ML_PROFILE={profile}",
-        "--conf", f"spark.executorEnv.ML_PROFILE={profile}",
-        # 없으면 ml/feature_engine/spark/config.py가 local-dev 버킷을 씀
-        "--conf", f"spark.yarn.appMasterEnv.S3_BUCKET={S3_BUCKET}",
-        "--conf", f"spark.executorEnv.S3_BUCKET={S3_BUCKET}",
-        "--conf", f"spark.yarn.appMasterEnv.PYTHONPATH={_EMR_PYTHONPATH}",
-        "--conf", f"spark.executorEnv.PYTHONPATH={_EMR_PYTHONPATH}",
-        "--conf", "spark.pyspark.python=/usr/bin/python3.11",
-        "--conf", "spark.pyspark.driver.python=/usr/bin/python3.11",
-        # m4.large 노드당 YARN 컨테이너 상한이 약 6GB임. 기본 2g 힙은 watermark 없는
-        # 최초 실행에서 죽었고, executor를 노드 수보다 하나 적게 잡아 AM 자리를 남김
-        "--driver-memory", "4g",
-        "--executor-memory", "4g",
-        "--num-executors", str(max(core_instance_count - 1, 1)),
-        "--conf", "spark.yarn.am.waitTime=1800s",
-        "--conf", "spark.sql.shuffle.partitions=24",
-        "--conf", "spark.hadoop.fs.s3a.buffer.dir=/mnt/tmp",
-        "--conf",
-        "spark.hadoop.fs.s3a.aws.credentials.provider=org.apache.hadoop.fs.s3a.auth.IAMInstanceCredentialsProvider",
-    ]
-    force_args = ["--force"] if force else []
-    model_args = ["--models", model_name] if model_name else []
-    return (
-        (
-            f"Spark-RunPipeline-{profile}",
-            _spark_module_launcher_command(
-                "feature_engine.spark.run_pipeline", spark_args, force_args
-            ),
-        ),
-        (
-            f"Spark-BuildMultiHorizon-{profile}",
-            _spark_module_launcher_command(
-                "feature_engine.spark.build_multi_horizon_features",
-                spark_args,
-                model_args + force_args,
-            ),
-        ),
-    )
-
-
-def _wait_for_yarn_nodes_step(count: int) -> tuple[str, list[str]]:
-    # 클러스터가 WAITING이 된 직후에는 YARN이 AM 등록을 받지 못해 첫 스텝이 죽을 수 있음
-    return "Wait-YARN-Nodes", [
-        "bash",
-        "-c",
-        f"until [ $(yarn node -list -all 2>/dev/null | grep -c RUNNING) -ge {count} ]; do sleep 15; done",
-    ]
 
 
 def _champion_profile_name(model_name: str) -> str | None:
@@ -381,12 +288,12 @@ def _is_feature_mart_fresh(profile: str, model_name: str, max_age_hours: float =
 
 
 def _create_cluster(**context: Any) -> str:
-    params = context["params"]
+    run = _RunParams.from_context(context)
     cluster_id = create_emr_cluster(
         cluster_name="ml-monthly-retrain",
-        core_instance_count=_core_instance_count(context),
-        core_instance_type=params.get("emr_core_instance_type") or None,
-        mock_override=_mock_override(context),
+        core_instance_count=run.core_instance_count,
+        core_instance_type=run.core_instance_type,
+        mock_override=run.mock_override,
     )
     context["ti"].xcom_push(key="cluster_id", value=cluster_id)
     return cluster_id
@@ -394,43 +301,44 @@ def _create_cluster(**context: Any) -> str:
 
 def _refresh_feature_mart(model_name: str, **context: Any) -> None:
     ti = context["ti"]
-    params = context["params"]
-    mock_override = _mock_override(context)
+    run = _RunParams.from_context(context)
     cluster_id = _cluster_id(ti)
-    core_count = _core_instance_count(context)
 
     submit_emr_step(
         cluster_id,
-        *_wait_for_yarn_nodes_step(core_count),
+        *wait_for_yarn_nodes_step(run.core_instance_count),
         timeout_seconds=1200,
-        mock_override=mock_override,
+        mock_override=run.mock_override,
     )
-    if params.get("test_profile_only"):
+    if run.test_profile_only:
         logger.info("[%s] test_profile_only — 챔피언 피처마트 갱신 스킵", model_name)
         return
 
-    force = bool(params.get("force_refresh_feature_mart", False))
     profile = _champion_profile_name(model_name) or _DEFAULT_PROFILE
-    if not force and _is_feature_mart_fresh(profile, model_name):
+    if not run.force_refresh and _is_feature_mart_fresh(profile, model_name):
         logger.info("[%s] 프로필 '%s' 피처마트가 24시간 이내 갱신됨 — Spark 스텝 스킵", model_name, profile)
     else:
-        logger.info("[%s] 프로필 '%s' 피처마트 %s", model_name, profile, "전체 재생성" if force else "증분 갱신")
-        _submit_feature_mart_steps(cluster_id, profile, model_name, force=force, context=context)
+        logger.info(
+            "[%s] 프로필 '%s' 피처마트 %s",
+            model_name, profile, "전체 재생성" if run.force_refresh else "증분 갱신",
+        )
+        _submit_feature_mart_steps(cluster_id, profile, model_name, run)
     ti.xcom_push(key="profile", value=profile)
 
 
 def _submit_feature_mart_steps(
-    cluster_id: str, profile: str, model_name: str, *, force: bool, context: dict[str, Any]
+    cluster_id: str, profile: str, model_name: str, run: _RunParams
 ) -> None:
-    for step_name, spark_args in _feature_mart_spark_steps(
-        profile, _core_instance_count(context), model_name=model_name, force=force
+    for step_name, command in feature_mart_steps(
+        profile, run.core_instance_count, model_name=model_name, force=run.force_refresh
     ):
-        submit_emr_step(cluster_id, step_name, spark_args, mock_override=_mock_override(context))
+        submit_emr_step(cluster_id, step_name, command, mock_override=run.mock_override)
 
 
 def _evaluate(model_name: str, **context: Any) -> dict[str, Any]:
     ti = context["ti"]
-    if context["params"].get("test_profile_only"):
+    run = _RunParams.from_context(context)
+    if run.test_profile_only:
         logger.info("[%s] test_profile_only — 평가 없이 '%s' 프로필로 재학습", model_name, TEST_ONLY_PROFILE_NAME)
         summary = {"needs_retrain": True, "candidate_profiles": [TEST_ONLY_PROFILE_NAME]}
         ti.xcom_push(key="needs_retrain", value=True)
@@ -438,12 +346,12 @@ def _evaluate(model_name: str, **context: Any) -> dict[str, Any]:
         return summary
 
     result_key = _result_s3_key(context["run_id"], f"eval-{model_name}")
-    eval_num_workers = _resolve_wrapper_worker_count(_core_instance_count(context))
+    eval_num_workers = _resolve_wrapper_worker_count(run.core_instance_count)
     profile = (
         ti.xcom_pull(task_ids=_task_id(model_name, "refresh_feature_mart"), key="profile")
         or _DEFAULT_PROFILE
     )
-    name, command = _yarn_python_module_step(
+    name, command = yarn_python_module_step(
         f"Evaluate-{model_name}",
         "training.scripts.monthly_retrain_check",
         [
@@ -452,7 +360,7 @@ def _evaluate(model_name: str, **context: Any) -> dict[str, Any]:
         ],
         env={"ML_PROFILE": profile},
     )
-    submit_emr_step(_cluster_id(ti), name, command, mock_override=_mock_override(context))
+    submit_emr_step(_cluster_id(ti), name, command, mock_override=run.mock_override)
 
     summary = read_s3_json(result_key) or {
         "needs_retrain": True,
@@ -472,13 +380,11 @@ def _choose_retrain_branch(model_name: str, **context: Any) -> str:
 
 
 def _train_profile(
-    model_name: str, profile: str, cluster_id: str, context: dict[str, Any]
+    model_name: str, profile: str, cluster_id: str, run: _RunParams, run_id: str
 ) -> bool:
-    params = context["params"]
-    force = bool(params.get("force_refresh_feature_mart", False))
-    _submit_feature_mart_steps(cluster_id, profile, model_name, force=force, context=context)
+    _submit_feature_mart_steps(cluster_id, profile, model_name, run)
 
-    result_key = _result_s3_key(context["run_id"], f"train-{model_name}-{profile}")
+    result_key = _result_s3_key(run_id, f"train-{model_name}-{profile}")
     train_args = [
         "--execute",
         "--performance-already-checked",
@@ -487,14 +393,14 @@ def _train_profile(
         "--models", model_name,
         "--result-s3-key", result_key,
     ]
-    if params.get("test_profile_only"):
+    if run.test_profile_only:
         train_args.append("--no-promote")
-    name, command = _yarn_python_module_step(
+    name, command = yarn_python_module_step(
         f"Train-{model_name}-{profile}",
         "training.scripts.monthly_retrain_check",
         train_args,
         env={
-            "LGB_NUM_MACHINES": str(_resolve_wrapper_worker_count(_core_instance_count(context))),
+            "LGB_NUM_MACHINES": str(_resolve_wrapper_worker_count(run.core_instance_count)),
             "LGB_TREE_LEARNER": "data",
         },
     )
@@ -503,7 +409,7 @@ def _train_profile(
         name,
         command,
         timeout_seconds=int(MONTHLY_TRAINING_TIMEOUT.total_seconds()),
-        mock_override=_mock_override(context),
+        mock_override=run.mock_override,
     )
     summary = read_s3_json(result_key) or {"promoted": {model_name: False}}
     return bool(summary.get("promoted", {}).get(model_name))
@@ -511,19 +417,21 @@ def _train_profile(
 
 def _orchestrate_retrain_loop(model_name: str, **context: Any) -> dict[str, Any]:
     ti = context["ti"]
+    run = _RunParams.from_context(context)
     cluster_id = _cluster_id(ti)
     candidate_profiles = (
         ti.xcom_pull(task_ids=_task_id(model_name, "evaluate"), key="candidate_profiles")
         or [_DEFAULT_PROFILE]
     )
-    _resolve_wrapper_worker_count(_core_instance_count(context))
+    # 학습 스텝을 제출하기 전에 core 노드 수 부족을 먼저 실패시킴
+    _resolve_wrapper_worker_count(run.core_instance_count)
     logger.info("[%s] 챌린저 재학습 시작 (후보 프로필: %s)", model_name, candidate_profiles)
 
     # 한 프로필이 실패해도 다음 후보를 시도하고, 승격되면 멈춤
     results_by_profile: dict[str, Any] = {}
     for profile in candidate_profiles:
         try:
-            promoted = _train_profile(model_name, profile, cluster_id, context)
+            promoted = _train_profile(model_name, profile, cluster_id, run, context["run_id"])
         except (RuntimeError, OSError, ValueError, TimeoutError) as exc:
             logger.error("[%s 프로필: %s] 재학습 중 오류 발생: %s", model_name, profile, exc)
             results_by_profile[profile] = {"status": "failed", "error": str(exc)}
@@ -540,7 +448,7 @@ def _terminate_cluster(**context: Any) -> None:
     if not cluster_id:
         logger.warning("cluster_id 없음(생성 실패) — 종료할 클러스터 없음")
         return
-    terminate_emr_cluster(cluster_id, mock_override=_mock_override(context))
+    terminate_emr_cluster(cluster_id, mock_override=_RunParams.from_context(context).mock_override)
 
 
 def _docker_mlflow_container_action(action: str) -> None:
@@ -562,7 +470,7 @@ def _docker_mlflow_container_action(action: str) -> None:
 
 
 def _start_mlflow(**context: Any) -> None:
-    if _mock_override(context) == MOCK_OVERRIDE_FORCE_MOCK:
+    if _RunParams.from_context(context).mock_override == MOCK_OVERRIDE_FORCE_MOCK:
         return
     try:
         _docker_mlflow_container_action("start")
@@ -571,7 +479,7 @@ def _start_mlflow(**context: Any) -> None:
 
 
 def _stop_mlflow(**context: Any) -> None:
-    if _mock_override(context) == MOCK_OVERRIDE_FORCE_MOCK:
+    if _RunParams.from_context(context).mock_override == MOCK_OVERRIDE_FORCE_MOCK:
         return
     try:
         _docker_mlflow_container_action("stop")
