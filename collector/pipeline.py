@@ -25,7 +25,13 @@ from core.source_snapshot import SourceSnapshotStatus
 
 import manifest as manifest_module
 import storage
-from adapters.base import FetchErrorKind, Window, fetch_with_rounds, get_adapter
+from adapters.base import (
+    FetchErrorKind,
+    FetchRoundResult,
+    Window,
+    fetch_with_rounds,
+    get_adapter,
+)
 from config.schema import SourceConfig
 from manifest import (
     Artifacts,
@@ -193,12 +199,10 @@ def _load_bronze(
 
     if existing and existing.stage >= Stage.BRONZE_WRITTEN and not force:
         revision = existing.artifacts.bronze.revision
-        chunks, missing_keys, expected_total = _reuse_bronze(
-            source_id, window_start, existing
-        )
+        fetched = _reuse_bronze(source_id, window_start, existing)
     else:
         revision = storage.next_bronze_revision(source_id, window_start)
-        result = fetch_with_rounds(
+        fetched = fetch_with_rounds(
             adapter_cls.fetch,
             config,
             window,
@@ -209,11 +213,8 @@ def _load_bronze(
             ),
             planned_parts=planned_parts,
         )
-        chunks, missing_keys, expected_total = (
-            result.chunks, result.missing, result.expected_total
-        )
 
-    bronze_parts = tuple(sorted(chunks))
+    bronze_parts = tuple(sorted(fetched.chunks))
     return _WindowRun(
         config=config,
         window=window,
@@ -225,26 +226,29 @@ def _load_bronze(
             parts=bronze_parts,
             revision=revision,
         ),
-        chunks=chunks,
-        missing_keys=missing_keys,
-        expected_total=expected_total,
+        chunks=fetched.chunks,
+        missing_keys=fetched.missing,
+        expected_total=fetched.expected_total,
         planned_parts=_effective_plan(
-            planned_parts, bronze_parts, tuple(sorted(missing_keys))
+            planned_parts, bronze_parts, tuple(sorted(fetched.missing))
         ),
     )
 
 
 def _reuse_bronze(
     source_id: str, window_start: datetime, existing: Manifest
-) -> tuple[dict[str, bytes], dict[str, FetchErrorKind], int | None]:
-    """manifest가 가리키는 Bronze revision을 읽어 (조각, 누락, 전체 행 수)를 복원한다."""
+) -> FetchRoundResult:
+    """manifest가 가리키는 Bronze revision을 읽어 fetch 결과를 복원한다."""
     parts = existing.artifacts.bronze.parts
     payloads = storage.read_bronze(
         source_id, window_start, parts, existing.artifacts.bronze.revision
     )
     # 조각을 다시 받지 않으므로 실패 종류는 게이트 계산에 영향이 없다.
-    missing_keys = {key: FetchErrorKind.PERMANENT for key in existing.missing.parts}
-    return dict(zip(parts, payloads)), missing_keys, existing.counts.expected
+    return FetchRoundResult(
+        chunks=dict(zip(parts, payloads)),
+        missing={key: FetchErrorKind.PERMANENT for key in existing.missing.parts},
+        expected_total=existing.counts.expected,
+    )
 
 
 def _fail_if_fetch_aborted(run: _WindowRun) -> Manifest | None:
@@ -272,11 +276,9 @@ def _check_completeness(run: _WindowRun, fetched_rows: int) -> _Completeness | M
     게이트에 걸리면 FAILED manifest를, 통과하면 확정한 완결도 정보를 반환한다.
     """
     quality = run.config.quality
-    expected_total = run.expected_total
-    if _is_probe(run.config):
-        # probe의 expected_total은 종료 페이지를 봤다는 표시일 뿐이다. 재시도 라운드는
-        # 이미 받은 page를 건너뛰므로 전체 Bronze의 실제 행 수로 확정한다.
-        expected_total = fetched_rows
+    # probe의 expected_total은 종료 페이지를 봤다는 표시일 뿐이다. 재시도 라운드는
+    # 이미 받은 page를 건너뛰므로 전체 Bronze의 실제 행 수로 확정한다.
+    expected_total = fetched_rows if _is_probe(run.config) else run.expected_total
     parts_summary = f"{len(run.chunks)}/{len(run.chunks) + len(run.missing_keys)}"
 
     def fail(detail: str) -> Manifest:
@@ -311,6 +313,18 @@ def _check_completeness(run: _WindowRun, fetched_rows: int) -> _Completeness | M
     ):
         return fail(f"parts={parts_summary} missing_ratio={ratio:.3f}")
 
+    _log_bronze_written(run, parts_summary, fetched_rows, ratio)
+    return _Completeness(
+        expected_total=expected_total,
+        ratio=ratio,
+        missing=_build_missing(run.missing_keys, expected_total, fetched_rows),
+    )
+
+
+def _log_bronze_written(
+    run: _WindowRun, parts_summary: str, fetched_rows: int, ratio: float
+) -> None:
+    """bronze_written 단계 경계 로그 한 줄을 남긴다."""
     bronze_bytes = sum(len(v) for v in run.chunks.values())
     summary = f"stage=bronze_written parts={parts_summary} rows={fetched_rows} bytes={bronze_bytes}"
     if run.missing_keys:
@@ -320,11 +334,6 @@ def _check_completeness(run: _WindowRun, fetched_rows: int) -> _Completeness | M
         )
     else:
         logger.info(summary)
-    return _Completeness(
-        expected_total=expected_total,
-        ratio=ratio,
-        missing=_build_missing(run.missing_keys, expected_total, fetched_rows),
-    )
 
 
 def _finish_empty(run: _WindowRun, completeness: _Completeness) -> Manifest:
