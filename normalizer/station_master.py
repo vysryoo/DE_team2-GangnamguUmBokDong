@@ -66,10 +66,8 @@ def _valid_wgs84(lat: object, lon: object) -> bool:
 def _station_no(station_id: str) -> int:
     """`ST-<숫자>` station_id에서 모델용 int16 정류소 번호를 추출한다.
 
-    `bike_station_master.ADDR2`는 실제 데이터에서 정류소 번호와 한글 상세주소가
-    섞여 있으므로 모델의 범주 키로 사용할 수 없다. 정류소 식별자인 `RNTLS_ID`의
-    숫자 suffix만 허용하고, Spark `ShortType` 및 모델 스키마와 같은 양의 int16
-    범위를 벗어나면 보강 snapshot 전체를 fail-closed한다.
+    `ADDR2`는 번호와 상세주소가 섞여 범주 키로 쓸 수 없어 `RNTLS_ID`의 숫자 suffix만 쓴다.
+    모델 스키마의 양의 int16 범위를 벗어나면 보강 snapshot 전체를 실패시킨다.
 
     raises:
         ValueError: station_id 형식이 잘못됐거나 숫자 suffix가 양의 int16 범위 밖일 때
@@ -101,6 +99,51 @@ def _realtime_by_station(table: pa.Table | None) -> dict[str, dict]:
     }
 
 
+def _grid_index(grid_table: pa.Table) -> tuple[list[str], list, STRtree]:
+    """baseline의 고유 CELL_ID와 그 폴리곤, 공간 인덱스를 만든다. 24시간 행은 하나로 합친다."""
+    cell_ids = sorted(
+        {
+            str(row["CELL_ID"])
+            for row in grid_table.to_pylist()
+            if row.get("CELL_ID") is not None
+        }
+    )
+    if not cell_ids:
+        raise ValueError("living_population_grid에 CELL_ID가 없음")
+    polygons = [grid.cell_id_to_polygon(cell_id) for cell_id in cell_ids]
+    return cell_ids, polygons, STRtree(polygons)
+
+
+def _station_coordinates(raw: dict, live: dict) -> tuple[float | None, float | None]:
+    """API master 좌표가 0이거나 결측이면 최신 실시간 대여소 좌표를 쓴다."""
+    lat = raw.get("LAT")
+    lon = raw.get("LOT")
+    if not _valid_wgs84(lat, lon) and _valid_wgs84(
+        live.get("stationLatitude"), live.get("stationLongitude")
+    ):
+        lat = live.get("stationLatitude")
+        lon = live.get("stationLongitude")
+    return _number(lat), _number(lon)
+
+
+def _coverage_metrics(rows: list[dict]) -> dict[str, int | float]:
+    """CELL_ID 매핑률을 계산하고 기준 미달이면 실패시킨다."""
+    if not rows:
+        raise ValueError("bike_station_master에 유효한 대여소가 없음")
+    mapped_count = sum(row["grid_id"] is not None for row in rows)
+    coverage = mapped_count / len(rows)
+    if coverage < MIN_GRID_COVERAGE:
+        raise ValueError(
+            f"station master CELL_ID 매핑률이 기준 미달: {coverage:.3%} < {MIN_GRID_COVERAGE:.1%}"
+        )
+    return {
+        "station_count": len(rows),
+        "grid_mapped_count": mapped_count,
+        "grid_unmapped_count": len(rows) - mapped_count,
+        "grid_coverage": coverage,
+    }
+
+
 def enrich_station_master(
     master_table: pa.Table,
     grid_table: pa.Table,
@@ -112,18 +155,7 @@ def enrich_station_master(
     격자 목록은 생활인구 baseline의 CELL_ID에서 가져오며 동일 CELL_ID의 24시간
     행은 하나로 중복 제거한다.
     """
-    cell_ids = sorted(
-        {
-            str(row["CELL_ID"])
-            for row in grid_table.to_pylist()
-            if row.get("CELL_ID") is not None
-        }
-    )
-    if not cell_ids:
-        raise ValueError("living_population_grid에 CELL_ID가 없음")
-
-    polygons = [grid.cell_id_to_polygon(cell_id) for cell_id in cell_ids]
-    tree = STRtree(polygons)
+    cell_ids, polygons, tree = _grid_index(grid_table)
     realtime = _realtime_by_station(realtime_table)
 
     rows_by_station: dict[str, dict] = {}
@@ -132,27 +164,14 @@ def enrich_station_master(
             continue
         station_id = str(raw["RNTLS_ID"])
         live = realtime.get(station_id, {})
-
-        lat = raw.get("LAT")
-        lon = raw.get("LOT")
-        if not _valid_wgs84(lat, lon) and _valid_wgs84(
-            live.get("stationLatitude"), live.get("stationLongitude")
-        ):
-            lat = live.get("stationLatitude")
-            lon = live.get("stationLongitude")
-
-        latitude = _number(lat)
-        longitude = _number(lon)
+        latitude, longitude = _station_coordinates(raw, live)
         grid_id = None
         weather_nx = weather_ny = None
-        # 좌표가 유효할 때만 계산한다 — LAT/LOT가 0인 대여소는 _number()가 0.0을
-        # 돌려주므로, 이 가드 없이는 적도상 엉뚱한 격자 번호가 실린다.
+        # LAT/LOT가 0인 대여소도 _number()는 0.0을 돌려주므로 적도의 엉뚱한 격자를 막음
         if _valid_wgs84(latitude, longitude):
             weather_nx, weather_ny = latlon_to_grid(latitude, longitude)
-            x, y = _TO_EPSG5179.transform(longitude, latitude)
-            point = Point(x, y)
-            candidates = tree.query(point)
-            matches = [int(index) for index in candidates if polygons[int(index)].covers(point)]
+            point = Point(*_TO_EPSG5179.transform(longitude, latitude))
+            matches = [int(index) for index in tree.query(point) if polygons[int(index)].covers(point)]
             if matches:
                 grid_id = cell_ids[matches[0]]
 
@@ -170,20 +189,8 @@ def enrich_station_master(
         }
 
     rows = list(rows_by_station.values())
-    if not rows:
-        raise ValueError("bike_station_master에 유효한 대여소가 없음")
-    mapped_count = sum(row["grid_id"] is not None for row in rows)
-    coverage = mapped_count / len(rows)
-    if coverage < MIN_GRID_COVERAGE:
-        raise ValueError(
-            f"station master CELL_ID 매핑률이 기준 미달: {coverage:.3%} < {MIN_GRID_COVERAGE:.1%}"
-        )
-    return pa.Table.from_pylist(rows, schema=_OUTPUT_SCHEMA), {
-        "station_count": len(rows),
-        "grid_mapped_count": mapped_count,
-        "grid_unmapped_count": len(rows) - mapped_count,
-        "grid_coverage": coverage,
-    }
+    metrics = _coverage_metrics(rows)
+    return pa.Table.from_pylist(rows, schema=_OUTPUT_SCHEMA), metrics
 
 
 def run(window_start: datetime) -> int:
