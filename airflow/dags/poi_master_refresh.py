@@ -10,7 +10,7 @@ from config.schedules import (
     POI_MASTER_REFRESH_CRON,
     TIMEZONE,
 )
-from orchestration.poi_master_task import build_poi_master_refresh_task
+from orchestration.refine_task import build_poi_master_refresh_task
 
 with DAG(
     dag_id="poi_master_refresh",

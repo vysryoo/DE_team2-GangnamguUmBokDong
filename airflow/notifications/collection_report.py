@@ -1,7 +1,4 @@
-"""수집 통계(collector --report-window-stats의 JSON)를 사람이 읽을 Slack 메시지로
-바꾸는 순수 함수들. Airflow에 의존하지 않아 두 DAG(daily/hourly)와 테스트가 그대로
-재사용한다.
-"""
+"""collector ``--report-window-stats`` JSON을 Slack 메시지로 바꾸는 순수 함수."""
 
 from __future__ import annotations
 
@@ -24,13 +21,15 @@ def _ratio(numerator: int, denominator: int) -> float:
 
 
 def evaluate_source_stats(source_id: str, stats: dict) -> SourceStatEvaluation:
-    """소스 하나의 통계를 alert_policy.yaml 기준과 비교해 위험 여부를 판정한다.
+    """소스 하나의 실행 실패율과 행 drop 비율을 alert_policy.yaml 기준과 비교한다.
 
-    전부 행(row) 단위다 — 실행(run) 중 몇 번이 실패했는지, 가져온 행 중 몇 행이
-    버려졌는지만 본다. 컬럼 값 단위 결측·이상치 비율은 쓰지 않는다: 소스마다
-    "정상 기준선"이 크게 달라(예: 비회원 대여의 성별·생년 컬럼은 평소에도 결측이
-    30%에 가깝다) 일률적인 임계값을 적용하면 노이즈가 컸다(2026-08-27 실측,
-    bike_rental_history).
+    컬럼 값 단위 결측 비율은 소스마다 평소 기준선이 크게 달라 쓰지 않음.
+
+    Args:
+        source_id: source ID
+        stats: ``--report-window-stats`` JSON
+    Returns:
+        비율과 위험 여부를 담은 평가 결과
     """
     thresholds = load_thresholds(source_id)
     run_count = stats["run_count"]
@@ -41,10 +40,8 @@ def evaluate_source_stats(source_id: str, stats: dict) -> SourceStatEvaluation:
     failure_rate = _ratio(failed, run_count)
     drop_rate = _ratio(dropped, fetched)
 
-    # run_count == 0이면 failure_rate도 0/0 → 0.0으로 계산돼 임계값 비교만으로는
-    # "정상"과 구분이 안 된다 — 그런데 이건 collector/Airflow가 그 기간 내내
-    # 완전히 멈춰 manifest가 하나도 안 남은, 비율 임계값보다 심한 장애다.
-    # run_count == 0 자체를 별도 위험 조건으로 명시한다.
+    # 실행 기록이 없으면 비율이 0이 되어 정상과 구분되지 않지만, 수집이 완전히
+    # 멈춘 더 심한 장애임
     no_runs = run_count == 0
     is_risky = (
         no_runs
@@ -67,15 +64,8 @@ _STATUS_WIDTH = max(len(_STATUS_OK), len(_STATUS_RISK), len(_COLUMNS[0]))
 
 
 def _table(evaluations: list[SourceStatEvaluation]) -> str:
-    """소스별 통계를 Slack 코드 블록 안에 넣을 고정폭 표로 만든다.
-
-    RUN=실행(수집 시도) 횟수, SUCC/FAIL/PART=그중 성공/실패/부분성공 횟수(행 개수가
-    아니라 실행 횟수다 — "OK"라고 하면 유효 행 수처럼 오해하기 쉬워 SUCC로 명확히
-    한다), KEEP=유효해서 살린 행, DROP=검증에 걸려 버린 행. 한글/이모지는 폰트마다
-    폭이 달라 고정폭 정렬이 어긋나므로 표 안은 전부 ASCII로 채운다. STATUS 컬럼(소스
-    전체 정상/위험 플래그)은 빈칸이 아니라 "OK"/"RISK" 텍스트로 명시해 한쪽이 안
-    보이는 일이 없게 한다.
-    """
+    # RUN/SUCC/FAIL/PART는 실행 횟수, KEEP/DROP은 행 수. 한글은 폰트마다 폭이 달라
+    # 고정폭 정렬이 어긋나므로 표 안은 ASCII만 씀
     name_width = max(
         (len(e["source_id"]) for e in evaluations), default=len(_COLUMNS[1])
     )

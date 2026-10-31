@@ -13,36 +13,32 @@ from callbacks.task_callbacks import on_failure_callback, on_success_callback
 from orchestration import collector_task
 from orchestration.collector_task import (
     COLLECTOR_DIR,
-    build_collector_replay_task,
     build_collector_task,
     build_daily_history_replay_task,
-    build_population_collector_task,
     build_weather_freshness_gate_task,
+    build_window_stats_task,
 )
-from orchestration.collection_stats_task import build_window_stats_task
-from orchestration.gold_publisher_task import (
-    GOLD_PUBLISHER_DIR,
-    build_gold_publisher_task,
-)
-from orchestration.inference_task import ML_DIR, build_inference_task
-from orchestration.normalizer_task import (
+from orchestration.refine_task import (
     NORMALIZER_DIR,
-    build_normalizer_task,
-    build_station_master_enrichment_task,
-)
-from orchestration.nowcasting_task import NOWCASTING_DIR, build_nowcasting_task
-from orchestration.poi_master_task import (
+    NOWCASTING_DIR,
     POI_MASTER_DIR,
+    build_normalizer_task,
+    build_nowcasting_task,
     build_poi_master_refresh_task,
     build_poi_master_resolve_task,
+    build_station_master_enrichment_task,
 )
-from orchestration.routes_task import build_routes_task
 from orchestration.serving_task import (
     LOADER_DIR,
+    ML_DIR,
+    build_event_publication_task,
     build_finalize_serving_task,
+    build_inference_task,
     build_prepare_serving_task,
+    build_routes_task,
+    build_urgency_task,
 )
-from orchestration.task_builder import REPO_ROOT, build_module_task
+from orchestration.task_builder import REPO_ROOT, build_module_task, uv_python_command
 from orchestration.templates import (
     KST_WINDOW_START,
     kst_date_days_ago,
@@ -51,7 +47,6 @@ from orchestration.templates import (
     kst_hours_ago_hour,
     kst_window_start_shifted,
 )
-from orchestration.urgency_task import build_urgency_task
 
 
 def test_repo_root_resolves_to_repository_root() -> None:
@@ -173,40 +168,23 @@ def test_module_task_rejects_unsafe_environment_name(dag) -> None:
         )
 
 
-def test_module_task_records_resource_profile_per_task_instance(dag) -> None:
-    """공통 모듈 task가 실행 식별자·동시성·process peak manifest를 남긴다."""
-    task = build_module_task(dag, "profiled", COLLECTOR_DIR, "printf 'done'")
+def test_module_task_runs_command_directly_in_module_environment(dag) -> None:
+    """모듈 명령을 다른 프로세스로 감싸지 않고 모듈 venv에서 바로 실행한다."""
+    task = build_module_task(dag, "plain", COLLECTOR_DIR, "printf 'done'")
 
-    assert "/workspace/ops/resource_probe.py" in task.bash_command
-    assert (
-        "/workspace/airflow/resource-profiles/{{ dag.dag_id }}/{{ run_id }}/"
-        "{{ task.task_id }}/map-{{ ti.map_index }}/try-{{ ti.try_number }}.json"
-        in task.bash_command
+    assert task.bash_command == (
+        "env -u VIRTUAL_ENV UV_PROJECT_ENVIRONMENT=/opt/venvs/modules/collector printf 'done'"
     )
-    for metadata in (
-        "dag_id={{ dag.dag_id }}",
-        "run_id={{ run_id }}",
-        "task_id={{ task.task_id }}",
-        "try_number={{ ti.try_number }}",
-        "map_index={{ ti.map_index }}",
-        "parallelism=${AIRFLOW__CORE__PARALLELISM:-3}",
-        "max_active_tasks_per_dag=${AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG:-3}",
-    ):
-        assert f'--metadata "{metadata}"' in task.bash_command
-    assert "--sample-seconds" in task.bash_command
-    assert "printf 'done'" in task.bash_command
-    assert "__AIRFLOW_RESOURCE_PROBE_COMMAND__" in task.bash_command
 
 
-def test_module_task_rejects_resource_probe_delimiter(dag) -> None:
-    """Heredoc 경계를 바꿀 수 있는 예약 구분자를 모듈 명령에서 거부한다."""
-    with pytest.raises(ValueError, match="예약 구분자"):
-        build_module_task(
-            dag,
-            "unsafe_profile_command",
-            COLLECTOR_DIR,
-            "echo __AIRFLOW_RESOURCE_PROBE_COMMAND__",
-        )
+def test_uv_python_command_joins_args_and_optional_project() -> None:
+    """uv 명령 조립 형태를 고정한다."""
+    assert uv_python_command("main.py", "--source", "x") == (
+        "uv run --frozen python main.py --source x"
+    )
+    assert uv_python_command("-m", "pkg.cli", project="inference") == (
+        "uv --project inference run --frozen python -m pkg.cli"
+    )
 
 
 def test_normalizer_task_contract(dag) -> None:
@@ -223,8 +201,10 @@ def test_normalizer_task_contract(dag) -> None:
 
 
 def test_population_collector_consumes_exact_poi_master_ref(dag) -> None:
-    """Population 전용 builder만 resolver의 mode·manifest exact ref를 전달한다."""
-    task = build_population_collector_task(dag, poi_master_task_id="resolve_x")
+    """poi_master_task_id를 주면 resolver의 mode·manifest exact ref를 전달한다."""
+    task = build_collector_task(
+        dag, "population_realtime", poi_master_task_id="resolve_x"
+    )
 
     assert task.task_id == "collect_population_realtime"
     assert task.cwd == COLLECTOR_DIR
@@ -267,7 +247,7 @@ def test_poi_master_refresh_and_resolve_builder_contracts(dag) -> None:
 
 
 def test_station_master_enrichment_builder_contract(dag) -> None:
-    """미사용 enrichment builder의 기존 CLI 계약도 회귀하지 않는다."""
+    """대여소 master enrichment CLI 계약을 고정한다."""
     task = build_station_master_enrichment_task(dag)
 
     assert task.cwd == NORMALIZER_DIR
@@ -398,28 +378,28 @@ def test_urgency_and_route_use_release_refs_without_legacy_compute(dag) -> None:
     assert "ti.xcom_pull" not in route.bash_command
 
 
-def test_gold_builder_allows_events_but_rejects_retired_station_weather(dag) -> None:
-    """Standalone Gold builder에는 seed/event 외 source authority가 남지 않는다."""
-    task = build_gold_publisher_task(dag, "event:cultural_event")
-    assert task.cwd == GOLD_PUBLISHER_DIR == LOADER_DIR
+def test_event_publication_task_contract(dag) -> None:
+    """행사 source만 gold_cli의 event publication으로 게시한다."""
+    task = build_event_publication_task(dag, "cultural_event")
+    assert task.task_id == "publish_event_cultural_event"
+    assert task.cwd == LOADER_DIR
     assert "uv run --frozen python gold_cli.py" in task.bash_command
     assert "--publication event:cultural_event" in task.bash_command
     assert "--window-start" in task.bash_command
     assert "astimezone" in task.bash_command
     assert task.trigger_rule == TriggerRule.ALL_SUCCESS
-    with pytest.raises(ValueError, match="지원하지 않는"):
-        build_gold_publisher_task(dag, "station-release")
-    with pytest.raises(ValueError, match="지원하지 않는"):
-        build_gold_publisher_task(dag, "station-master-correction")
-    with pytest.raises(ValueError, match="지원하지 않는"):
-        build_gold_publisher_task(dag, "weather-forecast")
-    with pytest.raises(ValueError, match="지원하지 않는"):
-        build_gold_publisher_task(dag, "station; unsafe")
 
 
 def test_replay_collector_remains_nonblocking_side_chain(dag) -> None:
     """과거 rental 보강은 force/all-done 계약을 유지한다."""
-    task = build_collector_replay_task(dag, "bike_rental_history", 1)
+    task = build_collector_task(
+        dag,
+        "bike_rental_history",
+        task_id="collect_bike_rental_history_replay_1h",
+        window_start=kst_window_start_shifted(1),
+        force=True,
+        trigger_rule=TriggerRule.ALL_DONE,
+    )
     assert task.task_id == "collect_bike_rental_history_replay_1h"
     assert task.cwd == COLLECTOR_DIR
     assert "--source bike_rental_history" in task.bash_command

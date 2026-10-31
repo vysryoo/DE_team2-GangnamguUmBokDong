@@ -74,24 +74,6 @@ def test_local_airflow_starts_project_dags_paused_without_examples():
     assert environment["AIRFLOW__CORE__LOAD_EXAMPLES"] == "false"
 
 
-def test_local_and_production_enable_same_resource_probe_sampling():
-    """로컬 adapter가 운영 원본의 resource probe 주기를 덮어쓰지 않는다."""
-    production = yaml.safe_load(_PROD_COMPOSE_PATH.read_text(encoding="utf-8"))
-    local_text = _LOCAL_ADAPTER_PATH.read_text(encoding="utf-8")
-    expected = "${AIRFLOW_RESOURCE_PROBE_SAMPLE_SECONDS:-1}"
-
-    assert (
-        production["x-airflow-common"]["environment"][
-            "AIRFLOW_RESOURCE_PROBE_SAMPLE_SECONDS"
-        ]
-        == expected
-    )
-    assert "AIRFLOW_RESOURCE_PROBE_SAMPLE_SECONDS" not in local_text
-    assert "AIRFLOW_RESOURCE_PROBE_SAMPLE_SECONDS=1" in _ENV_EXAMPLE_PATH.read_text(
-        encoding="utf-8"
-    )
-
-
 def test_local_adapter_does_not_redefine_production_runtime_images_or_commands():
     """로컬은 managed service 연결만 바꾸고 운영 runtime 정의는 재사용한다."""
     local_text = _LOCAL_ADAPTER_PATH.read_text(encoding="utf-8")

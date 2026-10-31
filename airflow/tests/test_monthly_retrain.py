@@ -1,14 +1,13 @@
-"""monthly_retrain DAG 구조, 스케줄 및 단일 EMR 클러스터 생애주기 오케스트레이션을
-검증한다(2026-08 재설계 — ADR-0007, EC2/SSM 경로를 EMR 스텝으로 통합. 이후
-대여/반납 동시 실행을 막기 위해 한 DAG 안에서 순차 실행하도록 재통합)."""
+"""monthly_retrain DAG 구조와 단일 EMR 클러스터 생애주기 오케스트레이션을 검증한다."""
 
 from datetime import timedelta
+from functools import partial
 from unittest.mock import MagicMock
 
 import pytest
+from airflow.task.trigger_rule import TriggerRule
 
 import dags.monthly_retrain as monthly_dag
-from airflow.task.trigger_rule import TriggerRule
 
 _DAG = monthly_dag.dag
 
@@ -99,7 +98,7 @@ def test_refresh_feature_mart_runs_between_create_cluster_and_evaluate() -> None
 def test_check_retrain_branch_decisions() -> None:
     """needs_retrain 값에 따라 올바른(모델 접미사가 붙은) 다운스트림 태스크로 분기한다."""
     mock_ti = MagicMock()
-    branch_fn = monthly_dag.make_task_check_retrain_branch("rental")
+    branch_fn = partial(monthly_dag._choose_retrain_branch, "rental")
 
     # Case 1: 재학습 필요 시 orchestrate_retrain_loop_rental로 분기
     mock_ti.xcom_pull.return_value = True
@@ -117,7 +116,7 @@ def test_create_cluster_pushes_cluster_id(monkeypatch) -> None:
     mock_ti = MagicMock()
     monkeypatch.setattr(monthly_dag, "create_emr_cluster", lambda **kwargs: "j-created")
 
-    task_fn = monthly_dag.make_task_create_cluster("rental")
+    task_fn = monthly_dag._create_cluster
     result = task_fn(ti=mock_ti, params={})
 
     assert result == "j-created"
@@ -164,7 +163,7 @@ def test_refresh_feature_mart_submits_feature_mart_steps_for_champion_profile(mo
         lambda cluster_id, name, command, **kwargs: submitted_steps.append((cluster_id, name)),
     )
 
-    task_fn = monthly_dag.make_task_refresh_feature_mart("rental")
+    task_fn = partial(monthly_dag._refresh_feature_mart, "rental")
     task_fn(ti=mock_ti, params={})
 
     assert ("j-created", "Spark-RunPipeline-leaves127") in submitted_steps
@@ -189,7 +188,7 @@ def test_refresh_feature_mart_waits_for_yarn_nodes_before_spark_steps(monkeypatc
         lambda cluster_id, name, command, **kwargs: submitted_names.append(name),
     )
 
-    task_fn = monthly_dag.make_task_refresh_feature_mart("rental")
+    task_fn = partial(monthly_dag._refresh_feature_mart, "rental")
     task_fn(ti=mock_ti, params={})
 
     assert submitted_names[0] == "Wait-YARN-Nodes"
@@ -216,7 +215,7 @@ def test_refresh_feature_mart_falls_back_to_builtin_default_when_no_champion(mon
         lambda cluster_id, name, command, **kwargs: submitted_steps.append(name),
     )
 
-    task_fn = monthly_dag.make_task_refresh_feature_mart("rental")
+    task_fn = partial(monthly_dag._refresh_feature_mart, "rental")
     task_fn(ti=mock_ti, params={})
 
     assert any("builtin-default" in s for s in submitted_steps)
@@ -237,7 +236,7 @@ def test_refresh_feature_mart_skips_champion_build_when_test_profile_only(monkey
         lambda cluster_id, name, command, **kwargs: submitted_names.append(name),
     )
 
-    task_fn = monthly_dag.make_task_refresh_feature_mart("rental")
+    task_fn = partial(monthly_dag._refresh_feature_mart, "rental")
     task_fn(ti=mock_ti, params={"test_profile_only": True})
 
     assert submitted_names == ["Wait-YARN-Nodes"]
@@ -258,7 +257,7 @@ def test_refresh_feature_mart_gives_wait_for_yarn_nodes_a_short_timeout(monkeypa
         lambda cluster_id, name, command, **kwargs: captured_timeouts.update({name: kwargs.get("timeout_seconds")}),
     )
 
-    task_fn = monthly_dag.make_task_refresh_feature_mart("rental")
+    task_fn = partial(monthly_dag._refresh_feature_mart, "rental")
     task_fn(ti=mock_ti, params={"test_profile_only": True})
 
     assert captured_timeouts["Wait-YARN-Nodes"] == 1200
@@ -284,7 +283,7 @@ def test_evaluate_uses_same_profile_refresh_feature_mart_just_built(monkeypatch)
     )
     monkeypatch.setattr(monthly_dag, "read_s3_json", lambda key: {"needs_retrain": False})
 
-    task_fn = monthly_dag.make_task_evaluate("rental")
+    task_fn = partial(monthly_dag._evaluate, "rental")
     task_fn(ti=mock_ti, params={}, run_id="run-1")
 
     script = submitted["command"][2]
@@ -305,7 +304,7 @@ def test_evaluate_defaults_profile_to_builtin_when_refresh_pushed_nothing(monkey
     )
     monkeypatch.setattr(monthly_dag, "read_s3_json", lambda key: {"needs_retrain": False})
 
-    task_fn = monthly_dag.make_task_evaluate("rental")
+    task_fn = partial(monthly_dag._evaluate, "rental")
     task_fn(ti=mock_ti, params={}, run_id="run-1")
 
     script = submitted["command"][2]
@@ -330,7 +329,7 @@ def test_evaluate_pushes_needs_retrain(monkeypatch) -> None:
         lambda key: {"needs_retrain": True, "candidate_profiles": ["rental-profile-1"]},
     )
 
-    task_fn = monthly_dag.make_task_evaluate("rental")
+    task_fn = partial(monthly_dag._evaluate, "rental")
     result = task_fn(ti=mock_ti, params={}, run_id="run-1")
 
     assert result["needs_retrain"] is True
@@ -360,11 +359,11 @@ def test_evaluate_passes_eval_num_workers_matching_provisioned_core_count(monkey
     )
     monkeypatch.setattr(monthly_dag, "read_s3_json", lambda key: {"needs_retrain": False})
 
-    task_fn = monthly_dag.make_task_evaluate("rental")
+    task_fn = partial(monthly_dag._evaluate, "rental")
     task_fn(ti=mock_ti, params={}, run_id="run-1")
 
     script = submitted["command"][2]
-    expected = monthly_dag.FEATURE_MART_CORE_INSTANCE_COUNT - monthly_dag._WRAPPER_NODE_RESERVATION
+    expected = monthly_dag.CORE_INSTANCE_COUNT - monthly_dag._WRAPPER_NODE_RESERVATION
     assert f"--eval-num-workers {expected}" in script
 
 
@@ -409,7 +408,7 @@ def test_evaluate_eval_num_workers_respects_core_instance_count_override(monkeyp
     )
     monkeypatch.setattr(monthly_dag, "read_s3_json", lambda key: {"needs_retrain": False})
 
-    task_fn = monthly_dag.make_task_evaluate("rental")
+    task_fn = partial(monthly_dag._evaluate, "rental")
     task_fn(ti=mock_ti, params={"emr_core_instance_count": 5}, run_id="run-1")
 
     script = submitted["command"][2]
@@ -424,7 +423,7 @@ def test_evaluate_defaults_to_needs_retrain_when_no_result(monkeypatch) -> None:
     monkeypatch.setattr(monthly_dag, "submit_emr_step", lambda *args, **kwargs: {"StepId": "mock-s-1", "State": "COMPLETED"})
     monkeypatch.setattr(monthly_dag, "read_s3_json", lambda key: None)
 
-    task_fn = monthly_dag.make_task_evaluate("rental")
+    task_fn = partial(monthly_dag._evaluate, "rental")
     result = task_fn(ti=mock_ti, params={}, run_id="run-1")
 
     assert result["needs_retrain"] is True
@@ -442,7 +441,7 @@ def test_evaluate_forces_test_profile_when_test_profile_only(monkeypatch) -> Non
         monthly_dag, "submit_emr_step", lambda *a, **k: submit_calls.append(a) or {"StepId": "s", "State": "COMPLETED"}
     )
 
-    task_fn = monthly_dag.make_task_evaluate("rental")
+    task_fn = partial(monthly_dag._evaluate, "rental")
     result = task_fn(ti=mock_ti, params={"test_profile_only": True}, run_id="run-1")
 
     assert submit_calls == []
@@ -480,7 +479,7 @@ def test_orchestrate_retrain_loop_submits_feature_mart_then_trains_without_resiz
         lambda key: {"promoted": {"rental": "profile-b" in key}},
     )
 
-    loop_fn = monthly_dag.make_task_orchestrate_retrain_loop("rental")
+    loop_fn = partial(monthly_dag._orchestrate_retrain_loop, "rental")
     result = loop_fn(ti=mock_ti, params={}, run_id="run-1")
 
     assert result["status"] == "completed"
@@ -496,7 +495,7 @@ def test_orchestrate_retrain_loop_submits_feature_mart_then_trains_without_resiz
     train_command = submitted_commands["Train-rental-profile-a"][2]
     assert "org.apache.hadoop.yarn.applications.distributedshell.Client" in train_command
     assert "--performance-already-checked" in train_command
-    expected_machines = monthly_dag.TRAINING_CORE_INSTANCE_COUNT - monthly_dag._WRAPPER_NODE_RESERVATION
+    expected_machines = monthly_dag.CORE_INSTANCE_COUNT - monthly_dag._WRAPPER_NODE_RESERVATION
     assert f"-shell_env LGB_NUM_MACHINES={expected_machines}" in train_command
 
 
@@ -519,7 +518,7 @@ def test_orchestrate_retrain_loop_passes_no_promote_when_test_profile_only(monke
     monkeypatch.setattr(monthly_dag, "submit_emr_step", _fake_submit_emr_step)
     monkeypatch.setattr(monthly_dag, "read_s3_json", lambda key: {"promoted": {"rental": False}})
 
-    loop_fn = monthly_dag.make_task_orchestrate_retrain_loop("rental")
+    loop_fn = partial(monthly_dag._orchestrate_retrain_loop, "rental")
     loop_fn(ti=mock_ti, params={"test_profile_only": True}, run_id="run-1")
 
     train_command = submitted_commands[f"Train-rental-{monthly_dag.TEST_ONLY_PROFILE_NAME}"][2]
@@ -532,7 +531,7 @@ def test_terminate_cluster_task_calls_terminate_when_cluster_exists(monkeypatch)
     terminated = []
     monkeypatch.setattr(monthly_dag, "terminate_emr_cluster", lambda cluster_id, **kwargs: terminated.append(cluster_id))
 
-    task_fn = monthly_dag.make_task_terminate_emr_cluster("rental")
+    task_fn = monthly_dag._terminate_cluster
     task_fn(ti=mock_ti, params={})
 
     assert terminated == ["j-1"]
@@ -546,7 +545,7 @@ def test_terminate_cluster_task_no_ops_when_cluster_id_missing(monkeypatch) -> N
     terminated = []
     monkeypatch.setattr(monthly_dag, "terminate_emr_cluster", lambda cluster_id, **kwargs: terminated.append(cluster_id))
 
-    task_fn = monthly_dag.make_task_terminate_emr_cluster("rental")
+    task_fn = monthly_dag._terminate_cluster
     task_fn(ti=mock_ti, params={})
 
     assert terminated == []
@@ -556,7 +555,7 @@ def test_start_mlflow_calls_docker_action(monkeypatch) -> None:
     calls = []
     monkeypatch.setattr(monthly_dag, "_docker_mlflow_container_action", lambda action: calls.append(action))
 
-    monthly_dag.make_task_start_mlflow()(params={})
+    monthly_dag._start_mlflow(params={})
 
     assert calls == ["start"]
 
@@ -565,7 +564,7 @@ def test_start_mlflow_skips_when_force_mock(monkeypatch) -> None:
     calls = []
     monkeypatch.setattr(monthly_dag, "_docker_mlflow_container_action", lambda action: calls.append(action))
 
-    monthly_dag.make_task_start_mlflow()(params={"mock_mode": "force_mock"})
+    monthly_dag._start_mlflow(params={"mock_mode": "force_mock"})
 
     assert calls == []
 
@@ -574,7 +573,7 @@ def test_stop_mlflow_calls_docker_action(monkeypatch) -> None:
     calls = []
     monkeypatch.setattr(monthly_dag, "_docker_mlflow_container_action", lambda action: calls.append(action))
 
-    monthly_dag.make_task_stop_mlflow()(params={})
+    monthly_dag._stop_mlflow(params={})
 
     assert calls == ["stop"]
 
@@ -588,7 +587,7 @@ def test_stop_mlflow_does_not_raise_when_docker_action_fails(monkeypatch) -> Non
 
     monkeypatch.setattr(monthly_dag, "_docker_mlflow_container_action", _boom)
 
-    monthly_dag.make_task_stop_mlflow()(params={})  # raise하지 않아야 한다
+    monthly_dag._stop_mlflow(params={})  # raise하지 않아야 한다
 
 
 def test_feature_mart_spark_steps_use_runpy_launcher_not_raw_script_path() -> None:
@@ -627,7 +626,7 @@ def test_feature_mart_spark_steps_num_executors_scales_with_core_count() -> None
     default_step, _ = monthly_dag._feature_mart_spark_steps("some-profile")
     scaled_step, _ = monthly_dag._feature_mart_spark_steps("some-profile", core_instance_count=8)
 
-    assert f"--num-executors {monthly_dag.FEATURE_MART_CORE_INSTANCE_COUNT - 1}" in default_step[1][2]
+    assert f"--num-executors {monthly_dag.CORE_INSTANCE_COUNT - 1}" in default_step[1][2]
     assert "--num-executors 7" in scaled_step[1][2]
 
 
@@ -670,26 +669,6 @@ def test_yarn_python_module_step_passes_env_via_shell_env() -> None:
     assert "-shell_env LGB_TREE_LEARNER=data" in script
     assert f"-shell_env S3_BUCKET={monthly_dag.S3_BUCKET}" in script
     assert f"-shell_env PYTHONPATH={monthly_dag._EMR_PYTHONPATH}" in script
-
-
-def test_bash_step_exports_s3_bucket_always() -> None:
-    _name, command = monthly_dag._bash_step("Test", "echo hi")
-    assert "export S3_BUCKET=" in command[2]
-
-
-def test_bash_step_exports_mlflow_uri_when_configured(monkeypatch) -> None:
-    """학습 스텝(train_common.py의 mlflow.start_run())이 EMR에서 docker 네트워크
-    이름("mlflow")을 못 풀어 죽는 걸 막기 위해, terraform이 채운 상시 EC2 사설 IP
-    기반 URI를 명시적으로 주입해야 한다(PR 리뷰 지적, 2026-08)."""
-    monkeypatch.setattr(monthly_dag, "EMR_MLFLOW_TRACKING_URI", "http://10.0.0.5:5000/mlflow")
-    _name, command = monthly_dag._bash_step("Test", "echo hi")
-    assert "export MLFLOW_TRACKING_URI=http://10.0.0.5:5000/mlflow" in command[2]
-
-
-def test_bash_step_skips_mlflow_uri_when_not_configured(monkeypatch) -> None:
-    monkeypatch.setattr(monthly_dag, "EMR_MLFLOW_TRACKING_URI", "")
-    _name, command = monthly_dag._bash_step("Test", "echo hi")
-    assert "MLFLOW_TRACKING_URI" not in command[2]
 
 
 def test_extract_profile_feature_params_handles_uppercase_and_defaults() -> None:
