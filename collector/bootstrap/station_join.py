@@ -1,37 +1,12 @@
 """재고 CSV의 `대여소번호`를 collector 스키마의 대여소 컬럼들로 옮기는 매핑표.
 
-## 왜 필요한가
+재고 CSV는 `00102` 같은 번호만 주지만 `bike_station_realtime`은 `stationId`를 required로
+요구한다. `bikeList` API의 이름 완전일치, 이름 접두 번호, 대여이력 CSV의 번호↔ID 순으로
+겹쳐 채운다. 대여이력에서만 찾은 폐쇄 대여소는 `station_id`만 채우고 나머지는 비운다.
+`bikeStationMaster`는 `ADDR2`가 상세주소라 번호로 조인할 수 없다.
 
-재고 CSV(`대여소별 공공자전거 대여가능 수량`)는 대여소를 `00102` 형식의 번호로
-가리키는데 `bike_station_realtime`은 `stationId`(`ST-4`)를 **required**로 요구한다.
-거치대 수·거치율·좌표도 CSV에 없다. 세 소스를 겹쳐 그 값들을 만든다.
-
-| 단계 | 소스 | 채우는 값 | 실측 매칭 |
-|---|---|---|---|
-| 1 | `bikeList` API — `stationName` 완전일치 | 5개 전부 | 2,711 |
-| 2 | `bikeList` API — 이름 접두 번호(`"102. ..."` -> `00102`) | 5개 전부 | 8 |
-| 3 | 대여이력 CSV — `대여소번호`↔`대여대여소ID` | `station_id`만 | 61 |
-
-행 207만 기준 미매칭이 API 단독 2.79%, 대여이력까지 겹치면 **0.68%**다. 살아나는
-43,856행(2.11%)은 2025-12 이후 폐쇄되어 `bikeList`에 더는 없는 대여소이므로
-`station_id`만 채워지고 나머지는 빈 값이 된다 — 지어내지 않는다.
-
-매핑 신뢰도는 교차 검증으로 확인했다. 1단계와 3단계가 모두 맞은 2,636건에서
-`stationId`가 **100% 일치**했다. 단 이 교차검증은 *API와 대여이력 사이*의 일치를 본
-것이고, *대여이력 파일들 사이*의 번호 재사용은 검증 대상이 아니었다 — 대여소번호는
-폐기 후 재사용될 수 있어 station_id와 1:1이 아니다. 3단계는 파일명순(=시간순)으로
-읽어 최신 기간의 id를 채택하고, 덮어쓴 사실은 `history_id_conflicts` 통계와 경고
-로그로 남긴다(`_read_history_ids` 참고).
-
-`bikeStationMaster`는 쓸 수 없다. `ADDR2`가 대여소 번호가 아니라 상세주소
-(`"더샵스타시티 C동 앞"`)라서 번호로 조인할 방법이 없다.
-
-## 값의 시점
-
-`bikeList`는 **현재** 재고 상태를 준다. 즉 여기서 얻는 `rack_tot_cnt`·`shared`·좌표는
-매핑표를 만든 그 시각의 값이고, 과거 날짜에 적재되면 그 기간 내내 상수가 된다.
-좌표는 대여소가 이전하지 않는 한 맞지만 거치대 수와 거치율은 그렇지 않다.
-`stats`를 archive manifest에 실어 나중에 출처를 되짚을 수 있게 한다.
+`bikeList`는 현재 상태를 주므로 거치대 수·거치율은 매핑표를 만든 시각의 값이다. 출처를
+되짚을 수 있게 `stats`를 archive manifest에 싣는다.
 """
 
 from __future__ import annotations
@@ -55,8 +30,7 @@ logger = logging.getLogger(__name__)
 _BASE_URL = "http://openapi.seoul.go.kr:8088"
 _SERVICE = "bikeList"
 _PAGE_SIZE = 1000
-# 페이지를 무한히 도는 것을 막는 상한. 대여소는 실측 2,737개소이고 열린데이터광장이
-# 총건수를 잘못 주더라도 여기서 끊긴다.
+# 페이지를 무한히 도는 것을 막는 상한
 _MAX_PAGES = 20
 
 
@@ -68,8 +42,6 @@ _HISTORY_PATTERN = "서울특별시 공공자전거 대여이력 정보_*.csv"
 _HISTORY_ENCODING = "cp949"
 # (대여소번호 컬럼, 대여소ID 컬럼) 쌍. 한 행이 대여·반납 두 대여소를 담는다.
 _HISTORY_COLUMN_PAIRS = (("대여 대여소번호", "대여대여소ID"), ("반납대여소번호", "반납대여소ID"))
-# 충돌 로그/stats에 남기는 샘플 개수. manifest를 비대하게 만들지 않으면서 "어느 번호가
-# 충돌했나"를 바로 짚을 수 있는 최소한.
 _MAX_CONFLICT_SAMPLE = 5
 
 
@@ -77,9 +49,7 @@ _MAX_CONFLICT_SAMPLE = 5
 class StationInfo:
     """대여소 하나에 대해 매핑표가 아는 값들.
 
-    전부 문자열이다 — `csv_source`가 모든 컬럼을 문자열로 넘기고 캐스팅은 검증 엔진의
-    `types`가 맡는다는 규약을 지킨다. 모르는 값은 빈 문자열이고, 검증 엔진이 그것을
-    결측으로 판정해 `optional_missing` 정책이 걸린다.
+    캐스팅은 검증 엔진이 맡으므로 전부 문자열이고, 모르는 값은 결측으로 판정될 빈 문자열이다.
     """
 
     station_id: str
@@ -124,13 +94,8 @@ def _api_key() -> str:
 def _fetch_stations(client: httpx.Client) -> list[dict]:
     """`bikeList`를 페이지 끝까지 받아 행을 모은다.
 
-    ⚠️ 끝 판단에 `list_total_count`를 쓰면 안 된다. 이 서비스는 그 값에 **전체 대여소
-    수가 아니라 그 페이지의 행 수**를 담는다(실측: 1/1000 -> 1000, 1001/2000 -> 1000,
-    2001/3000 -> 739). 그것으로 끝내면 첫 페이지에서 멈춰 1,000개소만 받고, 나머지
-    1,737개소가 조인에 실패해 그 행들이 조용히 폐기된다. 같은 열린데이터광장이라도
-    `bikeStationMaster`는 전체(3428)를 주므로 서비스마다 의미가 다르다.
-
-    페이지가 가득 차지 않으면 마지막 페이지다.
+    이 서비스의 `list_total_count`는 전체 건수가 아니라 그 페이지의 행 수라 끝 판단에 쓸 수
+    없다. 페이지가 가득 차지 않으면 마지막 페이지로 본다.
     """
     rows: list[dict] = []
     for page in range(_MAX_PAGES):
@@ -160,28 +125,17 @@ def _info_from_api(row: dict) -> StationInfo:
 def _read_history_ids(csv_dir: Path) -> tuple[dict[str, str], list[str]]:
     """대여이력 CSV들에서 `대여소번호 -> 대여소ID` 매핑을 모으고 충돌을 함께 기록한다.
 
-    대여·반납 두 컬럼 쌍을 모두 읽는다 — 한쪽에만 나오는 대여소가 있다.
-
-    ⚠️ 대여소번호는 station_id와 1:1이 **아니다**. 폐기된 대여소의 번호가 나중에 다른
-    대여소에 재사용될 수 있어서, 같은 `00102`가 2024년 파일에서는 `ST-4`, 2025년
-    파일에서는 `ST-999`로 나올 수 있다. 파일을 파일명순(=사실상 시간순)으로 읽으므로
-    나중 파일이 이긴다 — 최신 id가 지금 살아있는 대여소를 가리킬 가능성이 높아 이 동작
-    자체는 유지하되, 덮어쓴 사실을 조용히 삼키지 않고 어느 기간에서 어느 기간으로
-    바뀌었는지 남긴다. 이 매핑은 `bikeList`에 없는 대여소(폐쇄분)에만 쓰이므로 충돌이
-    그대로 적재 결과가 되는 경로다.
+    대여소번호는 폐기 후 다른 대여소에 재사용될 수 있다. 파일명순(시간순)으로 읽어 최신
+    기간의 id를 채택하되, 덮어쓴 사실을 기간과 함께 남긴다.
 
     returns:
         (매핑, 충돌 설명 목록). 충돌 설명은 `"00102: ST-4(2412) -> ST-999(2501)"`
         형식이고 대여소번호순으로 정렬된다(결정적).
     """
     mapping: dict[str, str] = {}
-    # 현재 매핑값이 어느 파일(기간)에서 왔는지 — 충돌 로그에 시점을 남기기 위한 것.
     origin: dict[str, str] = {}
     trail: dict[str, list[str]] = {}
-    # csv_source.glob_normalized 참고: macOS는 파일명을 NFD로 저장해 Path.glob()의
-    # NFC 패턴이 조용히 0건 매칭된다. 여기서도 같은 문제라 같은 방식으로 우회한다.
     for path in glob_normalized(csv_dir, _HISTORY_PATTERN):
-        # "...대여이력 정보_2501.csv" -> "2501"
         period = path.stem.rsplit("_", 1)[-1]
         with path.open(encoding=_HISTORY_ENCODING, errors="replace", newline="") as handle:
             for row in csv.DictReader(handle):
@@ -209,8 +163,7 @@ def build(csv_dir: Path | None, *, client: httpx.Client | None = None) -> Statio
     """대여소 매핑표를 만든다.
 
     args:
-        csv_dir: 대여이력 CSV를 찾을 디렉터리. None이면 3단계를 건너뛴다(커버리지가
-            실측 99.32%에서 97.1%로 떨어지지만 실행은 성공한다).
+        csv_dir: 대여이력 CSV를 찾을 디렉터리. None이면 대여이력 단계를 건너뛴다.
         client: 주입용 httpx 클라이언트. 생략하면 새로 만든다.
     returns:
         번호·이름으로 조회 가능한 매핑표. `stats`에 출처별 건수와 생성 시각이 담긴다.
@@ -243,8 +196,6 @@ def build(csv_dir: Path | None, *, client: httpx.Client | None = None) -> Statio
         "built_at": datetime.now(tz=KST).isoformat(),
         "api_stations": len(api_rows),
         "history_stations": len(history),
-        # 대여소번호 하나가 기간에 따라 서로 다른 station_id로 나타난 건수. manifest에
-        # 실려 남으므로 나중에 "그때 번호가 재사용됐었나"를 되짚을 수 있다.
         "history_id_conflicts": len(conflicts),
         "history_id_conflict_sample": conflicts[:_MAX_CONFLICT_SAMPLE],
     }
