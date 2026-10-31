@@ -57,20 +57,19 @@ class TestParseSilverKey:
             checksum,
         )
 
-    def test_rejects_legacy_mutable_key(self) -> None:
-        """Source snapshot authority 이전 key는 압축 입력으로 받지 않는다."""
-        with pytest.raises(ValueError):
-            _parse_silver_key("silver/test_source/dt=2026-08-12/hh=14/1410.parquet")
-
-    def test_rejects_noncanonical_checksum(self) -> None:
-        key = "silver/test_source/dt=2026-08-12/hh=14/1410/sha256=ABC.parquet"
-
+    @pytest.mark.parametrize(
+        "key",
+        [
+            # Source snapshot authority 이전 mutable key
+            "silver/test_source/dt=2026-08-12/hh=14/1410.parquet",
+            "silver/test_source/dt=2026-08-12/hh=14/1410/sha256=ABC.parquet",
+            "silver/test_source/dt=2026-08-12/hh=14/nowcast.parquet",
+        ],
+        ids=["legacy_mutable", "noncanonical_checksum", "unparseable"],
+    )
+    def test_rejects_non_content_addressed_key(self, key) -> None:
         with pytest.raises(ValueError):
             _parse_silver_key(key)
-
-    def test_rejects_unparseable_key(self):
-        with pytest.raises(ValueError):
-            _parse_silver_key("silver/test_source/dt=2026-08-12/hh=14/nowcast.parquet")
 
 
 class TestArchiveSchema:
@@ -96,20 +95,13 @@ class TestArchiveSchema:
         assert archive_schema(config).field("USE_MIN").type == pa.string()
 
     def test_meta_columns_appended(self):
+        """archive에 두 출처가 섞이므로 `_source_kind`도 메타 컬럼으로 붙는다."""
         config = _config(columns={"a": ColumnSpec(types=("str",))})
 
         schema = archive_schema(config)
 
         assert schema.names == ["a", "_row_status", "_window_start", "_source_kind"]
         assert schema.field("_window_start").type == pa.string()
-
-    def test_source_kind_is_part_of_the_schema(self):
-        """archive에 두 출처가 섞이므로 구분 컬럼이 스키마에 있어야 한다."""
-        config = _config(columns={"a": ColumnSpec(types=("str",))})
-
-        schema = archive_schema(config)
-
-        assert schema.names == ["a", "_row_status", "_window_start", "_source_kind"]
         assert schema.field("_source_kind").type == pa.string()
 
     def test_column_order_follows_yaml(self):

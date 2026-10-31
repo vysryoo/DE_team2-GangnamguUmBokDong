@@ -224,16 +224,7 @@ class TestLoadDate:
         assert result.out_of_range == 1
         table = read_parquet("archive/t_source/dt=2026-06-01.parquet", as_pandas=False)
         assert table.column("BIKE_ID").to_pylist() == ["SPB-0"]
-
-    def test_out_of_range_count_is_recorded_in_manifest(self):
-        rows = _rows("2026-06-01 09:05:00") + [
-            {"BIKE_ID": "SPB-OOR", "RENT_DT": "2026-05-31 23:30:00"},
-        ]
-
-        load_date(_source_config(), _bootstrap_config(), DAY, rows)
-
-        manifest = read_archive_manifest("t_source", DAY)
-        assert manifest["out_of_range"] == 1
+        assert read_archive_manifest("t_source", DAY)["out_of_range"] == 1
 
     def test_all_rows_out_of_range_is_empty(self):
         rows = [{"BIKE_ID": "SPB-OOR", "RENT_DT": "2026-05-31 23:30:00"}]
