@@ -22,6 +22,7 @@ from core.gold_publication.storage import (
     S3ImmutableObjectStore,
 )
 from core.s3 import (
+    S3Object,
     delete_objects,
     get_object_bytes,
     list_keys,
@@ -196,6 +197,18 @@ def _previous_rows(previous: dict | None) -> dict[str, dict]:
     return {row["original_key"]: row for row in table.to_pylist()}
 
 
+def _merge_hot_rows(
+    source_id: str, day: date, hot_objects: list[S3Object], rows_by_key: dict[str, dict]
+) -> None:
+    """Hot object를 Cold row로 만들어 기존 row에 합친다. 이미 담긴 key의 내용 변경은 거부한다."""
+    for obj in hot_objects:
+        row = _cold_row(source_id, day, obj)
+        previous_row = rows_by_key.get(obj.key)
+        if previous_row and previous_row["stored_sha256"] != row["stored_sha256"]:
+            raise RuntimeError(f"immutable Hot Bronze key 내용이 변경됐다: {obj.key}")
+        rows_by_key[obj.key] = row
+
+
 def _write_cold(source_id: str, day: date, rows: list[dict]) -> tuple[str, str]:
     """Cold row를 content-addressed Parquet으로 쓰고 key와 checksum을 반환한다."""
     buffer = io.BytesIO()
@@ -228,13 +241,7 @@ def compact_date(source_id: str, day: date) -> ColdBronzeResult:
     hot_objects = list_objects(hot_day_prefix(source_id, day))
     if not hot_objects and not rows_by_key:
         return ColdBronzeResult(status="empty", objects=0, cold_key=None)
-
-    for obj in hot_objects:
-        row = _cold_row(source_id, day, obj)
-        previous_row = rows_by_key.get(obj.key)
-        if previous_row and previous_row["stored_sha256"] != row["stored_sha256"]:
-            raise RuntimeError(f"immutable Hot Bronze key 내용이 변경됐다: {obj.key}")
-        rows_by_key[obj.key] = row
+    _merge_hot_rows(source_id, day, hot_objects, rows_by_key)
 
     # Python 문자열 정렬은 code point 기준이라 S3 LIST 순서(UTF-8 bytes)와 맞추려 encode함
     inventory_keys = sorted(rows_by_key, key=str.encode)
