@@ -106,12 +106,7 @@ def _validate_windows(
         )
         outcome = validate_batch(group, scfg, ctx)
         counts.dropped += outcome.counts.get("dropped", 0)
-        for column, issue_counts in outcome.column_issues.items():
-            merged = counts.column_issues.setdefault(
-                column, {"missing": 0, "outlier": 0, "type_error": 0}
-            )
-            for kind, value in issue_counts.items():
-                merged[kind] = merged.get(kind, 0) + value
+        _merge_column_issues(counts.column_issues, outcome.column_issues)
         if not outcome.silver_rows:
             continue
         table = pa.Table.from_pylist(outcome.silver_rows)
@@ -121,6 +116,16 @@ def _validate_windows(
         )
         tables.append(conform(table, schema))
     return tables
+
+
+def _merge_column_issues(
+    total: dict[str, dict[str, int]], window_issues: dict[str, dict[str, int]]
+) -> None:
+    """시간대 하나의 컬럼별 이상치 건수를 날짜 누적치에 더한다."""
+    for column, issue_counts in window_issues.items():
+        merged = total.setdefault(column, {"missing": 0, "outlier": 0, "type_error": 0})
+        for kind, value in issue_counts.items():
+            merged[kind] = merged.get(kind, 0) + value
 
 
 def _write_archive(
@@ -162,6 +167,18 @@ def _write_archive(
     )
 
 
+def _has_silver(source_id: str, day: date) -> bool:
+    """같은 날짜에 운영 수집 Silver가 있는지 확인하고 있으면 경고를 남긴다."""
+    if not storage.list_silver_objects(source_id, day):
+        return False
+    # 대량 적재에서는 로그 한 줄이 묻히므로 결과에도 남겨 실행 요약에 집계함
+    logger.warning(
+        f"stage=bootstrap source={source_id} date={day} "
+        "silver_present=true 다음 compaction이 이 archive를 덮어쓴다"
+    )
+    return True
+
+
 def load_date(
     scfg: SourceConfig,
     bcfg: BootstrapConfig,
@@ -191,13 +208,7 @@ def load_date(
     if not force and storage.archive_exists(scfg.source_id, day):
         return DateResult(day=day, status="skipped")
 
-    silver_present = bool(storage.list_silver_objects(scfg.source_id, day))
-    if silver_present:
-        # 대량 적재에서는 로그 한 줄이 묻히므로 결과에도 남겨 실행 요약에 집계함
-        logger.warning(
-            f"stage=bootstrap source={scfg.source_id} date={day} "
-            "silver_present=true 다음 compaction이 이 archive를 덮어쓴다"
-        )
+    silver_present = _has_silver(scfg.source_id, day)
 
     schema = archive_schema(scfg)
     counts = _DayCounts()

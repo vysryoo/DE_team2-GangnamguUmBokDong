@@ -292,13 +292,8 @@ def _copy_entry(
         )
 
 
-def _extract(
-    archive: zipfile.ZipFile,
-    selections: list[Selection],
-    force: bool,
-) -> None:
+def _extract(archive: zipfile.ZipFile, selections: list[Selection]) -> None:
     """모든 파일을 임시 경로에 준비한 뒤 각 목적지로 원자적으로 교체한다."""
-    _guard_existing(selections, force)
     staged: list[tuple[Path, Path]] = []
     try:
         for selection in selections:
@@ -368,7 +363,7 @@ def stage(
         )
         _guard_existing(selections, force)
         if not dry_run:
-            _extract(archive, selections, force)
+            _extract(archive, selections)
 
     return StageSummary(
         file_count=len(selections),
