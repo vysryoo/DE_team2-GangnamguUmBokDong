@@ -145,14 +145,6 @@ def read_bronze(
     return [restored[part] for part in parts if part in restored]
 
 
-def _layer_key(layer: str, source_id: str, window_start: datetime, ext: str) -> str:
-    """silver·quarantine처럼 윈도우당 파일 하나로 떨어지는 계층의 경로를 만든다."""
-    return (
-        f"{layer}/{source_id}/dt={window_start:%Y-%m-%d}/hh={window_start:%H}/"
-        f"{window_start:%H%M}.{ext}"
-    )
-
-
 def write_immutable_silver(
     source_id: str,
     window_start: datetime,
@@ -185,8 +177,6 @@ def read_immutable_silver_artifact(
     row_count: int,
 ) -> ImmutableSilverArtifact:
     """Content-addressed Silver key를 exact checksum으로 읽어 artifact를 복원한다."""
-    if type(key) is not str:
-        raise TypeError("immutable Silver key는 문자열이어야 합니다.")
     match = re.search(r"/sha256=([0-9a-f]{64})\.parquet\Z", key)
     if match is None:
         raise ValueError("Silver key가 content-addressed parquet 경로가 아닙니다.")
@@ -207,7 +197,10 @@ def write_quarantine(
     """검증에 실패한 row들을 jsonl로 저장하고, 저장된 키를 반환한다."""
     if not rows:
         return None
-    key = _layer_key("quarantine", source_id, window_start, "jsonl")
+    key = (
+        f"quarantine/{source_id}/dt={window_start:%Y-%m-%d}/hh={window_start:%H}/"
+        f"{window_start:%H%M}.jsonl"
+    )
     body = "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n"
     put_object_bytes(key, body.encode("utf-8"))
     return key
@@ -262,10 +255,8 @@ def read_archive_manifest(source_id: str, day: date) -> dict | None:
 def list_source_snapshot_windows(source_id: str, day: date) -> list[datetime]:
     """KST 날짜에 속한 immutable source snapshot logical window를 나열한다.
 
-    Manifest path는 UTC date partition을 사용하지만 compaction archive는 KST 날짜를
-    사용한다. KST 하루가 걸치는 두 UTC partition을 나열하고 canonical key에서 exact
-    logical identity를 복원한다. Revision이 여러 개인 correction window는 한 번만
-    반환하며, 각 revision chain의 검증은 manifest 계층이 담당한다.
+    manifest 경로는 UTC 날짜 partition이라 KST 하루가 걸치는 두 partition을 나열한다.
+    revision이 여러 개인 window는 한 번만 반환하며, revision chain 검증은 manifest가 맡는다.
 
     args:
         source_id: 대상 Collector source ID
@@ -300,10 +291,8 @@ def latest_source_snapshot_logical_dttm(
 ) -> datetime | None:
     """`as_of` 이전 가장 최근 source snapshot의 logical 시각을 반환한다(없으면 None).
 
-    Airflow의 freshness gate가 "마지막 성공 수집 이후 얼마나 지났는지"를 판단하는
-    용도다 — `as_of`가 속한 KST 날짜에서 못 찾으면 자정을 막 넘긴 경우를 위해
-    전날도 한 번 더 본다(그 이상 과거는 보지 않는다: 그만큼 오래 비어있다면 이미
-    다른 방식으로 감지되어야 할 장애다).
+    freshness gate용이다. 자정 직후를 위해 전날까지만 보며, 그보다 오래 비었다면 다른
+    방식으로 감지해야 할 장애다.
 
     args:
         source_id: 대상 Collector source ID
@@ -382,9 +371,8 @@ def list_window_manifest_payloads(
 ) -> list[dict]:
     """해당 KST 날짜(및 선택적으로 시)에 속한 window manifest를 모두 읽어 반환한다.
 
-    window manifest의 `dt=`/`hh=`는 KST 파티션이라 이 prefix 하나가 정확히 KST
-    하루(또는 KST 한 시간)와 일치한다. 데이터 수집 모니터링 알림(일별/시간별)이 이
-    함수로 해당 기간의 manifest를 모두 모은다.
+    window manifest의 `dt=`/`hh=`는 KST partition이라 prefix 하나가 KST 하루(또는 한
+    시간)와 정확히 일치한다.
     """
     prefix = layout.window_manifest_prefix(
         source_id, day, None if hour is None else int(hour)

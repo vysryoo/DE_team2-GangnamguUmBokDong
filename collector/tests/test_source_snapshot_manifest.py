@@ -26,13 +26,20 @@ def _silver(values: list[int]) -> storage.ImmutableSilverArtifact:
     )
 
 
+def _publish(**fields) -> manifest_module.PublishedSourceSnapshot:
+    """authority manifest를 준비한 뒤 확정한다."""
+    return manifest_module.finalize_source_snapshot(
+        manifest_module.prepare_source_snapshot(**fields)
+    )
+
+
 def _publish_succeeded(
     artifact: storage.ImmutableSilverArtifact,
     *,
     config_version: str = "v1",
 ) -> manifest_module.PublishedSourceSnapshot:
     """테스트용 SUCCEEDED authority manifest를 게시한다."""
-    return manifest_module.publish_source_snapshot(
+    return _publish(
         source_id="test_source",
         logical_dttm=WINDOW_START,
         status=SourceSnapshotStatus.SUCCEEDED,
@@ -81,7 +88,7 @@ def test_logical_times_within_same_minute_have_independent_revision_chains() -> 
     _publish_succeeded(artifact)
     other_logical = WINDOW_START + timedelta(seconds=1, microseconds=2)
 
-    other = manifest_module.publish_source_snapshot(
+    other = _publish(
         source_id="test_source",
         logical_dttm=other_logical,
         status=SourceSnapshotStatus.SUCCEEDED,
@@ -108,7 +115,7 @@ def test_succeeded_to_confirmed_empty_gets_higher_revision() -> None:
     """같은 logical source의 SUCCEEDED→EMPTY correction은 revision을 증가시킨다."""
     _publish_succeeded(_silver([1]))
 
-    empty = manifest_module.publish_source_snapshot(
+    empty = _publish(
         source_id="test_source",
         logical_dttm=WINDOW_START,
         status=SourceSnapshotStatus.EMPTY,
@@ -125,7 +132,7 @@ def test_succeeded_to_confirmed_empty_gets_higher_revision() -> None:
 
 def test_confirmed_empty_to_succeeded_gets_higher_revision() -> None:
     """같은 logical source의 EMPTY→SUCCEEDED correction도 revision을 증가시킨다."""
-    manifest_module.publish_source_snapshot(
+    _publish(
         source_id="test_source",
         logical_dttm=WINDOW_START,
         status=SourceSnapshotStatus.EMPTY,
