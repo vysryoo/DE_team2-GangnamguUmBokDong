@@ -74,7 +74,15 @@ def _sha256(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def _hot_prefix(source_id: str, day: date) -> str:
+def hot_day_prefix(source_id: str, day: date) -> str:
+    """날짜의 Hot Bronze prefix를 반환한다.
+
+    Args:
+        source_id: 소스 id
+        day: KST 날짜
+    Returns:
+        `bronze/hot/{source_id}/dt=YYYY-MM-DD/`
+    """
     return f"bronze/hot/{source_id}/dt={day.isoformat()}/"
 
 
@@ -161,6 +169,25 @@ def _cold_row(source_id: str, day: date, obj) -> dict:
     }
 
 
+def _previous_rows(previous: dict | None) -> dict[str, dict]:
+    """기존 Cold bundle의 row를 원본 Hot key별로 읽는다."""
+    if previous is None:
+        return {}
+    table = pq.read_table(pa.BufferReader(read_verified_cold(previous)))
+    return {row["original_key"]: row for row in table.to_pylist()}
+
+
+def _write_cold(source_id: str, day: date, rows: list[dict]) -> tuple[str, str]:
+    """Cold row를 content-addressed Parquet으로 쓰고 key와 checksum을 반환한다."""
+    buffer = io.BytesIO()
+    pq.write_table(pa.Table.from_pylist(rows, schema=_SCHEMA), buffer, compression="zstd")
+    cold_payload = buffer.getvalue()
+    cold_sha256 = _sha256(cold_payload)
+    cold_key = f"bronze/cold/{source_id}/dt={day.isoformat()}/sha256={cold_sha256}.parquet"
+    S3ImmutableObjectStore().put_verified(object_uri(cold_key), cold_payload)
+    return cold_key, cold_sha256
+
+
 def compact_date(source_id: str, day: date) -> ColdBronzeResult:
     """날짜의 모든 Hot Bronze revision을 원본 bytes 그대로 Cold 파일 하나에 보관한다.
 
@@ -178,13 +205,8 @@ def compact_date(source_id: str, day: date) -> ColdBronzeResult:
         ImmutableObjectError: 기존 Cold의 checksum 검증 또는 새 Cold 쓰기에 실패했을 때
     """
     previous = read_manifest(source_id, day)
-    rows_by_key: dict[str, dict] = {}
-    if previous is not None:
-        previous_payload = read_verified_cold(previous)
-        for row in pq.read_table(pa.BufferReader(previous_payload)).to_pylist():
-            rows_by_key[row["original_key"]] = row
-
-    hot_objects = list_objects(_hot_prefix(source_id, day))
+    rows_by_key = _previous_rows(previous)
+    hot_objects = list_objects(hot_day_prefix(source_id, day))
     if not hot_objects and not rows_by_key:
         return ColdBronzeResult(status="empty", objects=0, cold_key=None)
 
@@ -201,13 +223,7 @@ def compact_date(source_id: str, day: date) -> ColdBronzeResult:
         return ColdBronzeResult("skipped", len(inventory_keys), previous["cold_key"])
 
     rows = [rows_by_key[key] for key in inventory_keys]
-    buffer = io.BytesIO()
-    pq.write_table(pa.Table.from_pylist(rows, schema=_SCHEMA), buffer, compression="zstd")
-    cold_payload = buffer.getvalue()
-    cold_sha256 = _sha256(cold_payload)
-    cold_key = f"bronze/cold/{source_id}/dt={day.isoformat()}/sha256={cold_sha256}.parquet"
-    S3ImmutableObjectStore().put_verified(object_uri(cold_key), cold_payload)
-
+    cold_key, cold_sha256 = _write_cold(source_id, day, rows)
     write_json(
         manifest_key(source_id, day),
         {
@@ -249,7 +265,7 @@ def _recover_date(source_id: str, day: date, marker_keys: list[str]) -> int:
     inventory = set(manifest.get("inventory_keys", []))
     late_keys = [
         obj.key
-        for obj in list_objects(_hot_prefix(source_id, day))
+        for obj in list_objects(hot_day_prefix(source_id, day))
         if obj.key not in inventory
     ]
     if late_keys:
