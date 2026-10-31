@@ -51,30 +51,18 @@ def _config(columns: dict, **policy_overrides):
 
 
 class TestParseBool:
-    def test_true_string(self):
-        assert _parse_bool("true") is True
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [("true", True), ("false", False), ("True", True), ("FALSE", False), (True, True), (False, False)],
+    )
+    def test_accepts_true_false_strings_case_insensitive_and_bools(self, raw, expected):
+        assert _parse_bool(raw) is expected
 
-    def test_false_string(self):
-        assert _parse_bool("false") is False
-
-    def test_case_insensitive(self):
-        assert _parse_bool("True") is True
-        assert _parse_bool("FALSE") is False
-
-    def test_actual_bool_passthrough(self):
-        assert _parse_bool(True) is True
-        assert _parse_bool(False) is False
-
-    def test_zero_one_rejected(self):
-        # 내장 bool()과 달리 "0"/"1"은 인정하지 않는다 — 오직 "true"/"false" 문자열만.
+    # 내장 bool()과 달리 "0"/"1"은 인정하지 않는다 — 오직 "true"/"false" 문자열만.
+    @pytest.mark.parametrize("raw", ["0", "1", "yes"])
+    def test_rejects_other_strings(self, raw):
         with pytest.raises(ValueError):
-            _parse_bool("0")
-        with pytest.raises(ValueError):
-            _parse_bool("1")
-
-    def test_garbage_rejected(self):
-        with pytest.raises(ValueError):
-            _parse_bool("yes")
+            _parse_bool(raw)
 
 
 class TestTryCast:
@@ -181,46 +169,35 @@ class TestJudgeColumn:
 
 
 class TestResolvePolicyName:
-    def test_required_missing_uses_quadrant_default(self, make_spec, make_issue, policies):
-        spec = make_spec(required=True)
-        issue = make_issue(IssueKind.MISSING, spec=spec)
-        assert _resolve_policy_name(issue, policies) == "drop_row"
-
-    def test_optional_missing_uses_quadrant_default(self, make_spec, make_issue, policies):
-        spec = make_spec(required=False)
-        issue = make_issue(IssueKind.MISSING, spec=spec)
-        assert _resolve_policy_name(issue, policies) == "keep_null"
-
-    def test_required_outlier_uses_quadrant_default(self, make_spec, make_issue, policies):
-        spec = make_spec(required=True)
-        issue = make_issue(IssueKind.OUTLIER, spec=spec)
-        assert _resolve_policy_name(issue, policies) == "drop_row"
-
-    def test_optional_outlier_uses_quadrant_default(self, make_spec, make_issue, policies):
-        spec = make_spec(required=False)
-        issue = make_issue(IssueKind.OUTLIER, spec=spec)
-        assert _resolve_policy_name(issue, policies) == "set_null"
-
-    def test_on_missing_override_wins(self, make_spec, make_issue, policies):
-        spec = make_spec(required=True, on_missing="fill_zero")
-        issue = make_issue(IssueKind.MISSING, spec=spec)
-        assert _resolve_policy_name(issue, policies) == "fill_zero"
-
-    def test_on_outlier_override_wins_for_outlier(self, make_spec, make_issue, policies):
-        spec = make_spec(required=False, on_outlier="clip_to_range")
-        issue = make_issue(IssueKind.OUTLIER, spec=spec)
-        assert _resolve_policy_name(issue, policies) == "clip_to_range"
-
-    def test_type_error_ignores_on_outlier_override_required(self, make_spec, make_issue, policies):
-        # TYPE_ERROR는 컬럼 오버라이드를 무시하고 4분면 기본값만 쓴다.
-        spec = make_spec(required=True, on_outlier="clip_to_range")
-        issue = make_issue(IssueKind.TYPE_ERROR, spec=spec)
-        assert _resolve_policy_name(issue, policies) == "drop_row"
-
-    def test_type_error_ignores_on_outlier_override_optional(self, make_spec, make_issue, policies):
-        spec = make_spec(required=False, on_outlier="clip_to_range")
-        issue = make_issue(IssueKind.TYPE_ERROR, spec=spec)
-        assert _resolve_policy_name(issue, policies) == "set_null"
+    # TYPE_ERROR는 컬럼 오버라이드를 무시하고 4분면 기본값만 쓴다.
+    @pytest.mark.parametrize(
+        ("kind", "spec_kwargs", "expected"),
+        [
+            (IssueKind.MISSING, {"required": True}, "drop_row"),
+            (IssueKind.MISSING, {"required": False}, "keep_null"),
+            (IssueKind.OUTLIER, {"required": True}, "drop_row"),
+            (IssueKind.OUTLIER, {"required": False}, "set_null"),
+            (IssueKind.MISSING, {"required": True, "on_missing": "fill_zero"}, "fill_zero"),
+            (IssueKind.OUTLIER, {"required": False, "on_outlier": "clip_to_range"}, "clip_to_range"),
+            (IssueKind.TYPE_ERROR, {"required": True, "on_outlier": "clip_to_range"}, "drop_row"),
+            (IssueKind.TYPE_ERROR, {"required": False, "on_outlier": "clip_to_range"}, "set_null"),
+        ],
+        ids=[
+            "required_missing_default",
+            "optional_missing_default",
+            "required_outlier_default",
+            "optional_outlier_default",
+            "on_missing_override",
+            "on_outlier_override",
+            "type_error_ignores_override_required",
+            "type_error_ignores_override_optional",
+        ],
+    )
+    def test_resolves_quadrant_default_or_column_override(
+        self, make_spec, make_issue, policies, kind, spec_kwargs, expected
+    ):
+        issue = make_issue(kind, spec=make_spec(**spec_kwargs))
+        assert _resolve_policy_name(issue, policies) == expected
 
 
 class TestProcessColumns:

@@ -171,35 +171,23 @@ def test_fetch_skips_keys_already_collected(monkeypatch):
     assert len(calls) == 1  # page1은 호출되지 않는다
 
 
-def test_fetch_classifies_auth_error_as_fatal():
+@pytest.mark.parametrize(
+    ("code", "expected"),
+    [
+        ("INFO-100", FetchErrorKind.FATAL),
+        ("ERROR-500", FetchErrorKind.TRANSIENT),
+        ("ERROR-336", FetchErrorKind.PERMANENT),
+    ],
+)
+def test_fetch_classifies_result_code_errors(code, expected):
     def handler(request):
-        return httpx.Response(200, content=_body(code="INFO-100"))
+        return httpx.Response(200, content=_body(code=code))
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
     results = list(SeoulOpenApiAdapter.fetch(_config(), window=None, client=client))
 
     assert len(results) == 1
-    assert results[0].error is FetchErrorKind.FATAL
-
-
-def test_fetch_classifies_server_error_as_transient():
-    def handler(request):
-        return httpx.Response(200, content=_body(code="ERROR-500"))
-
-    client = httpx.Client(transport=httpx.MockTransport(handler))
-    results = list(SeoulOpenApiAdapter.fetch(_config(), window=None, client=client))
-
-    assert results[0].error is FetchErrorKind.TRANSIENT
-
-
-def test_fetch_classifies_other_error_as_permanent():
-    def handler(request):
-        return httpx.Response(200, content=_body(code="ERROR-336"))
-
-    client = httpx.Client(transport=httpx.MockTransport(handler))
-    results = list(SeoulOpenApiAdapter.fetch(_config(), window=None, client=client))
-
-    assert results[0].error is FetchErrorKind.PERMANENT
+    assert results[0].error is expected
 
 
 def test_fetch_treats_empty_result_info_200_as_success():
@@ -654,71 +642,33 @@ class TestPathSuffixTemplate:
             "path_suffix": suffix,
         }
 
-    def test_window_start_is_available(self):
-        window = Window(
-            window_start=datetime(2026, 8, 18, 18, 55, tzinfo=KST),
-            window_end=datetime(2026, 8, 18, 19, 0, tzinfo=KST),
-        )
+    @pytest.mark.parametrize(
+        ("window_start", "suffix", "expected_tail"),
+        [
+            ((18, 18, 55), "/{window_start:%Y-%m-%d}/{window_start:%H}", "/2026-08-18/18/"),
+            ((18, 18, 55), "/{window_end:%H}", "/19/"),
+            ((18, 19, 0), "/{window_last:%Y-%m-%d}/{window_last:%H}", "/2026-08-18/18/"),
+            ((18, 19, 5), "/{window_last:%H}", "/19/"),
+            ((19, 0, 0), "/{window_last:%Y-%m-%d}/{window_last:%H}", "/2026-08-18/23/"),
+            ((18, 4, 5), "/{window_last:%H}", "/04/"),
+        ],
+        ids=[
+            "window_start",
+            "window_end",
+            "window_last_is_instant_before_window",
+            "window_last_keeps_mid_hour_window",
+            "window_last_rolls_date_back_at_midnight",
+            "hour_is_zero_padded",
+        ],
+    )
+    def test_suffix_renders_window_fields(self, window_start, suffix, expected_tail):
+        day, hour, minute = window_start
+        start = datetime(2026, 8, day, hour, minute, tzinfo=KST)
+        window = Window(window_start=start, window_end=start + timedelta(minutes=5))
 
-        calls = self._capture(
-            self._params("/{window_start:%Y-%m-%d}/{window_start:%H}"), window
-        )
+        calls = self._capture(self._params(suffix), window)
 
-        assert calls[0].endswith("/2026-08-18/18/")
-
-    def test_window_end_is_available(self):
-        window = Window(
-            window_start=datetime(2026, 8, 18, 18, 55, tzinfo=KST),
-            window_end=datetime(2026, 8, 18, 19, 0, tzinfo=KST),
-        )
-
-        calls = self._capture(self._params("/{window_end:%H}"), window)
-
-        assert calls[0].endswith("/19/")
-
-    def test_window_last_is_the_instant_before_the_window(self):
-        window = Window(
-            window_start=datetime(2026, 8, 18, 19, 0, tzinfo=KST),
-            window_end=datetime(2026, 8, 18, 19, 5, tzinfo=KST),
-        )
-
-        calls = self._capture(
-            self._params("/{window_last:%Y-%m-%d}/{window_last:%H}"), window
-        )
-
-        assert calls[0].endswith("/2026-08-18/18/")
-
-    def test_window_last_keeps_mid_hour_windows_on_their_own_hour(self):
-        window = Window(
-            window_start=datetime(2026, 8, 18, 19, 5, tzinfo=KST),
-            window_end=datetime(2026, 8, 18, 19, 10, tzinfo=KST),
-        )
-
-        calls = self._capture(self._params("/{window_last:%H}"), window)
-
-        assert calls[0].endswith("/19/")
-
-    def test_window_last_rolls_the_date_back_at_midnight(self):
-        window = Window(
-            window_start=datetime(2026, 8, 19, 0, 0, tzinfo=KST),
-            window_end=datetime(2026, 8, 19, 0, 5, tzinfo=KST),
-        )
-
-        calls = self._capture(
-            self._params("/{window_last:%Y-%m-%d}/{window_last:%H}"), window
-        )
-
-        assert calls[0].endswith("/2026-08-18/23/")
-
-    def test_hour_is_zero_padded(self):
-        window = Window(
-            window_start=datetime(2026, 8, 18, 4, 5, tzinfo=KST),
-            window_end=datetime(2026, 8, 18, 4, 10, tzinfo=KST),
-        )
-
-        calls = self._capture(self._params("/{window_last:%H}"), window)
-
-        assert calls[0].endswith("/04/")
+        assert calls[0].endswith(expected_tail)
 
 
 # ---------------------------------------------------------------------------
