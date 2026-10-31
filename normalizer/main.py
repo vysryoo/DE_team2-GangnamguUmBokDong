@@ -138,6 +138,17 @@ _OUTPUT_SCHEMA = pa.schema(
 )
 
 
+def _union_cells(
+    cells_by_target: dict[datetime, dict[str, merge.GridCell]],
+) -> dict[str, merge.GridCell]:
+    """시각별 격자 셀을 CELL_ID 기준 합집합으로 모은다. 같은 id는 먼저 나온 셀을 쓴다."""
+    union: dict[str, merge.GridCell] = {}
+    for cells in cells_by_target.values():
+        for cell_id, cell in cells.items():
+            union.setdefault(cell_id, cell)
+    return union
+
+
 def _write_targets(
     window_start: datetime,
     targets: list[datetime],
@@ -206,10 +217,7 @@ def run(
     cells_by_target, skipped, baseline_dates = baseline.load_baseline_cells(window_start, targets)
 
     # 교차 면적은 지오메트리만 보므로 모든 시각의 셀 합집합으로 한 번만 계산함
-    union_cells: dict[str, merge.GridCell] = {}
-    for cells in cells_by_target.values():
-        for cell_id, cell in cells.items():
-            union_cells.setdefault(cell_id, cell)
+    union_cells = _union_cells(cells_by_target)
     overlap_areas = merge.find_overlap_areas(list(union_cells.values()), list(poi_areas))
 
     observed_snapshots = _build_poi_snapshots(poi_areas, realtime_table)

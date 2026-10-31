@@ -167,6 +167,16 @@ def _write_archive(
     )
 
 
+def _day_table(
+    tables: list[pa.Table], schema: pa.Schema, *, dedup: bool, materialize_empty: bool
+) -> pa.Table | None:
+    """검증된 window 테이블을 하루치로 합친다. 남은 행이 없고 빈 기록도 원하지 않으면 None."""
+    if tables:
+        table = pa.concat_tables(tables)
+        return _dedup_full_row(table, schema) if dedup else table
+    return schema.empty_table() if materialize_empty else None
+
+
 def _has_silver(source_id: str, day: date) -> bool:
     """같은 날짜에 운영 수집 Silver가 있는지 확인하고 있으면 경고를 남긴다."""
     if not storage.list_silver_objects(source_id, day):
@@ -221,13 +231,8 @@ def load_date(
             out_of_range=counts.out_of_range, silver_present=silver_present,
         )
 
-    if tables:
-        table = pa.concat_tables(tables)
-        if bcfg.dedup:
-            table = _dedup_full_row(table, schema)
-    elif materialize_empty:
-        table = schema.empty_table()
-    else:
+    table = _day_table(tables, schema, dedup=bcfg.dedup, materialize_empty=materialize_empty)
+    if table is None:
         return DateResult(
             day=day, status="empty", rows=0, dropped=counts.dropped,
             out_of_range=counts.out_of_range, silver_present=silver_present,

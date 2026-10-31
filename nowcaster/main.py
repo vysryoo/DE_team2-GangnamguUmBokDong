@@ -135,6 +135,19 @@ def required_lookback_dates(today: date, horizon_days: int = 3) -> list[date]:
     return sorted(required)
 
 
+def _csv_tables_by_date(
+    csv_paths: list[Path], targets: set[date]
+) -> dict[date, list[pa.Table]]:
+    """CSV를 날짜별로 나눠 `targets`에 든 날짜의 테이블만 모은다."""
+    tables_by_date: dict[date, list[pa.Table]] = {}
+    for csv_path in csv_paths:
+        table = backfill.read_source_csv(csv_path)
+        for target_date, day_table in backfill.group_rows_by_date(table).items():
+            if target_date in targets:
+                tables_by_date.setdefault(target_date, []).append(day_table)
+    return tables_by_date
+
+
 def run_bootstrap_lookback(
     csv_dir: str,
     today: date,
@@ -158,15 +171,8 @@ def run_bootstrap_lookback(
 
     required = set(required_lookback_dates(today, horizon_days))
     available = {day for day in required if storage.read_archive(day) is not None}
-    tables_by_date: dict[date, list[pa.Table]] = {}
-
-    for csv_path in csv_paths:
-        table = backfill.read_source_csv(csv_path)
-        for target_date, day_table in backfill.group_rows_by_date(table).items():
-            if target_date in required and (force or target_date not in available):
-                tables_by_date.setdefault(target_date, []).append(day_table)
-
-    for target_date, tables in sorted(tables_by_date.items()):
+    targets = required if force else required - available
+    for target_date, tables in sorted(_csv_tables_by_date(csv_paths, targets).items()):
         _write_actual_archive(target_date, pa.concat_tables(tables))
         available.add(target_date)
 
