@@ -24,7 +24,7 @@ _DEGRAD = math.pi / 180.0
 
 
 def _projection_constants() -> tuple[float, float, float, float]:
-    """두 변환이 공유하는 투영 상수 (re, sn, sf, ro)를 계산한다."""
+    """두 변환이 공유하는 투영 상수 (re, sn, sf, ro)를 계산한다. import 때 한 번만 호출한다."""
     re = _RE / _GRID
     slat1 = _SLAT1 * _DEGRAD
     slat2 = _SLAT2 * _DEGRAD
@@ -39,6 +39,10 @@ def _projection_constants() -> tuple[float, float, float, float]:
     return re, sn, sf, ro
 
 
+_RE_GRID, _SN, _SF, _RO = _projection_constants()
+_OLON_RAD = _OLON * _DEGRAD
+
+
 def grid_to_latlon(nx: float, ny: float) -> tuple[float, float]:
     """기상청 격자 좌표(nx, ny)를 WGS84 위경도 좌표(lat, lon)로 변환한다.
 
@@ -48,18 +52,15 @@ def grid_to_latlon(nx: float, ny: float) -> tuple[float, float]:
     returns:
         (lat, lon) 위경도 좌표 튜플
     """
-    re, sn, sf, ro = _projection_constants()
-    olon = _OLON * _DEGRAD
-
     xn = nx - _XO
-    yn = ro - (ny - _YO)
+    yn = _RO - (ny - _YO)
     ra = math.hypot(xn, yn)
-    if sn < 0.0:
+    if _SN < 0.0:
         ra = -ra
-    alat = (re * sf / ra) ** (1.0 / sn)
+    alat = (_RE_GRID * _SF / ra) ** (1.0 / _SN)
     alat = 2.0 * math.atan(alat) - math.pi * 0.5
     theta = math.atan2(xn, yn) if (xn, yn) != (0.0, 0.0) else 0.0
-    alon = theta / sn + olon
+    alon = theta / _SN + _OLON_RAD
 
     return math.degrees(alat), math.degrees(alon)
 
@@ -75,20 +76,17 @@ def latlon_to_grid(lat: float, lon: float) -> tuple[int, int]:
     returns:
         가장 가까운 격자의 (nx, ny) 정수 좌표
     """
-    re, sn, sf, ro = _projection_constants()
-    olon = _OLON * _DEGRAD
-
     ra = math.tan(math.pi * 0.25 + (lat * _DEGRAD) * 0.5)
-    ra = re * sf / ra**sn
-    theta = lon * _DEGRAD - olon
+    ra = _RE_GRID * _SF / ra**_SN
+    theta = lon * _DEGRAD - _OLON_RAD
     if theta > math.pi:
         theta -= 2.0 * math.pi
     if theta < -math.pi:
         theta += 2.0 * math.pi
-    theta *= sn
+    theta *= _SN
 
     xn = ra * math.sin(theta)
     yn = ra * math.cos(theta)
     nx = xn + _XO
-    ny = _YO + ro - yn
+    ny = _YO + _RO - yn
     return round(nx), round(ny)
